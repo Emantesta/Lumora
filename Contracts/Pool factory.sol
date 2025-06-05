@@ -6,7 +6,7 @@ import "@openzeppelin/contracts-upgradeable/utils/AddressUpgradeable.sol";
 import "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
 import "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
 import "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
-import "@openzeppelin/contracts-upgradeable/security/ReentrancyGuardUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/utils/ReentrancyGuardUpgradeable.sol";
 import "@openzeppelin/contracts-upgradeable/token/ERC20/IERC20Upgradeable.sol";
 
 // Chainlink Oracle interface for price validation
@@ -24,7 +24,7 @@ interface IChainlinkOracle {
 }
 
 // LayerZero endpoint interface for cross-chain compatibility
-interface ICustomLayerZeroEndpoint {
+interface ILayerZeroEndpoint {
     function estimateFees(
         uint16 dstChainId,
         address userApplication,
@@ -204,7 +204,7 @@ contract PoolFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable, Reen
     /// @notice Storage gap for future upgrades
     uint256[99] private __gap; // FIXED: Reduced by 1 for new state variable
 
-    /// @custom:errors
+    /// @custom: Errors
     error InvalidTokenAddress(string reason);
     error IdenticalTokens();
     error PoolAlreadyExists();
@@ -262,7 +262,7 @@ contract PoolFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable, Reen
     );
     event BatchPoolsCreated(uint256 poolCount, uint16 chainId);
     event PauseToggled(bool paused);
-    event ChainPausedEvent(uint16 indexed chainId, address indexed caller);
+    event ChainPaused(uint16 indexed chainId, address indexed caller);
     event ChainUnpaused(uint16 indexed chainId, address indexed caller);
     event TreasuryUpdated(address indexed newTreasury);
     event LayerZeroEndpointUpdated(address indexed newEndpoint);
@@ -274,7 +274,7 @@ contract PoolFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable, Reen
     event GovernanceProposalCancelled(uint256 indexed proposalId);
     event Voted(uint256 indexed proposalId, address indexed voter, bool inFavor, uint256 votingPower);
     event BatchVoted(address indexed voter, uint256[] proposalIds, bool[] inFavor, uint256 votingPower);
-    event VotingClosedEvent(uint256 indexed proposalId);
+    event VotingClosed(uint256 indexed proposalId);
     event FailedMessageStored(uint256 indexed messageId, uint16 dstChainId, bytes payload);
     event FailedMessageRetried(uint256 indexed messageId, uint16 dstChainId, uint256 retries);
     event FailedMessageRecovered(uint256 indexed messageId, address indexed recipient);

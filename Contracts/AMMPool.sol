@@ -9,9 +9,7 @@ import "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
 import "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
 import "@openzeppelin/contracts-upgradeable/security/ReentrancyGuardUpgradeable.sol";
 import "@chainlink/contracts/src/v0.8/shared/interfaces/AggregatorV3Interface.sol";
-import {UD60x18, ud} from "@prb/math/UD60x18.sol";
-import {Address} from "@openzeppelin/contracts/utils/Address.sol";
-
+import {UD60x18, ud} from "@prb/math/src/UD60x18.sol"; // Adjust based on the actual library
 // LayerZero interface for cross-chain communication
 interface ILayerZeroEndpoint {
     function send(
@@ -61,14 +59,14 @@ interface IGovernance {
 contract AMMPool is Initializable, OwnableUpgradeable, UUPSUpgradeable, ReentrancyGuardUpgradeable {
     using SafeERC20Upgradeable for IERC20Upgradeable;
 
-    // Constants
-    string public VERSION;
-    uint256 public constant MIN_TIMELOCK = 1 days;
-    uint256 public constant MAX_TIMELOCK = 7 days;
-    uint256 public constant MAX_BATCH_SIZE = 100;
-    uint256 public constant MAX_GAS_LIMIT = 1_000_000;
-    uint256 public constant GOVERNANCE_TIMELOCK = 2 days;
-    uint256 public constant MAX_RETRIES = 3;
+    // Immutable constants set during initialization
+    string public immutable VERSION;
+    uint256 public immutable MIN_TIMELOCK;
+    uint256 public immutable MAX_TIMELOCK;
+    uint256 public immutable MAX_BATCH_SIZE;
+    uint256 public immutable MAX_GAS_LIMIT;
+    uint256 public immutable GOVERNANCE_TIMELOCK;
+    uint256 public immutable MAX_RETRIES;
 
     /// @notice Token A address (must be less than tokenB for pair ordering)
     address public tokenA;
@@ -152,13 +150,13 @@ contract AMMPool is Initializable, OwnableUpgradeable, UUPSUpgradeable, Reentran
     uint256 public failedMessageCount;
 
     /// @notice Structure to track governance proposals
-    struct AMMGovernanceProposal {
+    struct GovernanceProposal {
         address target; // Target contract address
         bytes data; // Call data
         uint256 proposedAt; // Proposal timestamp
         bool executed; // Execution status
     }
-    mapping(uint256 => AMMGovernanceProposal) public governanceProposals;
+    mapping(uint256 => GovernanceProposal) public governanceProposals;
     uint256 public proposalCount;
 
     // Custom errors
@@ -190,7 +188,6 @@ contract AMMPool is Initializable, OwnableUpgradeable, UUPSUpgradeable, Reentran
     error OracleFailure();
     error MaxRetriesExceeded(uint256 messageId);
     error MessageNotFailed(uint256 messageId);
-    error ProposalExecutionFailed();
 
     // Events
     event LiquidityAdded(address indexed provider, uint256 amountA, uint256 amountB, uint256 liquidity);
@@ -199,7 +196,7 @@ contract AMMPool is Initializable, OwnableUpgradeable, UUPSUpgradeable, Reentran
     event FeesUpdated(uint16 indexed chainId, uint256 baseFee, uint256 maxFee, uint256 lpFeeShare, uint256 treasuryFeeShare);
     event Paused(address indexed caller);
     event Unpaused(address indexed caller);
-    event AMMPoolChainPaused(uint16 indexed chainId, address indexed caller);
+    event ChainPaused(uint16 indexed chainId, address indexed caller);
     event ChainUnpaused(uint16 indexed chainId, address indexed caller);
     event CrossChainLiquiditySent(address indexed provider, uint256 amountA, uint256 amountB, uint16 indexed chainId, uint64 nonce, uint256 estimatedConfirmationTime);
     event CrossChainLiquidityReceived(address indexed provider, uint256 amountA, uint256 amountB, uint16 indexed chainId, uint64 nonce);
@@ -249,7 +246,22 @@ contract AMMPool is Initializable, OwnableUpgradeable, UUPSUpgradeable, Reentran
     }
 
     /// @notice Constructor disables initializers for upgradeable contracts
-    constructor() {
+    constructor(
+        string memory _version,
+        uint256 _minTimelock,
+        uint256 _maxTimelock,
+        uint256 _maxBatchSize,
+        uint256 _maxGasLimit,
+        uint256 _governanceTimelock,
+        uint256 _maxRetries
+    ) {
+        VERSION = _version;
+        MIN_TIMELOCK = _minTimelock;
+        MAX_TIMELOCK = _maxTimelock;
+        MAX_BATCH_SIZE = _maxBatchSize;
+        MAX_GAS_LIMIT = _maxGasLimit;
+        GOVERNANCE_TIMELOCK = _governanceTimelock;
+        MAX_RETRIES = _maxRetries;
         _disableInitializers();
     }
 
@@ -290,7 +302,6 @@ contract AMMPool is Initializable, OwnableUpgradeable, UUPSUpgradeable, Reentran
         __UUPSUpgradeable_init();
         __ReentrancyGuard_init();
 
-        VERSION = "1.0.0";
         tokenA = _tokenA;
         tokenB = _tokenB;
         treasury = _treasury;
@@ -326,7 +337,7 @@ contract AMMPool is Initializable, OwnableUpgradeable, UUPSUpgradeable, Reentran
 
         uint256 liquidity;
         if (totalLiquidity == 0) {
-            UD60x18 sqrtResult = ud(amountA).mul(ud(amountB)).sqrt();
+            UD60x18 sqrtResult = ud(amountA * amountB).sqrt();
             liquidity = sqrtResult.unwrap();
         } else {
             liquidity = (amountA * totalLiquidity) / reserves.reserveA;
@@ -334,12 +345,12 @@ contract AMMPool is Initializable, OwnableUpgradeable, UUPSUpgradeable, Reentran
             liquidity = liquidity < liquidityB ? liquidity : liquidityB;
         }
 
-        if (liquidity == 0) revert InvalidAmount(amountA, amountB);
-
-        liquidityBalance[msg.sender] += liquidity;
-        totalLiquidity += liquidity;
-        reserves.reserveA += amountA;
-        reserves.reserveB += amountB;
+        unchecked {
+            liquidityBalance[msg.sender] += liquidity;
+            totalLiquidity += liquidity;
+            reserves.reserveA += amountA;
+            reserves.reserveB += amountB;
+        }
 
         _updateVolatility();
         emit LiquidityAdded(msg.sender, amountA, amountB, liquidity);
@@ -355,10 +366,12 @@ contract AMMPool is Initializable, OwnableUpgradeable, UUPSUpgradeable, Reentran
         uint256 amountA = (liquidity * reserves.reserveA) / totalLiquidity;
         uint256 amountB = (liquidity * reserves.reserveB) / totalLiquidity;
 
-        liquidityBalance[msg.sender] -= liquidity;
-        totalLiquidity -= liquidity;
-        reserves.reserveA -= amountA;
-        reserves.reserveB -= amountB;
+        unchecked {
+            liquidityBalance[msg.sender] -= liquidity;
+            totalLiquidity -= liquidity;
+            reserves.reserveA -= amountA;
+            reserves.reserveB -= amountB;
+        }
 
         IERC20Upgradeable(tokenA).safeTransfer(msg.sender, amountA);
         IERC20Upgradeable(tokenB).safeTransfer(msg.sender, amountB);
@@ -386,13 +399,13 @@ contract AMMPool is Initializable, OwnableUpgradeable, UUPSUpgradeable, Reentran
             : (reserves.reserveB, reserves.reserveA);
         uint256 currentFee = _getDynamicFee(1); // Default chain ID for local swaps
         uint256 amountInWithFee = (amountIn * (10000 - currentFee)) / 10000;
-        uint256 lpFee = (amountIn * currentFee * lpFeeShare) / (10000 * 10000);
-        uint256 treasuryFee = (amountIn * currentFee * treasuryFeeShare) / (10000 * 10000);
+        uint256 lpFee = (amountIn * currentFee * lpFeeShare) / 10000;
+        uint256 treasuryFee = (amountIn * currentFee * treasuryFeeShare) / 10000;
 
         if (useConstantSum) {
             amountOut = amountInWithFee;
         } else {
-            amountOut = (amountInWithFee * reserveOut) / (reserveIn + amountInWithFee);
+            amountOut = (reserveOut * amountInWithFee) / (reserveIn + amountInWithFee);
         }
 
         if (amountOut < minAmountOut) revert InsufficientOutputAmount(amountOut, minAmountOut);
@@ -401,13 +414,17 @@ contract AMMPool is Initializable, OwnableUpgradeable, UUPSUpgradeable, Reentran
         _validatePrice(inputToken, amountIn, amountOut);
 
         if (inputToken == tokenA) {
-            reserves.reserveA += amountIn;
-            reserves.reserveB -= amountOut;
+            unchecked {
+                reserves.reserveA += amountIn;
+                reserves.reserveB -= amountOut;
+            }
             IERC20Upgradeable(tokenA).safeTransferFrom(msg.sender, address(this), amountIn);
             IERC20Upgradeable(tokenB).safeTransfer(msg.sender, amountOut);
         } else {
-            reserves.reserveB += amountIn;
-            reserves.reserveA -= amountOut;
+            unchecked {
+                reserves.reserveB += amountIn;
+                reserves.reserveA -= amountOut;
+            }
             IERC20Upgradeable(tokenB).safeTransferFrom(msg.sender, address(this), amountIn);
             IERC20Upgradeable(tokenA).safeTransfer(msg.sender, amountOut);
         }
@@ -517,7 +534,7 @@ contract AMMPool is Initializable, OwnableUpgradeable, UUPSUpgradeable, Reentran
             adapterParams
         ) {
             if (msg.value > nativeFee) {
-                Address.sendValue(payable(msg.sender), msg.value - nativeFee);
+                payable(msg.sender).transfer(msg.value - nativeFee);
             }
             emit CrossChainLiquiditySent(msg.sender, amountA, amountB, dstChainId, nonce, block.timestamp + timelock);
         } catch {
@@ -545,10 +562,12 @@ contract AMMPool is Initializable, OwnableUpgradeable, UUPSUpgradeable, Reentran
         uint64 nonce,
         bytes calldata payload
     ) external onlyLayerZero whenNotPaused whenChainNotPaused(srcChainId) nonReentrant {
+        // Validate source chain and address
         if (trustedRemotePools[srcChainId].length == 0) revert InvalidChainId(srcChainId);
         if (keccak256(srcAddress) != keccak256(trustedRemotePools[srcChainId])) revert InvalidAddress(msg.sender);
         if (usedNonces[srcChainId][nonce]) revert InvalidNonce(nonce, nonce);
 
+        // Decode payload
         (address provider, uint256 amountA, uint256 amountB, uint64 receivedNonce, uint256 timelock) = 
             abi.decode(payload, (address, uint256, uint256, uint64, uint256));
         if (receivedNonce != nonce) revert InvalidNonce(receivedNonce, nonce);
@@ -557,6 +576,7 @@ contract AMMPool is Initializable, OwnableUpgradeable, UUPSUpgradeable, Reentran
 
         usedNonces[srcChainId][nonce] = true;
 
+        // Mint or release tokenA
         uint256 balanceBeforeA = IERC20Upgradeable(tokenA).balanceOf(address(this));
         if (tokenBridgeType[tokenA] == 1) {
             ITokenBridge(tokenBridge).mint(tokenA, amountA, address(this));
@@ -568,6 +588,7 @@ contract AMMPool is Initializable, OwnableUpgradeable, UUPSUpgradeable, Reentran
         if (IERC20Upgradeable(tokenA).balanceOf(address(this)) < balanceBeforeA + amountA) 
             revert InvalidAmount(amountA, 0);
 
+        // Mint or release tokenB
         uint256 balanceBeforeB = IERC20Upgradeable(tokenB).balanceOf(address(this));
         if (tokenBridgeType[tokenB] == 1) {
             ITokenBridge(tokenBridge).mint(tokenB, amountB, address(this));
@@ -579,9 +600,10 @@ contract AMMPool is Initializable, OwnableUpgradeable, UUPSUpgradeable, Reentran
         if (IERC20Upgradeable(tokenB).balanceOf(address(this)) < balanceBeforeB + amountB) 
             revert InvalidAmount(amountB, 0);
 
+        // Calculate liquidity
         uint256 liquidity;
         if (totalLiquidity == 0) {
-            UD60x18 sqrtResult = ud(amountA).mul(ud(amountB)).sqrt();
+            UD60x18 sqrtResult = ud(amountA * amountB).sqrt();
             liquidity = sqrtResult.unwrap();
         } else {
             liquidity = (amountA * totalLiquidity) / reserves.reserveA;
@@ -589,12 +611,13 @@ contract AMMPool is Initializable, OwnableUpgradeable, UUPSUpgradeable, Reentran
             liquidity = liquidity < liquidityB ? liquidity : liquidityB;
         }
 
-        if (liquidity == 0) revert InvalidAmount(amountA, amountB);
-
-        liquidityBalance[provider] += liquidity;
-        totalLiquidity += liquidity;
-        reserves.crossChainReserveA += amountA;
-        reserves.crossChainReserveB += amountB;
+        // Update state
+        unchecked {
+            liquidityBalance[provider] += liquidity;
+            totalLiquidity += liquidity;
+            reserves.crossChainReserveA += amountA;
+            reserves.crossChainReserveB += amountB;
+        }
 
         _updateVolatility();
         emit CrossChainLiquidityReceived(provider, amountA, amountB, srcChainId, nonce);
@@ -621,18 +644,19 @@ contract AMMPool is Initializable, OwnableUpgradeable, UUPSUpgradeable, Reentran
         if (tokenBridgeType[inputToken] != 1 && tokenBridgeType[inputToken] != 2) 
             revert InvalidBridgeType(tokenBridgeType[inputToken]);
 
+        // Calculate output
         (uint256 reserveIn, uint256 reserveOut) = inputToken == tokenA 
             ? (reserves.reserveA, reserves.reserveB) 
             : (reserves.reserveB, reserves.reserveA);
         uint256 currentFee = _getDynamicFee(dstChainId);
         uint256 amountInWithFee = (amountIn * (10000 - currentFee)) / 10000;
-        uint256 lpFee = (amountIn * currentFee * lpFeeShare) / (10000 * 10000);
-        uint256 treasuryFee = (amountIn * currentFee * treasuryFeeShare) / (10000 * 10000);
+        uint256 lpFee = (amountIn * currentFee * lpFeeShare) / 10000;
+        uint256 treasuryFee = (amountIn * currentFee * treasuryFeeShare) / 10000;
 
         if (useConstantSum) {
             amountOut = amountInWithFee;
         } else {
-            amountOut = (amountInWithFee * reserveOut) / (reserveIn + amountInWithFee);
+            amountOut = (reserveOut * amountInWithFee) / (reserveIn + amountInWithFee);
         }
 
         if (amountOut < minAmountOut) revert InsufficientOutputAmount(amountOut, minAmountOut);
@@ -640,6 +664,7 @@ contract AMMPool is Initializable, OwnableUpgradeable, UUPSUpgradeable, Reentran
 
         _validatePrice(inputToken, amountIn, amountOut);
 
+        // Transfer and bridge input token
         uint256 balanceBefore = IERC20Upgradeable(inputToken).balanceOf(address(this));
         IERC20Upgradeable(inputToken).safeTransferFrom(msg.sender, address(this), amountIn);
         if (IERC20Upgradeable(inputToken).balanceOf(address(this)) < balanceBefore + amountIn) 
@@ -651,6 +676,7 @@ contract AMMPool is Initializable, OwnableUpgradeable, UUPSUpgradeable, Reentran
             ITokenBridge(tokenBridge).lock(inputToken, amountIn, msg.sender, dstChainId);
         }
 
+        // Send LayerZero message
         uint64 nonce = ILayerZeroEndpoint(layerZeroEndpoint).getInboundNonce(dstChainId, trustedRemotePools[dstChainId]);
         uint256 timelock = _getDynamicTimelock(dstChainId);
         bytes memory payload = abi.encode(msg.sender, inputToken, amountIn, amountOut, minAmountOut, nonce, block.timestamp + timelock);
@@ -667,11 +693,11 @@ contract AMMPool is Initializable, OwnableUpgradeable, UUPSUpgradeable, Reentran
             adapterParams
         ) {
             if (msg.value > nativeFee) {
-                Address.sendValue(payable(msg.sender), msg.value - nativeFee);
+                payable(msg.sender).transfer(msg.value - nativeFee);
             }
             lpFees[msg.sender][inputToken] += lpFee;
             IERC20Upgradeable(inputToken).safeTransfer(treasury, treasuryFee);
-            emit CrossChainSwap(msg.sender, inputToken, amountIn, amountOut, dstChainId, nonce, block.timestamp);
+            emit CrossChainSwap(msg.sender, inputToken, amountIn, amountOut, dstChainId, nonce, block.timestamp + timelock);
         } catch {
             failedMessages[failedMessageCount] = FailedMessage({
                 dstChainId: dstChainId,
@@ -710,65 +736,39 @@ contract AMMPool is Initializable, OwnableUpgradeable, UUPSUpgradeable, Reentran
 
         for (uint256 i; i < payloads.length; ++i) {
             uint256 gasStart = gasleft();
-            bool isLiquidity = payloads[i].length == 132; // Liquidity payload: (address, uint256, uint256, uint64, uint256)
-            if (isLiquidity) {
-                (address sender, uint256 amountA, uint256 amountB, uint64 payloadNonce, uint256 payloadTimelock) = 
-                    abi.decode(payloads[i], (address, uint256, uint256, uint64, uint256));
-                if (payloadNonce != nonce + uint64(i)) revert InvalidNonce(payloadNonce, nonce + uint64(i));
-                if (payloadTimelock < block.timestamp + MIN_TIMELOCK) revert InvalidTimelock(payloadTimelock);
+            (address sender, uint256 amountA, uint256 amountB, uint64 payloadNonce, uint256 payloadTimelock) = 
+                abi.decode(payloads[i], (address, uint256, uint256, uint64, uint256));
+            if (payloadNonce != nonce + uint64(i)) revert InvalidNonce(payloadNonce, nonce + uint64(i));
+            if (payloadTimelock < block.timestamp + MIN_TIMELOCK) revert InvalidTimelock(payloadTimelock);
 
-                (uint256 nativeFee,) = getEstimatedLayerZeroFee(dstChainId, payloads[i], adapterParams);
-                totalNativeFee += nativeFee;
+            (uint256 nativeFee,) = getEstimatedLayerZeroFee(dstChainId, payloads[i], adapterParams);
+            totalNativeFee += nativeFee;
 
-                try ILayerZeroEndpoint(layerZeroEndpoint).send{value: nativeFee}(
-                    dstChainId,
-                    remoteAndLocalAddresses,
-                    payloads[i],
-                    payable(msg.sender),
-                    address(0),
-                    adapterParams
-                ) {
+            try ILayerZeroEndpoint(layerZeroEndpoint).send{value: nativeFee}(
+                dstChainId,
+                remoteAndLocalAddresses,
+                payloads[i],
+                payable(msg.sender),
+                address(0),
+                adapterParams
+            ) {
+                if (amountB > 0) {
                     emit CrossChainLiquiditySent(sender, amountA, amountB, dstChainId, nonce + uint64(i), payloadTimelock);
-                } catch {
-                    failedMessages[failedMessageCount] = FailedMessage({
-                        dstChainId: dstChainId,
-                        payload: payloads[i],
-                        adapterParams: adapterParams,
-                        retries: 0,
-                        timestamp: block.timestamp
-                    });
-                    emit FailedMessageStored(failedMessageCount, dstChainId, payloads[i]);
-                    failedMessageCount++;
-                }
-            } else {
-                (address sender, address inputToken, uint256 amountIn, uint256 amountOut, uint256 minAmountOut, uint64 payloadNonce, uint256 payloadTimelock) = 
-                    abi.decode(payloads[i], (address, address, uint256, uint256, uint256, uint64, uint256));
-                if (payloadNonce != nonce + uint64(i)) revert InvalidNonce(payloadNonce, nonce + uint64(i));
-                if (payloadTimelock < block.timestamp + MIN_TIMELOCK) revert InvalidTimelock(payloadTimelock);
-
-                (uint256 nativeFee,) = getEstimatedLayerZeroFee(dstChainId, payloads[i], adapterParams);
-                totalNativeFee += nativeFee;
-
-                try ILayerZeroEndpoint(layerZeroEndpoint).send{value: nativeFee}(
-                    dstChainId,
-                    remoteAndLocalAddresses,
-                    payloads[i],
-                    payable(msg.sender),
-                    address(0),
-                    adapterParams
-                ) {
+                } else {
+                    (, address inputToken, uint256 amountIn, uint256 amountOut, , ,) = 
+                        abi.decode(payloads[i], (address, address, uint256, uint256, uint256, uint64, uint256));
                     emit CrossChainSwap(sender, inputToken, amountIn, amountOut, dstChainId, nonce + uint64(i), payloadTimelock);
-                } catch {
-                    failedMessages[failedMessageCount] = FailedMessage({
-                        dstChainId: dstChainId,
-                        payload: payloads[i],
-                        adapterParams: adapterParams,
-                        retries: 0,
-                        timestamp: block.timestamp
-                    });
-                    emit FailedMessageStored(failedMessageCount, dstChainId, payloads[i]);
-                    failedMessageCount++;
                 }
+            } catch {
+                failedMessages[failedMessageCount] = FailedMessage({
+                    dstChainId: dstChainId,
+                    payload: payloads[i],
+                    adapterParams: adapterParams,
+                    retries: 0,
+                    timestamp: block.timestamp
+                });
+                emit FailedMessageStored(failedMessageCount, dstChainId, payloads[i]);
+                failedMessageCount++;
             }
 
             gasUsed += gasStart - gasleft();
@@ -777,7 +777,7 @@ contract AMMPool is Initializable, OwnableUpgradeable, UUPSUpgradeable, Reentran
 
         if (msg.value < totalNativeFee) revert InsufficientFee(msg.value, totalNativeFee);
         if (msg.value > totalNativeFee) {
-            Address.sendValue(payable(msg.sender), msg.value - totalNativeFee);
+            payable(msg.sender).transfer(msg.value - totalNativeFee);
         }
     }
 
@@ -803,7 +803,7 @@ contract AMMPool is Initializable, OwnableUpgradeable, UUPSUpgradeable, Reentran
             message.adapterParams
         ) {
             if (msg.value > nativeFee) {
-                Address.sendValue(payable(msg.sender), msg.value - nativeFee);
+                payable(msg.sender).transfer(msg.value - nativeFee);
             }
             emit FailedMessageRetried(messageId, message.dstChainId, message.retries);
             delete failedMessages[messageId];
@@ -820,10 +820,8 @@ contract AMMPool is Initializable, OwnableUpgradeable, UUPSUpgradeable, Reentran
         if (message.dstChainId == 0) revert MessageNotFailed(messageId);
         if (message.retries < MAX_RETRIES) revert MessageNotFailed(messageId);
 
-        bool isLiquidity = message.payload.length == 132;
-        if (isLiquidity) {
-            (address sender, uint256 amountA, uint256 amountB, , ) = 
-                abi.decode(message.payload, (address, uint256, uint256, uint64, uint256));
+        (address sender, uint256 amountA, uint256 amountB, , ) = abi.decode(message.payload, (address, uint256, uint256, uint64, uint256));
+        if (amountB > 0) {
             IERC20Upgradeable(tokenA).safeTransfer(recipient, amountA);
             IERC20Upgradeable(tokenB).safeTransfer(recipient, amountB);
         } else {
@@ -863,7 +861,7 @@ contract AMMPool is Initializable, OwnableUpgradeable, UUPSUpgradeable, Reentran
         usedNonces[srcChainId][nonce] = true;
 
         address outputToken = inputToken == tokenA ? tokenB : tokenA;
-        uint256 balanceBefore = IERC20Upgradeable(outputToken).balanceOf(user);
+        uint256 balanceBefore = IERC20Upgradeable(outputToken).balanceOf(address(this));
 
         if (tokenBridgeType[outputToken] == 1) {
             ITokenBridge(tokenBridge).mint(outputToken, amountOut, user);
@@ -875,13 +873,17 @@ contract AMMPool is Initializable, OwnableUpgradeable, UUPSUpgradeable, Reentran
             revert InvalidAmount(amountOut, 0);
 
         if (inputToken == tokenA) {
-            reserves.crossChainReserveA += amountIn;
-            if (amountOut > reserves.crossChainReserveB) revert InsufficientReserve(amountOut, reserves.crossChainReserveB);
-            reserves.crossChainReserveB -= amountOut;
+            unchecked {
+                reserves.crossChainReserveA += amountIn;
+                reserves.crossChainReserveB -= amountOut;
+            }
+            if (amountOut > reserves.reserveB) revert InsufficientReserve(amountOut, reserves.reserveB);
         } else {
-            reserves.crossChainReserveB += amountIn;
-            if (amountOut > reserves.crossChainReserveA) revert InsufficientReserve(amountOut, reserves.crossChainReserveA);
-            reserves.crossChainReserveA -= amountOut;
+            unchecked {
+                reserves.crossChainReserveB += amountIn;
+                reserves.crossChainReserveA -= amountOut;
+            }
+            if (amountOut > reserves.reserveA) revert InsufficientReserve(amountOut, reserves.reserveA);
         }
 
         _updateVolatility();
@@ -901,13 +903,16 @@ contract AMMPool is Initializable, OwnableUpgradeable, UUPSUpgradeable, Reentran
     {
         if (trustedRemotePools[dstChainId].length == 0) revert InvalidChainId(dstChainId);
 
+        // Calculate total reserves
         uint256 totalReserveA = reserves.reserveA + reserves.crossChainReserveA;
         uint256 totalReserveB = reserves.reserveB + reserves.crossChainReserveB;
         if (totalReserveA == 0 || totalReserveB == 0) return;
 
+        // Check current ratio
         uint256 currentRatio = (totalReserveA * 1e18) / totalReserveB;
         if (currentRatio == targetReserveRatio) return;
 
+        // Determine transfer amounts
         uint256 amountA;
         uint256 amountB;
         if (currentRatio > targetReserveRatio) {
@@ -918,6 +923,7 @@ contract AMMPool is Initializable, OwnableUpgradeable, UUPSUpgradeable, Reentran
             amountA = 0;
         }
 
+        // Transfer and bridge tokens
         if (amountA > 0) {
             if (tokenBridgeType[tokenA] != 1 && tokenBridgeType[tokenA] != 2) 
                 revert InvalidBridgeType(tokenBridgeType[tokenA]);
@@ -927,7 +933,7 @@ contract AMMPool is Initializable, OwnableUpgradeable, UUPSUpgradeable, Reentran
             } else {
                 ITokenBridge(tokenBridge).lock(tokenA, amountA, address(this), dstChainId);
             }
-            reserves.reserveA -= amountA;
+            unchecked { reserves.reserveA -= amountA; }
         } else if (amountB > 0) {
             if (tokenBridgeType[tokenB] != 1 && tokenBridgeType[tokenB] != 2) 
                 revert InvalidBridgeType(tokenBridgeType[tokenB]);
@@ -937,9 +943,10 @@ contract AMMPool is Initializable, OwnableUpgradeable, UUPSUpgradeable, Reentran
             } else {
                 ITokenBridge(tokenBridge).lock(tokenB, amountB, address(this), dstChainId);
             }
-            reserves.reserveB -= amountB;
+            unchecked { reserves.reserveB -= amountB; }
         }
 
+        // Send LayerZero message
         uint64 nonce = ILayerZeroEndpoint(layerZeroEndpoint).getInboundNonce(dstChainId, trustedRemotePools[dstChainId]);
         uint256 timelock = _getDynamicTimelock(dstChainId);
         bytes memory payload = abi.encode(address(this), amountA, amountB, nonce, block.timestamp + timelock);
@@ -995,6 +1002,7 @@ contract AMMPool is Initializable, OwnableUpgradeable, UUPSUpgradeable, Reentran
             address(0),
             adapterParams
         ) {
+            // Success
         } catch {
             failedMessages[failedMessageCount] = FailedMessage({
                 dstChainId: chainId,
@@ -1019,10 +1027,12 @@ contract AMMPool is Initializable, OwnableUpgradeable, UUPSUpgradeable, Reentran
         uint256 amountA = (liquidity * reserves.reserveA) / totalLiquidity;
         uint256 amountB = (liquidity * reserves.reserveB) / totalLiquidity;
 
-        liquidityBalance[msg.sender] = 0;
-        totalLiquidity -= liquidity;
-        reserves.reserveA -= amountA;
-        reserves.reserveB -= amountB;
+        unchecked {
+            liquidityBalance[msg.sender] = 0;
+            totalLiquidity -= liquidity;
+            reserves.reserveA -= amountA;
+            reserves.reserveB -= amountB;
+        }
 
         IERC20Upgradeable(tokenA).safeTransfer(msg.sender, amountA);
         IERC20Upgradeable(tokenB).safeTransfer(msg.sender, amountB);
@@ -1073,14 +1083,14 @@ contract AMMPool is Initializable, OwnableUpgradeable, UUPSUpgradeable, Reentran
     function _updateVolatility() internal {
         uint256 totalReserveA = reserves.reserveA + reserves.crossChainReserveA;
         uint256 totalReserveB = reserves.reserveB + reserves.crossChainReserveB;
-        if (totalReserveA == 0) return;
+        if (totalReserveA == 0 || totalReserveB == 0) return;
 
         uint256 currentPrice = (totalReserveB * 1e18) / totalReserveA;
         if (lastPrice != 0) {
             uint256 priceChange = currentPrice > lastPrice ? currentPrice - lastPrice : lastPrice - currentPrice;
             uint256 volatility = (priceChange * 1e18) / lastPrice;
 
-            uint256 alpha = (2 * 1e18) / (emaPeriod + 1);
+            uint256 alpha = 2e18 / (emaPeriod + 1);
             emaVolatility = (alpha * volatility + (1e18 - alpha) * emaVolatility) / 1e18;
 
             useConstantSum = emaVolatility < volatilityThreshold;
@@ -1144,17 +1154,9 @@ contract AMMPool is Initializable, OwnableUpgradeable, UUPSUpgradeable, Reentran
     /// @return price Price from oracle
     /// @return decimals Oracle decimals
     function _getOraclePrice(address oracle) internal view returns (int256 price, uint8 decimals) {
-        try AggregatorV3Interface(oracle).latestRoundData() returns (
-            uint80,
-            int256 answer,
-            uint256,
-            uint256 updatedAt,
-            uint80
-        ) {
-            if (answer <= 0) revert NegativeOraclePrice(answer);
-            if (updatedAt < block.timestamp - 1 hours) revert OracleFailure();
-            price = answer;
-            decimals = AggregatorV3Interface(oracle).decimals();
+        try IChainlinkOracle(oracle).latestAnswer() returns (int256 _price) {
+            price = _price;
+            decimals = IChainlinkOracle(oracle).decimals();
         } catch {
             revert OracleFailure();
         }
@@ -1176,7 +1178,7 @@ contract AMMPool is Initializable, OwnableUpgradeable, UUPSUpgradeable, Reentran
         returns (uint256) 
     {
         uint256 proposalId = proposalCount++;
-        governanceProposals[proposalId] = AMMGovernanceProposal({
+        governanceProposals[proposalId] = GovernanceProposal({
             target: target,
             data: data,
             proposedAt: block.timestamp,
@@ -1189,24 +1191,15 @@ contract AMMPool is Initializable, OwnableUpgradeable, UUPSUpgradeable, Reentran
     /// @notice Executes a governance proposal after timelock
     /// @param proposalId Proposal ID
     function executeGovernanceProposal(uint256 proposalId) external onlyGovernance {
-        AMMGovernanceProposal storage proposal = governanceProposals[proposalId];
+        GovernanceProposal storage proposal = governanceProposals[proposalId];
         if (proposal.target == address(0)) revert ProposalNotFound(proposalId);
         if (proposal.executed) revert ProposalAlreadyExecuted(proposalId);
         if (block.timestamp < proposal.proposedAt + GOVERNANCE_TIMELOCK) 
             revert ProposalNotReady(proposalId);
 
         proposal.executed = true;
-        (bool success, bytes memory result) = proposal.target.call(proposal.data);
-        if (!success) {
-            if (result.length > 0) {
-                assembly {
-                    let returndata_size := mload(result)
-                    revert(add(32, result), returndata_size)
-                }
-            } else {
-                revert ProposalExecutionFailed();
-            }
-        }
+        (bool success,) = proposal.target.call(proposal.data);
+        if (!success) revert("Proposal execution failed");
         emit GovernanceProposalExecuted(proposalId);
     }
 
@@ -1252,7 +1245,7 @@ contract AMMPool is Initializable, OwnableUpgradeable, UUPSUpgradeable, Reentran
     function pauseChain(uint16 chainId) external onlyGovernance {
         if (chainPaused[chainId]) revert ChainPaused(chainId);
         chainPaused[chainId] = true;
-        emit AMMPoolChainPaused(chainId, msg.sender);
+        emit ChainPaused(chainId, msg.sender);
     }
 
     /// @notice Unpauses a specific chain

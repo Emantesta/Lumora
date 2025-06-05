@@ -5,8 +5,8 @@ import "@openzeppelin/contracts-upgradeable/token/ERC20/ERC20Upgradeable.sol";
 import "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
 import "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
 import "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
-import "@openzeppelin/contracts-upgradeable/security/PausableUpgradeable.sol";
-import "@openzeppelin/contracts-upgradeable/security/ReentrancyGuardUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/utils/PausableUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/utils/ReentrancyGuardUpgradeable.sol";
 
 /**
  * @title DebtToken
@@ -44,26 +44,17 @@ contract DebtToken is Initializable, ERC20Upgradeable, OwnableUpgradeable, UUPSU
      * @param _underlyingAsset Address of the underlying asset (e.g., USDC)
      * @param _upgradeDelay Delay for upgrades in seconds (min 1 hour, max 30 days)
      */
-    function initialize(
-    string memory name_,
-    string memory symbol_,
-    address _underlyingAsset,
-    address initialOwner,
-    uint256 _upgradeDelay
-)   public initializer {
-    require(bytes(name_).length > 0, "Invalid token name");
-    require(bytes(symbol_).length > 0, "Invalid token symbol");
-    require(_underlyingAsset != address(0), "Invalid underlying asset address");
-    require(initialOwner != address(0), "Invalid owner address");
-    require(_upgradeDelay >= 1 hours && _upgradeDelay <= 30 days, "Invalid upgrade delay");
-    __ERC20_init(name_, symbol_);
-    underlyingAsset = _underlyingAsset;
-    __Ownable_init(initialOwner);
-    __UUPSUpgradeable_init();
-    __Pausable_init();
-    __ReentrancyGuard_init();
-    upgradeDelay = _upgradeDelay;
-}
+    function initialize(string memory name_, string memory symbol_, address _underlyingAsset, uint256 _upgradeDelay) public initializer {
+        require(_underlyingAsset != address(0), "Invalid underlying asset address");
+        require(_upgradeDelay >= 1 hours && _upgradeDelay <= 30 days, "Invalid upgrade delay");
+        __ERC20_init(name_, symbol_);
+        underlyingAsset = _underlyingAsset;
+        __Ownable_init(msg.sender);
+        __UUPSUpgradeable_init();
+        __Pausable_init();
+        __ReentrancyGuard_init();
+        upgradeDelay = _upgradeDelay;
+    }
 
     /**
      * @notice Mints debt tokens to a user, representing new debt

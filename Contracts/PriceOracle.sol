@@ -2,15 +2,12 @@
 pragma solidity ^0.8.24;
 
 import "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
-import "@chainlink/contracts/src/v0.8/vrf/interfaces/VRFCoordinatorV2Interface.sol";
 import "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
 import "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
-import "@chainlink/contracts/src/v0.8/vrf/VRFConsumerBaseV2.sol";
-import "@chainlink/contracts/src/v0.8/vrf/dev/libraries/VRFV2PlusClient.sol";
-import "@openzeppelin/contracts-upgradeable/security/ReentrancyGuardUpgradeable.sol"; // Line 7
-import "@openzeppelin/contracts-upgradeable/security/PausableUpgradeable.sol"; // Line 8
+import "@openzeppelin/contracts-upgradeable/utils/ReentrancyGuardUpgradeable.sol"; // Line 7
+import "@openzeppelin/contracts-upgradeable/utils/PausableUpgradeable.sol"; // Line 8
 // Remove SafeMathUpgradeable import (not needed in Solidity 0.8.28) // Line 9
-import "@chainlink/contracts/src/v0.8/shared/interfaces/AggregatorV3Interface.sol"; // Line 10, verify version
+import "@chainlink/contracts/src/v0.8/interfaces/AggregatorV3Interface.sol"; // Line 10, verify version
 // Uniswap imports need npm packages or local files
 import "./external/uniswap/v3/IUniswapV3Pool.sol";
 import "./external/uniswap/v3/TickMath.sol";
@@ -26,12 +23,9 @@ contract PriceOracle is
     OwnableUpgradeable,
     ReentrancyGuardUpgradeable,
     PausableUpgradeable,
-    VRFConsumerBaseV2
+    VRFConsumerBaseV2Plus
 {
-    error InvalidInput();
-    error ZeroAddress();
-    error InvalidVRFConfig();
-    error VRFRequestPending(address asset);
+    using SafeMathUpgradeable for uint256;
 
     // Structs
     struct PriceFeedConfig {
@@ -98,7 +92,7 @@ contract PriceOracle is
     mapping(address => uint256) public pendingVRFRequestId; // Tracks VRF request per asset
 
     // Chainlink VRF configuration
-    VRFCoordinatorV2Interface public vrfCoordinator;
+    IVRFCoordinatorV2Plus public vrfCoordinator;
     uint64 public subscriptionId;
     bytes32 public keyHash;
     uint32 public callbackGasLimit;
@@ -124,6 +118,7 @@ contract PriceOracle is
     event PoolStateUpdated(address indexed asset, address pool, uint8 oracleType, uint256 index, uint128 liquidity, uint256 timestamp);
 
     // Errors
+    error ZeroAddress();
     error InvalidPriceFeed(address asset);
     error InvalidPool(address asset);
     error StalePrice(address asset);
@@ -135,11 +130,13 @@ contract PriceOracle is
     error NoValidPools(address asset);
     error PriceDeviationTooHigh(address asset);
     error FeedDeviationTooHigh(address asset);
-    error ContractPaused();   
+    error ContractPaused();
+    error VRFRequestPending(address asset);
     error VRFNotConfigured();
     error InvalidVRFRequest(uint256 requestId);
     error NoValidFeeds(address asset);
     error InvalidReliabilityScore();
+    error InvalidVRFConfig();
     error PoolLimitReached(address asset);
     error InvalidEmergencyPrice(address asset);
     error ZeroValue();
@@ -166,7 +163,7 @@ contract PriceOracle is
     uint16 public constant MAX_REQUEST_CONFIRMATIONS = 20;
 
     /// @custom:oz-upgrades-unsafe-allow constructor
-    constructor(address _vrfCoordinator) VRFConsumerBaseV2(_vrfCoordinator) {
+    constructor(address _vrfCoordinator) VRFConsumerBaseV2Plus(_vrfCoordinator) {
         _disableInitializers();
     }
 
@@ -197,7 +194,7 @@ contract PriceOracle is
         __ReentrancyGuard_init();
         __Pausable_init();
         __UUPSUpgradeable_init();
-        vrfCoordinator = VRFCoordinatorV2Interface(_vrfCoordinator);
+        vrfCoordinator = IVRFCoordinatorV2Plus(_vrfCoordinator);
         subscriptionId = _subscriptionId;
         keyHash = _keyHash;
         callbackGasLimit = _callbackGasLimit;
@@ -223,7 +220,7 @@ contract PriceOracle is
         if (_callbackGasLimit < MIN_CALLBACK_GAS_LIMIT || _callbackGasLimit > MAX_CALLBACK_GAS_LIMIT) revert InvalidVRFConfig();
         if (_requestConfirmations < MIN_REQUEST_CONFIRMATIONS || _requestConfirmations > MAX_REQUEST_CONFIRMATIONS) revert InvalidVRFConfig();
 
-        vrfCoordinator = VRFCoordinatorV2Interface(_vrfCoordinator);
+        vrfCoordinator = IVRFCoordinatorV2Plus(_vrfCoordinator);
         subscriptionId = _subscriptionId;
         keyHash = _keyHash;
         callbackGasLimit = _callbackGasLimit;
@@ -420,8 +417,8 @@ contract PriceOracle is
             uint256 secondaryPrice = getSecondaryPrice(asset, config.primaryOracle);
             if (secondaryPrice > 0) {
                 uint256 deviation = price > secondaryPrice
-                    ? (price - secondaryPrice) * 1e18 / secondaryPrice
-                    : (secondaryPrice - price) * 1e18 / price;
+                    ? price.sub(secondaryPrice).mul(1e18).div(secondaryPrice)
+                    : secondaryPrice.sub(price).mul(1e18).div(price);
                 if (deviation > config.maxPriceDeviation) revert InvalidEmergencyPrice(asset);
             }
         }
@@ -534,10 +531,10 @@ contract PriceOracle is
     /// @return price The EMA price, or 0 if VRF request is sent
     function getPrice(address asset) external nonReentrant whenNotPaused returns (uint256) {
     if (emergencyOverrideActive[asset]) {
-        uint256 emergencyprice = emergencyPrices[asset];
-        uint256 updatedEmaPrice = updateEMA(asset, emergencyprice);
-        emit PriceFetched(asset, emergencyprice, updatedEmaPrice, block.timestamp, 4);
-        return updatedEmaPrice;
+        uint256 price = emergencyPrices[asset];
+        uint256 emaPrice = updateEMA(asset, price);
+        emit PriceFetched(asset, price, emaPrice, block.timestamp, 4);
+        return emaPrice;
     }
 
     AssetConfig storage config = assetConfigs[asset];
@@ -597,18 +594,18 @@ contract PriceOracle is
             for (uint256 i = 0; i < priceFeedCount[request.asset]; i++) {
                 PriceFeedConfig memory feed = priceFeeds[request.asset][i];
                 if (feed.isActive) {
-                    oracleReliabilitySums[0] = oracleReliabilitySums[0] + feed.reliabilityScore;
+                    oracleReliabilitySums[0] = oracleReliabilitySums[0].add(feed.reliabilityScore);
                 }
             }
-            totalReliability = totalReliability + oracleReliabilitySums[0];
+            totalReliability = totalReliability.add(oracleReliabilitySums[0]);
         }
         if (oracleAvailability[1]) oracleReliabilitySums[1] = 75;
         if (oracleAvailability[2]) oracleReliabilitySums[2] = 60;
         if (oracleAvailability[3]) oracleReliabilitySums[3] = 60;
         totalReliability = totalReliability
-            (oracleAvailability[1] ? oracleReliabilitySums[1] : 0) +
-            (oracleAvailability[2] ? oracleReliabilitySums[2] : 0) +
-            (oracleAvailability[3] ? oracleReliabilitySums[3] : 0);
+            .add(oracleAvailability[1] ? oracleReliabilitySums[1] : 0)
+            .add(oracleAvailability[2] ? oracleReliabilitySums[2] : 0)
+            .add(oracleAvailability[3] ? oracleReliabilitySums[3] : 0);
 
         if (totalReliability == 0) revert NoValidPools(request.asset);
 
@@ -616,7 +613,7 @@ contract PriceOracle is
         uint256 cumulativeReliability = 0;
         for (uint8 i = 0; i < 4; i++) {
             if (oracleAvailability[i]) {
-                cumulativeReliability = cumulativeReliability + oracleReliabilitySums[i];
+                cumulativeReliability = cumulativeReliability.add(oracleReliabilitySums[i]);
                 if (randomValue < cumulativeReliability) {
                     oracleType = i;
                     break;
@@ -636,8 +633,8 @@ contract PriceOracle is
             uint256 secondaryPrice = getSecondaryPrice(request.asset, oracleType);
             if (secondaryPrice > 0) {
                 uint256 deviation = price > secondaryPrice
-                    ? (price - secondaryPrice) * 1e18 / secondaryPrice
-                    : (secondaryPrice - price) * 1e18 / price;
+                    ? price.sub(secondaryPrice).mul(1e18).div(secondaryPrice)
+                    : secondaryPrice.sub(price).mul(1e18).div(price);
                 if (deviation > config.maxPriceDeviation) {
                     price = fetchPriceDeterministic(request.asset);
                     oracleType = config.primaryOracle;
@@ -708,8 +705,8 @@ contract PriceOracle is
             uint256 secondaryPrice = getSecondaryPrice(asset, oracleType);
             if (secondaryPrice > 0) {
                 uint256 deviation = price > secondaryPrice
-                    ? (price - secondaryPrice) * 1e18 / secondaryPrice
-                    : (secondaryPrice - price) * 1e18 / price;
+                    ? price.sub(secondaryPrice).mul(1e18).div(secondaryPrice)
+                    : secondaryPrice.sub(price).mul(1e18).div(price);
                 if (deviation > config.maxPriceDeviation) revert PriceDeviationTooHigh(asset);
             }
         }
@@ -917,15 +914,18 @@ contract PriceOracle is
             uint256 secondaryPrice = getSecondaryPrice(asset, config.primaryOracle);
             if (secondaryPrice > 0 && config.maxPriceDeviation > 0) {
                 uint256 deviation = newPrice > secondaryPrice
-                    ? (newPrice - secondaryPrice) * 1e18 / secondaryPrice
-                    : (secondaryPrice - newPrice) * 1e18 / newPrice;
+                    ? newPrice.sub(secondaryPrice).mul(1e18).div(secondaryPrice)
+                    : secondaryPrice.sub(newPrice).mul(1e18).div(newPrice);
                 if (deviation > config.maxPriceDeviation) revert InvalidPrice(asset);
             }
             config.emaPrice = newPrice;
             return newPrice;
         }
-            config.emaPrice = (config.emaPrice * (1e18 - config.emaAlpha) + newPrice * config.emaAlpha) / 1e18;
-            return config.emaPrice;
+        config.emaPrice = config.emaPrice
+            .mul(1e18 - config.emaAlpha)
+            .add(newPrice.mul(config.emaAlpha))
+            .div(1e18);
+        return config.emaPrice;
     }
 
     /// @notice Calculates dynamic heartbeat based on volatility
@@ -934,7 +934,7 @@ contract PriceOracle is
     function calculateDynamicHeartbeat(address asset) internal view returns (uint256) {
         uint256 volatility = assetConfigs[asset].volatilityIndex;
         if (volatility == 0) volatility = 1e18;
-        uint256 heartbeat = DEFAULT_HEARTBEAT * 1e18 / volatility;
+        uint256 heartbeat = DEFAULT_HEARTBEAT.mul(1e18).div(volatility);
         return heartbeat < 5 minutes ? 5 minutes : heartbeat > 30 minutes ? 30 minutes : heartbeat;
     }
 

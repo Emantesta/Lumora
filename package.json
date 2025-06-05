@@ -42,10 +42,10 @@
     "test": "test"
   },
   "dependencies": {
-    "@arbitrum/nitro-contracts": "^3.0.0",
     "@chainlink/contracts": "^1.4.0",
     "@openzeppelin/contracts-upgradeable": "^4.9.6",
     "@openzeppelin/truffle-upgrades": "^1.21.0",
+    "@arbitrum/nitro-contracts": "^3.0.0",
     "@prb/math": "^3.0.0",
     "@uniswap/v2-core": "^1.0.1",
     "@uniswap/v3-core": "^1.0.1",
