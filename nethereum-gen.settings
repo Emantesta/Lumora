@@ -1,0 +1,7 @@
+{
+    "projectName": "Lumora",
+    "namespace": "Lumora.Contracts",
+    "lang": 0,
+    "autoCodeGen": true,
+    "projectPath": "../"
+}

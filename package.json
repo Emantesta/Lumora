@@ -1,0 +1,58 @@
+{
+  "name": "lumora",
+  "version": "1.0.0",
+  "description": "Lumora is a cutting-edge DeFi protocol that redefines lending by seamlessly integrating an Automated Market Maker (AMM) with a dynamic Loan-to-Value (LTV) model. Designed for safety and flexibility, Lumora adjusts borrowing limits in real-time based on asset volatility, pool liquidity, and market conditions, ensuring robust risk management.",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Emantesta/Lumora.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/Emantesta/Lumora/issues"
+  },
+  "homepage": "https://github.com/Emantesta/Lumora#readme",
+  "devDependencies": {
+    "@nomicfoundation/hardhat-chai-matchers": "^2.0.8",
+    "@nomicfoundation/hardhat-ethers": "^3.0.8",
+    "@nomicfoundation/hardhat-ignition-ethers": "^0.15.7",
+    "@nomicfoundation/hardhat-network-helpers": "^1.0.11",
+    "@nomicfoundation/hardhat-toolbox": "^5.0.0",
+    "@nomicfoundation/hardhat-verify": "^2.0.11",
+    "@typechain/ethers-v6": "^0.5.1",
+    "@typechain/hardhat": "^9.1.0",
+    "@types/chai": "^4.3.20",
+    "@types/mocha": "^10.0.8",
+    "chai": "^4.5.0",
+    "ethers": "^6.13.4",
+    "hardhat": "^2.24.1",
+    "hardhat-gas-reporter": "^1.0.10",
+    "solhint": "^5.1.0",
+    "solidity-coverage": "^0.8.12",
+    "ts-node": "^10.9.2",
+    "typechain": "^8.3.2",
+    "typescript": "^5.6.2"
+  },
+  "directories": {
+    "test": "test"
+  },
+  "dependencies": {
+    "@arbitrum/nitro-contracts": "^3.0.0",
+    "@chainlink/contracts": "^1.4.0",
+    "@openzeppelin/contracts-upgradeable": "^4.9.6",
+    "@openzeppelin/truffle-upgrades": "^1.21.0",
+    "@prb/math": "^3.0.0",
+    "@uniswap/v2-core": "^1.0.1",
+    "@uniswap/v3-core": "^1.0.1",
+    "solc": "^0.8.20",
+    "truffle": "^5.11.5"
+  },
+  "resolutions": {
+    "@openzeppelin/contracts-upgradeable": "4.9.6"
+  }
+}
