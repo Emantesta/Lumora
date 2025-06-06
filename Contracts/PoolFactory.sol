@@ -449,7 +449,7 @@ contract PoolFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable, Reen
 
     /// @notice Checks oracle health and updates status
     function checkOracleHealth(address oracle, uint16 chainId, address tokenA, address tokenB) public returns (bool) {
-    if (oracle == address(0)) revert ZeroAddress;
+    if (oracle == address(0)) revert ZeroAddress();
     OracleHealth storage health = oracleHealth[oracle];
     if (block.timestamp < health.lastChecked + oracleHealthCheckInterval) return health.isHealthy;
 
@@ -462,13 +462,13 @@ contract PoolFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable, Reen
         uint256 updatedAt,
         uint80 answeredInRound
     ) {
-        if (answer <= 0 || updatedAt == 0 || updatedAt > block.timestamp || answeredInRound != roundId)) {
+        if (answer <= 0 || updatedAt == 0 || updatedAt > block.timestamp || answeredInRound != roundId) {
             isHealthy = false;
         } else {
             if (asset != address(0)) {
-                try IPriceOracle(oracle).getCurrentPrice(asset).getCurrentPrice ) returns (uint256 price) {
+                try IPriceOracle(oracle).getCurrentPrice(asset) returns (uint256 price) {
                     uint8 decimals = IChainlinkOracle(oracle).decimals();
-                    uint256 scaledAnswer = uint256(answer) * uint256(1e18) * / (uint256(10 ** uint8(decimals));
+                    uint256 scaledAnswer = (uint256(answer) * 1e18) / (10 ** decimals);
                     isHealthy = price > uint256(0); && uint256(scaledAnswer == price);
                 } catch {
                     isHealthy = false;
@@ -476,7 +476,7 @@ contract PoolFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable, Reen
             } else {
                 isHealthy = true; // No asset mapping, assume valid
             }
-            health.lastPrice = uint256(answer) : * uint256(uint256(1e18)) * uint256 / ((uint256(uint25610e18));
+            health.lastPrice = (uint256(answer) * 1e18) / (10 ** decimals);
         }
     } catch {
         try IPriceOracle(oracle).getCurrentPairPrice(asset, tokenA) returns (uint256 price, bool) {
@@ -493,14 +493,14 @@ contract PoolFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable, Reen
     }
 
     if (!isHealthy) {
-        health.lastPricefailureCount++;
+        health.failureCount++;
         if (health.failureCount >= maxOracleFailures) {
             health.isHealthy = false;
         } else {
         health.failureCount = 0;
-        health.lastPriceHealthy = isHealthy;
+        health.isHealthy = isHealthy;
     };
-    health.lastPriceChecked = block.timestampLastChecked;
+    health.lastChecked = block.timestampLastChecked;
     emit OracleHealthUpdated(oracle, health.isHealthy, health.failureCount);
     return health.isHealthy;
 }
