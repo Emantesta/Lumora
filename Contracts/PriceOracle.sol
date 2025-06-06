@@ -4,18 +4,16 @@ pragma solidity ^0.8.24;
 import "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
 import "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
 import "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
-import "@openzeppelin/contracts-upgradeable/utils/ReentrancyGuardUpgradeable.sol"; // Line 7
-import "@openzeppelin/contracts-upgradeable/utils/PausableUpgradeable.sol"; // Line 8
-// Remove SafeMathUpgradeable import (not needed in Solidity 0.8.28) // Line 9
-import "@chainlink/contracts/src/v0.8/interfaces/AggregatorV3Interface.sol"; // Line 10, verify version
-// Uniswap imports need npm packages or local files
+import "@openzeppelin/contracts-upgradeable/security/ReentrancyGuardUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/security/PausableUpgradeable.sol";
+import "@chainlink/contracts/src/v0.8/shared/interfaces/AggregatorV3Interface.sol";
 import "./external/uniswap/v3/IUniswapV3Pool.sol";
 import "./external/uniswap/v3/TickMath.sol";
 import "./external/uniswap/v3/FullMath.sol";
 import "./external/uniswap/v2/IUniswapV2Pair.sol";
 
 /// @title PriceOracle
-/// @notice Upgradeable price oracle for Sonic Blockchain with multiple data sources and advanced features
+/// @notice Upgradeable price oracle for Sonic Blockchain with multiple data sources
 /// @dev Uses UUPS proxy, Chainlink VRF v2.5, and aggregates Chainlink feeds, Uniswap V3, SushiSwap, and PancakeSwap
 contract PriceOracle is
     Initializable,
@@ -25,7 +23,6 @@ contract PriceOracle is
     PausableUpgradeable,
     VRFConsumerBaseV2Plus
 {
-    using SafeMathUpgradeable for uint256;
 
     // Structs
     struct PriceFeedConfig {
@@ -42,7 +39,7 @@ contract PriceOracle is
     struct UniswapV3PoolConfig {
         address poolAddress;
         uint32 twapSeconds;
-        bool isToken0Base;
+        bool isToken0Base; // True if token0 is the base token
         bool isActive;
         uint128 liquidity;
     }
@@ -59,25 +56,29 @@ contract PriceOracle is
     }
 
     struct AssetConfig {
+        address tokenA; // First token in pair (for orientation)
+        address tokenB; // Second token in pair
         uint8 primaryOracle; // 0: Chainlink, 1: Uniswap V3, 2: SushiSwap, 3: PancakeSwap
         uint256 maxPriceDeviation;
         bool useVRF;
         uint256 maxFeedDeviation;
-        uint256 emaPrice;
+        uint256 emaPrice; // Cached EMA price in 1e18 precision
         uint256 emaAlpha;
         uint256 volatilityIndex;
     }
 
     struct VRFRequest {
         address asset;
+        address inputToken; // Tracks which token was queried
         uint256 requestId;
         bool isPending;
-        uint256 price;
+        uint256 price; // Cached VRF price in 1e18 precision
         uint256 timestamp;
+        uint256 attempts;
     }
 
     // Storage
-    mapping(address => AssetConfig) public assetConfigs;
+    mapping(address => AssetConfig) public assetConfigs; // asset is pair address (e.g., tokenA/tokenB pool)
     mapping(address => mapping(uint256 => PriceFeedConfig)) public priceFeeds;
     mapping(address => uint256) public priceFeedCount;
     mapping(address => mapping(uint256 => UniswapV3PoolConfig)) public uniswapV3Pools;
@@ -89,7 +90,7 @@ contract PriceOracle is
     mapping(address => uint256) public emergencyPrices;
     mapping(address => bool) public emergencyOverrideActive;
     mapping(uint256 => VRFRequest) public vrfRequests;
-    mapping(address => uint256) public pendingVRFRequestId; // Tracks VRF request per asset
+    mapping(address => uint256) public pendingVRFRequestId;
 
     // Chainlink VRF configuration
     IVRFCoordinatorV2Plus public vrfCoordinator;
@@ -99,6 +100,28 @@ contract PriceOracle is
     uint16 public requestConfirmations;
     uint32 public numWords;
 
+    // Constants
+    uint256 public constant DEFAULT_HEARTBEAT = 15 minutes;
+    uint32 public constant MIN_TWAP_SECONDS = 5 minutes;
+    uint32 public constant MAX_TWAP_SECONDS = 12 hours;
+    uint32 public constant MIN_BLOCK_WINDOW = 20;
+    uint32 public constant MAX_BLOCK_WINDOW = 512;
+    uint256 public constant PRICE_PRECISION = 1e18;
+    uint128 public constant MIN_LIQUIDITY_THRESHOLD = 1e15;
+    uint16 public constant MAX_FEEDS_PER_ASSET = 5;
+    uint16 public constant MAX_POOLS_PER_ASSET = 5;
+    uint256 public constant BLOCK_TIME = 6;
+    uint256 public constant DEFAULT_MAX_PRICE_DEVIATION = 5e16;
+    uint256 public constant DEFAULT_MAX_FEED_DEVIATION = 2e16;
+    uint256 public constant DEFAULT_EMA_ALPHA = 2e17;
+    uint256 public constant MAX_RELIABILITY_SCORE = 100;
+    uint256 public constant VOLATILITY_PRECISION = 1e18;
+    uint32 public constant MIN_CALLBACK_GAS_LIMIT = 50_000;
+    uint32 public constant MAX_CALLBACK_GAS_LIMIT = 500_000;
+    uint16 public constant MIN_REQUEST_CONFIRMATIONS = 3;
+    uint16 public constant MAX_REQUEST_CONFIRMATIONS = 20;
+    uint256 public constant MAX_ORACLE_ATTEMPTS = 3;
+
     // Events
     event PriceFeedUpdated(address indexed asset, address feed, uint8 decimals, uint256 heartbeat, uint256 weight, uint256 reliabilityScore, uint256 index);
     event UniswapV3PoolAdded(address indexed asset, address pool, uint32 twapSeconds, bool isToken0Base, uint256 index);
@@ -106,12 +129,12 @@ contract PriceOracle is
     event UniswapV3PoolUpdated(address indexed asset, address pool, uint32 twapSeconds, uint128 liquidity, uint256 index);
     event UniswapV2PoolUpdated(address indexed asset, address pool, uint32 blockWindow, uint128 liquidity, bool isSushiSwap, uint256 index);
     event PoolDeactivated(address indexed asset, address pool, uint8 oracleType, uint256 index);
-    event PriceFetched(address indexed asset, uint256 price, uint256 emaPrice, uint256 timestamp, uint8 oracleType);
+    event PriceFetched(address indexed asset, address inputToken, uint256 price, uint256 emaPrice, uint256 timestamp, uint8 oracleType);
     event TWAPWindowAdjusted(address indexed asset, address pool, uint32 oldWindow, uint32 newWindow, uint8 oracleType);
     event EmergencyPriceSet(address indexed asset, uint256 price);
     event EmergencyOverrideToggled(address indexed asset, bool isActive);
-    event VRFRequestSent(uint256 requestId, address indexed asset);
-    event VRFRequestFulfilled(uint256 requestId, address indexed asset, uint256 price, uint8 oracleType);
+    event VRFRequestSent(uint256 requestId, address indexed asset, address inputToken);
+    event VRFRequestFulfilled(uint256 requestId, address indexed asset, address inputToken, uint256 price, uint8 oracleType);
     event VRFConfigUpdated(address coordinator, uint64 subscriptionId, bytes32 keyHash);
     event VolatilityUpdated(address indexed asset, uint256 volatilityIndex);
     event EMASmoothingUpdated(address indexed asset, uint256 oldAlpha, uint256 newAlpha);
@@ -140,27 +163,8 @@ contract PriceOracle is
     error PoolLimitReached(address asset);
     error InvalidEmergencyPrice(address asset);
     error ZeroValue();
-
-    // Constants
-    uint256 public constant DEFAULT_HEARTBEAT = 15 minutes; // Adjusted for better balance
-    uint32 public constant MIN_TWAP_SECONDS = 5 minutes;
-    uint32 public constant MAX_TWAP_SECONDS = 12 hours;
-    uint32 public constant MIN_BLOCK_WINDOW = 20;
-    uint32 public constant MAX_BLOCK_WINDOW = 512;
-    uint256 public constant PRICE_PRECISION = 1e18;
-    uint128 public constant MIN_LIQUIDITY_THRESHOLD = 1e15;
-    uint16 public constant MAX_FEEDS_PER_ASSET = 5;
-    uint16 public constant MAX_POOLS_PER_ASSET = 5;
-    uint256 public constant BLOCK_TIME = 6;
-    uint256 public constant DEFAULT_MAX_PRICE_DEVIATION = 5e16;
-    uint256 public constant DEFAULT_MAX_FEED_DEVIATION = 2e16;
-    uint256 public constant DEFAULT_EMA_ALPHA = 2e17;
-    uint256 public constant MAX_RELIABILITY_SCORE = 100;
-    uint256 public constant VOLATILITY_PRECISION = 1e18;
-    uint32 public constant MIN_CALLBACK_GAS_LIMIT = 50_000;
-    uint32 public constant MAX_CALLBACK_GAS_LIMIT = 500_000;
-    uint16 public constant MIN_REQUEST_CONFIRMATIONS = 3;
-    uint16 public constant MAX_REQUEST_CONFIRMATIONS = 20;
+    error InvalidTokenPair();
+    error MaxOracleAttemptsReached();
 
     /// @custom:oz-upgrades-unsafe-allow constructor
     constructor(address _vrfCoordinator) VRFConsumerBaseV2Plus(_vrfCoordinator) {
@@ -168,16 +172,9 @@ contract PriceOracle is
     }
 
     /// @notice Authorizes contract upgrades
-    /// @dev Required for UUPS proxy, only owner can upgrade
     function _authorizeUpgrade(address) internal override onlyOwner {}
 
     /// @notice Initializes the contract
-    /// @param initialOwner The initial owner address
-    /// @param _vrfCoordinator Chainlink VRF Coordinator address
-    /// @param _subscriptionId Chainlink VRF subscription ID
-    /// @param _keyHash Chainlink VRF key hash
-    /// @param _callbackGasLimit Gas limit for VRF callback
-    /// @param _requestConfirmations Number of confirmations for VRF request
     function initialize(
         address initialOwner,
         address _vrfCoordinator,
@@ -204,11 +201,6 @@ contract PriceOracle is
     }
 
     /// @notice Updates VRF configuration
-    /// @param _vrfCoordinator Chainlink VRF Coordinator address
-    /// @param _subscriptionId Chainlink VRF subscription ID
-    /// @param _keyHash Chainlink VRF key hash
-    /// @param _callbackGasLimit Gas limit for VRF callback
-    /// @param _requestConfirmations Number of confirmations for VRF request
     function updateVRFConfig(
         address _vrfCoordinator,
         uint64 _subscriptionId,
@@ -238,13 +230,39 @@ contract PriceOracle is
         _unpause();
     }
 
+    /// @notice Sets up asset configuration with token pair
+    function setAssetConfig(
+        address asset,
+        address tokenA,
+        address tokenB,
+        uint8 primaryOracle,
+        uint256 maxPriceDeviation,
+        uint256 maxFeedDeviation,
+        bool useVRF,
+        uint256 emaAlpha,
+        uint256 volatilityIndex
+    ) external onlyOwner {
+        if (asset == address(0) || tokenA == address(0) || tokenB == address(0)) revert ZeroAddress();
+        if (tokenA == tokenB) revert InvalidTokenPair();
+        if (primaryOracle > 3 || emaAlpha > 1e18) revert InvalidInput();
+
+        AssetConfig storage config = assetConfigs[asset];
+        emit EMASmoothingUpdated(asset, config.emaAlpha, emaAlpha == 0 ? DEFAULT_EMA_ALPHA : emaAlpha);
+        if (config.volatilityIndex != volatilityIndex) {
+            emit VolatilityUpdated(asset, volatilityIndex == 0 ? 1e18 : volatilityIndex);
+        }
+
+        config.tokenA = tokenA;
+        config.tokenB = tokenB;
+        config.primaryOracle = primaryOracle;
+        config.maxPriceDeviation = maxPriceDeviation == 0 ? DEFAULT_MAX_PRICE_DEVIATION : maxPriceDeviation;
+        config.maxFeedDeviation = maxFeedDeviation == 0 ? DEFAULT_MAX_FEED_DEVIATION : maxFeedDeviation;
+        config.useVRF = useVRF;
+        config.emaAlpha = emaAlpha == 0 ? DEFAULT_EMA_ALPHA : emaAlpha;
+        config.volatilityIndex = volatilityIndex == 0 ? 1e18 : volatilityIndex;
+    }
+
     /// @notice Adds or updates a Chainlink price feed
-    /// @param asset The asset address
-    /// @param feed The Chainlink price feed address
-    /// @param decimals Decimals of the price feed
-    /// @param heartbeat Maximum time before price is considered stale
-    /// @param weight Weight for weighted median calculation
-    /// @param reliabilityScore Reliability score for VRF selection (0-100)
     function setPriceFeed(
         address asset,
         address feed,
@@ -273,8 +291,6 @@ contract PriceOracle is
     }
 
     /// @notice Deactivates a Chainlink price feed
-    /// @param asset The asset address
-    /// @param feedIndex Index of the price feed
     function deactivatePriceFeed(address asset, uint256 feedIndex) external onlyOwner {
         if (feedIndex >= priceFeedCount[asset]) revert InvalidPriceFeed(asset);
         priceFeeds[asset][feedIndex].isActive = false;
@@ -282,10 +298,6 @@ contract PriceOracle is
     }
 
     /// @notice Adds a Uniswap V3 pool
-    /// @param asset The asset address
-    /// @param poolAddress The Uniswap V3 pool address
-    /// @param twapSeconds TWAP window in seconds
-    /// @param isToken0Base Whether token0 is the base token
     function addUniswapV3Pool(
         address asset,
         address poolAddress,
@@ -319,11 +331,6 @@ contract PriceOracle is
     }
 
     /// @notice Adds a Uniswap V2-style pool (SushiSwap or PancakeSwap)
-    /// @param asset The asset address
-    /// @param poolAddress The pool address
-    /// @param blockWindow Number of blocks for TWAP
-    /// @param isToken0Base Whether token0 is the base token
-    /// @param isSushiSwap Whether the pool is SushiSwap (true) or PancakeSwap (false)
     function addUniswapV2Pool(
         address asset,
         address poolAddress,
@@ -336,7 +343,7 @@ contract PriceOracle is
 
         IUniswapV2Pair pool = IUniswapV2Pair(poolAddress);
         (uint112 reserve0, uint112 reserve1, ) = pool.getReserves();
-        uint128 liquidity = uint128(uint256(reserve0).mul(reserve1));
+        uint128 liquidity = uint128(uint256(reserve0) * uint256(reserve1));
         if (liquidity < MIN_LIQUIDITY_THRESHOLD) revert InsufficientLiquidity(poolAddress);
 
         uint256 index;
@@ -371,43 +378,7 @@ contract PriceOracle is
         emit UniswapV2PoolAdded(asset, poolAddress, blockWindow, isToken0Base, isSushiSwap, index);
     }
 
-    /// @notice Sets oracle preference and VRF usage
-    /// @param asset The asset address
-    /// @param oracleType Primary oracle type (0: Chainlink, 1: Uniswap V3, 2: SushiSwap, 3: PancakeSwap)
-    /// @param maxPriceDeviation Maximum allowed deviation from secondary oracle
-    /// @param maxFeedDeviation Maximum allowed deviation between Chainlink feeds
-    /// @param useVRF Whether to use VRF for oracle selection
-    /// @param emaAlpha EMA smoothing factor
-    /// @param volatilityIndex Volatility index for dynamic heartbeat
-    function setOraclePreference(
-        address asset,
-        uint8 oracleType,
-        uint256 maxPriceDeviation,
-        uint256 maxFeedDeviation,
-        bool useVRF,
-        uint256 emaAlpha,
-        uint256 volatilityIndex
-    ) external onlyOwner {
-        if (asset == address(0)) revert ZeroAddress();
-        if (oracleType > 3 || emaAlpha > 1e18) revert InvalidInput();
-
-        AssetConfig storage config = assetConfigs[asset];
-        emit EMASmoothingUpdated(asset, config.emaAlpha, emaAlpha == 0 ? DEFAULT_EMA_ALPHA : emaAlpha);
-        if (config.volatilityIndex != volatilityIndex) {
-            emit VolatilityUpdated(asset, volatilityIndex == 0 ? 1e18 : volatilityIndex);
-        }
-
-        config.primaryOracle = oracleType;
-        config.maxPriceDeviation = maxPriceDeviation == 0 ? DEFAULT_MAX_PRICE_DEVIATION : maxPriceDeviation;
-        config.maxFeedDeviation = maxFeedDeviation == 0 ? DEFAULT_MAX_FEED_DEVIATION : maxFeedDeviation;
-        config.useVRF = useVRF;
-        config.emaAlpha = emaAlpha == 0 ? DEFAULT_EMA_ALPHA : emaAlpha;
-        config.volatilityIndex = volatilityIndex == 0 ? 1e18 : volatilityIndex;
-    }
-
-    /// @notice Sets emergency price override with deviation check
-    /// @param asset The asset address
-    /// @param price The emergency price
+    /// @notice Sets emergency price override
     function setEmergencyPrice(address asset, uint256 price) external onlyOwner {
         if (asset == address(0)) revert ZeroAddress();
         if (price == 0) revert ZeroValue();
@@ -417,8 +388,8 @@ contract PriceOracle is
             uint256 secondaryPrice = getSecondaryPrice(asset, config.primaryOracle);
             if (secondaryPrice > 0) {
                 uint256 deviation = price > secondaryPrice
-                    ? price.sub(secondaryPrice).mul(1e18).div(secondaryPrice)
-                    : secondaryPrice.sub(price).mul(1e18).div(price);
+                    ? (price - secondaryPrice) * 1e18 / secondaryPrice
+                    : (secondaryPrice - price) * 1e18 / price;
                 if (deviation > config.maxPriceDeviation) revert InvalidEmergencyPrice(asset);
             }
         }
@@ -430,7 +401,6 @@ contract PriceOracle is
     }
 
     /// @notice Disables emergency price override
-    /// @param asset The asset address
     function disableEmergencyOverride(address asset) external onlyOwner {
         if (asset == address(0)) revert ZeroAddress();
         emergencyOverrideActive[asset] = false;
@@ -438,9 +408,6 @@ contract PriceOracle is
     }
 
     /// @notice Deactivates a pool
-    /// @param asset The asset address
-    /// @param poolIndex Index of the pool
-    /// @param oracleType Oracle type (1: Uniswap V3, 2: SushiSwap, 3: PancakeSwap)
     function deactivatePool(address asset, uint256 poolIndex, uint8 oracleType) external onlyOwner {
         if (oracleType == 1) {
             if (poolIndex >= uniswapV3PoolCount[asset]) revert InvalidPool(asset);
@@ -460,9 +427,6 @@ contract PriceOracle is
     }
 
     /// @notice Updates TWAP window for a pool
-    /// @param asset The asset address
-    /// @param poolIndex Index of the pool
-    /// @param oracleType Oracle type (1: Uniswap V3, 2: SushiSwap, 3: PancakeSwap)
     function updateTWAPWindow(address asset, uint256 poolIndex, uint8 oracleType) external nonReentrant whenNotPaused {
         if (oracleType == 1) {
             if (poolIndex >= uniswapV3PoolCount[asset]) revert InvalidPool(asset);
@@ -494,7 +458,7 @@ contract PriceOracle is
 
             IUniswapV2Pair pool = IUniswapV2Pair(poolConfig.poolAddress);
             (uint112 reserve0, uint112 reserve1, uint32 blockTimestampLast) = pool.getReserves();
-            uint128 liquidity = uint128(uint256(reserve0).mul(reserve1));
+            uint128 liquidity = uint128(uint256(reserve0) * uint256(reserve1));
             if (liquidity < MIN_LIQUIDITY_THRESHOLD) revert InsufficientLiquidity(poolConfig.poolAddress);
 
             uint32 newWindow = calculateDynamicBlockWindow(liquidity);
@@ -513,69 +477,103 @@ contract PriceOracle is
     }
 
     /// @notice Gets the current EMA price for an asset
-    /// @param asset The asset address
-    /// @return The current EMA price
     function getCurrentPrice(address asset) external view returns (uint256) {
+        if (emergencyOverrideActive[asset]) return emergencyPrices[asset];
+        if (pendingVRFRequestId[asset] != 0) {
+            VRFRequest memory request = vrfRequests[pendingVRFRequestId[asset]];
+            return request.price != 0 ? request.price : assetConfigs[asset].emaPrice;
+        }
         return assetConfigs[asset].emaPrice;
     }
 
+    /// @notice Gets the current price for a specific token pair
+    /// @param asset The asset address (e.g., token pair or pool address)
+    /// @param inputToken The token to base the price on (tokenA or tokenB)
+    /// @return price The price in 1e18 precision
+    /// @return isCached Whether the price is cached
+    function getCurrentPairPrice(address asset, address inputToken) public view returns (uint256 price, bool isCached) {
+    if (asset == address(0) || inputToken == address(0)) revert ZeroAddress();
+    AssetConfig memory config = assetConfigs[asset];
+    if (inputToken != config.tokenA && inputToken != config.tokenB) revert InvalidTokenPair();
+
+    price = getCurrentPrice(asset);
+    isCached = emergencyOverrideActive[asset] || pendingVRFRequestId[asset] != 0;
+    if (price == 0) return (0, isCached);
+
+    // If inputToken is tokenB, invert the price (tokenB/tokenA = 1 / (tokenA/tokenB))
+    price = inputToken == config.tokenA ? price : (PRICE_PRECISION * PRICE_PRECISION) / price;
+    return (price, isCached);
+    }
+
     /// @notice Checks if a VRF request is pending for an asset
-    /// @param asset The asset address
-    /// @return requestId The pending VRF request ID, or 0 if none
     function getPendingVRFRequest(address asset) external view returns (uint256) {
         return pendingVRFRequestId[asset];
     }
 
-    /// @notice Requests price with optional VRF-based oracle selection
-    /// @param asset The asset address
-    /// @return price The EMA price, or 0 if VRF request is sent
+    /// @notice Gets the price for an asset using the default token pair
+    /// @param asset The asset address (e.g., token pair or pool address)
+    /// @return The price in 1e18 precision
     function getPrice(address asset) external nonReentrant whenNotPaused returns (uint256) {
-    if (emergencyOverrideActive[asset]) {
-        uint256 price = emergencyPrices[asset];
+    if (asset == address(0)) revert ZeroAddress();
+    AssetConfig storage config = assetConfigs[asset];
+    if (config.tokenA == address(0)) revert InvalidTokenPair();
+    return getPrice(asset, config.tokenA);
+    }
+
+    /// @notice Requests price with optional VRF-based oracle selection for a specific token pair
+    function getPrice(address asset, address inputToken) external nonReentrant whenNotPaused returns (uint256) {
+        if (asset == address(0) || inputToken == address(0)) revert ZeroAddress();
+        AssetConfig storage config = assetConfigs[asset];
+        if (inputToken != config.tokenA && inputToken != config.tokenB) revert InvalidTokenPair();
+
+        if (emergencyOverrideActive[asset]) {
+            uint256 price = emergencyPrices[asset];
+            price = inputToken == config.tokenA ? price : (PRICE_PRECISION * PRICE_PRECISION) / price;
+            uint256 emaPrice = updateEMA(asset, price);
+            emit PriceFetched(asset, inputToken, price, emaPrice, block.timestamp, 4);
+            return emaPrice;
+        }
+
+        if (config.useVRF && address(vrfCoordinator) != address(0)) {
+            if (pendingVRFRequestId[asset] != 0) revert VRFRequestPending(asset);
+            uint256 requestId = vrfCoordinator.requestRandomWords(
+                VRFV2PlusClient.RandomWordsRequest({
+                    keyHash: keyHash,
+                    subId: subscriptionId,
+                    requestConfirmations: requestConfirmations,
+                    callbackGasLimit: callbackGasLimit,
+                    numWords: numWords,
+                    extraArgs: VRFV2PlusClient._argsToBytes(
+                        VRFV2PlusClient.ExtraArgsV1({nativePayment: false})
+                    )
+                })
+            );
+            vrfRequests[requestId] = VRFRequest({
+                asset: asset,
+                inputToken: inputToken,
+                requestId: requestId,
+                isPending: true,
+                price: assetConfigs[asset].emaPrice, // Cache last valid price
+                timestamp: block.timestamp,
+                attempts: 0
+            });
+            pendingVRFRequestId[asset] = requestId;
+            emit VRFRequestSent(requestId, asset, inputToken);
+            return assetConfigs[asset].emaPrice; // Return cached price while VRF is pending
+        }
+
+        uint256 price = fetchPriceDeterministic(asset);
+        price = inputToken == config.tokenA ? price : (PRICE_PRECISION * PRICE_PRECISION) / price;
         uint256 emaPrice = updateEMA(asset, price);
-        emit PriceFetched(asset, price, emaPrice, block.timestamp, 4);
+        emit PriceFetched(asset, inputToken, price, emaPrice, block.timestamp, config.primaryOracle);
         return emaPrice;
     }
 
-    AssetConfig storage config = assetConfigs[asset];
-    if (config.useVRF && address(vrfCoordinator) != address(0)) {
-        if (pendingVRFRequestId[asset] != 0) revert VRFRequestPending(asset);
-        uint256 requestId = vrfCoordinator.requestRandomWords(
-            VRFV2PlusClient.RandomWordsRequest({
-                keyHash: keyHash,
-                subId: subscriptionId,
-                requestConfirmations: requestConfirmations,
-                callbackGasLimit: callbackGasLimit,
-                numWords: numWords,
-                extraArgs: VRFV2PlusClient._argsToBytes(
-                    VRFV2PlusClient.ExtraArgsV1({nativePayment: false})
-                )
-            })
-        ); // Semicolon after function call
-        vrfRequests[requestId] = VRFRequest({
-            asset: asset,
-            requestId: requestId,
-            isPending: true,
-            price: 0,
-            timestamp: 0
-        }); // Semicolon
-        pendingVRFRequestId[asset] = requestId; // Semicolon
-        emit VRFRequestSent(requestId, asset); // Semicolon
-        return 0; // Indicate VRF request is pending
-    }
-
-    uint256 price = fetchPriceDeterministic(asset);
-    uint256 emaPrice = updateEMA(asset, price);
-    emit PriceFetched(asset, price, emaPrice, block.timestamp, config.primaryOracle);
-    return emaPrice;
-}
-
     /// @notice Fulfills VRF request with weighted oracle selection
-    /// @param requestId The VRF request ID
-    /// @param randomWords The random words provided by VRF
     function fulfillRandomWords(uint256 requestId, uint256[] memory randomWords) internal override {
         VRFRequest storage request = vrfRequests[requestId];
         if (request.asset == address(0) || !request.isPending) revert InvalidVRFRequest(requestId);
+        if (request.attempts >= MAX_ORACLE_ATTEMPTS) revert MaxOracleAttemptsReached();
 
         AssetConfig storage config = assetConfigs[request.asset];
         uint256 randomWord = randomWords[0];
@@ -594,18 +592,17 @@ contract PriceOracle is
             for (uint256 i = 0; i < priceFeedCount[request.asset]; i++) {
                 PriceFeedConfig memory feed = priceFeeds[request.asset][i];
                 if (feed.isActive) {
-                    oracleReliabilitySums[0] = oracleReliabilitySums[0].add(feed.reliabilityScore);
+                    oracleReliabilitySums[0] += feed.reliabilityScore;
                 }
             }
-            totalReliability = totalReliability.add(oracleReliabilitySums[0]);
+            totalReliability += oracleReliabilitySums[0];
         }
         if (oracleAvailability[1]) oracleReliabilitySums[1] = 75;
         if (oracleAvailability[2]) oracleReliabilitySums[2] = 60;
         if (oracleAvailability[3]) oracleReliabilitySums[3] = 60;
-        totalReliability = totalReliability
-            .add(oracleAvailability[1] ? oracleReliabilitySums[1] : 0)
-            .add(oracleAvailability[2] ? oracleReliabilitySums[2] : 0)
-            .add(oracleAvailability[3] ? oracleReliabilitySums[3] : 0);
+        totalReliability += (oracleAvailability[1] ? oracleReliabilitySums[1] : 0) +
+                           (oracleAvailability[2] ? oracleReliabilitySums[2] : 0) +
+                           (oracleAvailability[3] ? oracleReliabilitySums[3] : 0);
 
         if (totalReliability == 0) revert NoValidPools(request.asset);
 
@@ -613,7 +610,7 @@ contract PriceOracle is
         uint256 cumulativeReliability = 0;
         for (uint8 i = 0; i < 4; i++) {
             if (oracleAvailability[i]) {
-                cumulativeReliability = cumulativeReliability.add(oracleReliabilitySums[i]);
+                cumulativeReliability += oracleReliabilitySums[i];
                 if (randomValue < cumulativeReliability) {
                     oracleType = i;
                     break;
@@ -625,36 +622,96 @@ contract PriceOracle is
         try this.fetchPriceWithOracle(request.asset, oracleType) returns (uint256 _price) {
             price = _price;
         } catch {
-            price = fetchPriceDeterministic(request.asset);
-            oracleType = config.primaryOracle;
+            request.attempts++;
+            if (request.attempts < MAX_ORACLE_ATTEMPTS) {
+                // Retry with a new VRF request
+                uint256 newRequestId = vrfCoordinator.requestRandomWords(
+                    VRFV2PlusClient.RandomWordsRequest({
+                        keyHash: keyHash,
+                        subId: subscriptionId,
+                        requestConfirmations: requestConfirmations,
+                        callbackGasLimit: callbackGasLimit,
+                        numWords: numWords,
+                        extraArgs: VRFV2PlusClient._argsToBytes(
+                            VRFV2PlusClient.ExtraArgsV1({nativePayment: false})
+                        )
+                    })
+                );
+                vrfRequests[newRequestId] = VRFRequest({
+                    asset: request.asset,
+                    inputToken: request.inputToken,
+                    requestId: newRequestId,
+                    isPending: true,
+                    price: request.price,
+                    timestamp: block.timestamp,
+                    attempts: request.attempts
+                });
+                pendingVRFRequestId[request.asset] = newRequestId;
+                delete vrfRequests[requestId];
+                emit VRFRequestSent(newRequestId, request.asset, request.inputToken);
+                return;
+            } else {
+                price = fetchPriceDeterministic(request.asset);
+                oracleType = config.primaryOracle;
+            }
         }
 
         if (config.maxPriceDeviation > 0) {
             uint256 secondaryPrice = getSecondaryPrice(request.asset, oracleType);
             if (secondaryPrice > 0) {
                 uint256 deviation = price > secondaryPrice
-                    ? price.sub(secondaryPrice).mul(1e18).div(secondaryPrice)
-                    : secondaryPrice.sub(price).mul(1e18).div(price);
+                    ? (price - secondaryPrice) * 1e18 / secondaryPrice
+                    : (secondaryPrice - price) * 1e18 / price;
                 if (deviation > config.maxPriceDeviation) {
-                    price = fetchPriceDeterministic(request.asset);
-                    oracleType = config.primaryOracle;
+                    request.attempts++;
+                    if (request.attempts < MAX_ORACLE_ATTEMPTS) {
+                        // Retry with a new VRF request
+                        uint256 newRequestId = vrfCoordinator.requestRandomWords(
+                            VRFV2PlusClient.RandomWordsRequest({
+                                keyHash: keyHash,
+                                subId: subscriptionId,
+                                requestConfirmations: requestConfirmations,
+                                callbackGasLimit: callbackGasLimit,
+                                numWords: numWords,
+                                extraArgs: VRFV2PlusClient._argsToBytes(
+                                    VRFV2PlusClient.ExtraArgsV1({nativePayment: false})
+                                )
+                            })
+                        );
+                        vrfRequests[newRequestId] = VRFRequest({
+                            asset: request.asset,
+                            inputToken: request.inputToken,
+                            requestId: newRequestId,
+                            isPending: true,
+                            price: request.price,
+                            timestamp: block.timestamp,
+                            attempts: request.attempts
+                        });
+                        pendingVRFRequestId[request.asset] = newRequestId;
+                        delete vrfRequests[requestId];
+                        emit VRFRequestSent(newRequestId, request.asset, request.inputToken);
+                        return;
+                    } else {
+                        price = fetchPriceDeterministic(request.asset);
+                        oracleType = config.primaryOracle;
+                    }
                 }
             }
         }
 
+        // Adjust price based on inputToken
+        price = request.inputToken == config.tokenA ? price : (PRICE_PRECISION * PRICE_PRECISION) / price;
         price = updateEMA(request.asset, price);
         request.price = price;
         request.timestamp = block.timestamp;
         request.isPending = false;
         pendingVRFRequestId[request.asset] = 0;
-        emit VRFRequestFulfilled(requestId, request.asset, price, oracleType);
-        emit PriceFetched(request.asset, price, price, block.timestamp, oracleType);
+        emit VRFRequestFulfilled(requestId, request.asset, request.inputToken, price, oracleType);
+        emit PriceFetched(request.asset, request.inputToken, price, price, block.timestamp, oracleType);
     }
 
     /// @notice Fetches price using deterministic logic
-    /// @param asset The asset address
-    /// @return price The fetched price
-    function fetchPriceDeterministic(address asset) internal nonReentrant returns (uint256) {
+    function fetchPriceDeterministic(address asset) internal returns (uint256) {
         AssetConfig storage config = assetConfigs[asset];
         uint8 oracleType = config.primaryOracle;
         uint256 price;
@@ -705,8 +762,8 @@ contract PriceOracle is
             uint256 secondaryPrice = getSecondaryPrice(asset, oracleType);
             if (secondaryPrice > 0) {
                 uint256 deviation = price > secondaryPrice
-                    ? price.sub(secondaryPrice).mul(1e18).div(secondaryPrice)
-                    : secondaryPrice.sub(price).mul(1e18).div(price);
+                    ? (price - secondaryPrice) * 1e18 / secondaryPrice
+                    : (secondaryPrice - price) * 1e18 / price;
                 if (deviation > config.maxPriceDeviation) revert PriceDeviationTooHigh(asset);
             }
         }
@@ -715,9 +772,6 @@ contract PriceOracle is
     }
 
     /// @notice Fetches price with specific oracle type
-    /// @param asset The asset address
-    /// @param oracleType Oracle type (0: Chainlink, 1: Uniswap V3, 2: SushiSwap, 3: PancakeSwap)
-    /// @return price The fetched price
     function fetchPriceWithOracle(address asset, uint8 oracleType) external returns (uint256) {
         if (msg.sender != address(this)) revert InvalidInput();
         if (oracleType == 0) return getChainlinkPrice(asset);
@@ -727,8 +781,6 @@ contract PriceOracle is
     }
 
     /// @notice Gets aggregated Chainlink price
-    /// @param asset The asset address
-    /// @return price The weighted median price
     function getChainlinkPrice(address asset) public returns (uint256) {
         uint256 feedCount = priceFeedCount[asset];
         if (feedCount == 0) revert InvalidPriceFeed(asset);
@@ -752,10 +804,10 @@ contract PriceOracle is
                 uint256 heartbeat = calculateDynamicHeartbeat(asset);
                 if (price <= 0 || answeredInRound < roundId || block.timestamp > updatedAt + heartbeat) continue;
 
-                uint256 adjustedPrice = config.decimals == 18 ? uint256(price) : uint256(price).mul(10**(18 - config.decimals));
+                uint256 adjustedPrice = uint256(price) * 1e18 / (10 ** config.decimals);
                 prices[validPrices] = adjustedPrice;
                 weights[validPrices] = config.weight;
-                totalWeight = totalWeight.add(config.weight);
+                totalWeight += config.weight;
                 config.lastPrice = adjustedPrice;
                 config.lastUpdated = block.timestamp;
                 validPrices++;
@@ -771,8 +823,8 @@ contract PriceOracle is
             uint256 medianPrice = calculateMedian(prices, validPrices);
             for (uint256 i = 0; i < validPrices; i++) {
                 uint256 deviation = prices[i] > medianPrice
-                    ? prices[i].sub(medianPrice).mul(1e18).div(medianPrice)
-                    : medianPrice.sub(prices[i]).mul(1e18).div(prices[i]);
+                    ? (prices[i] - medianPrice) * 1e18 / medianPrice
+                    : (medianPrice - prices[i]) * 1e18 / prices[i];
                 if (deviation > assetConfig.maxFeedDeviation) revert FeedDeviationTooHigh(asset);
             }
         }
@@ -781,8 +833,6 @@ contract PriceOracle is
     }
 
     /// @notice Gets Uniswap V3 TWAP
-    /// @param asset The asset address
-    /// @return price The median TWAP price
     function getUniswapV3TWAP(address asset) public returns (uint256) {
         uint256 poolCount = uniswapV3PoolCount[asset];
         if (poolCount == 0) revert InvalidPool(asset);
@@ -823,9 +873,6 @@ contract PriceOracle is
     }
 
     /// @notice Gets Uniswap V2-style TWAP (SushiSwap or PancakeSwap)
-    /// @param asset The asset address
-    /// @param isSushiSwap Whether to use SushiSwap (true) or PancakeSwap (false)
-    /// @return price The median TWAP price
     function getUniswapV2TWAP(address asset, bool isSushiSwap) public returns (uint256) {
         uint256 poolCount = isSushiSwap ? sushiSwapPoolCount[asset] : pancakeSwapPoolCount[asset];
         if (poolCount == 0) revert InvalidPool(asset);
@@ -845,7 +892,7 @@ contract PriceOracle is
 
             uint256 price0Cumulative = pool.price0CumulativeLast();
             uint256 price1Cumulative = pool.price1CumulativeLast();
-            uint256 timeElapsed = block.timestamp.sub(poolConfig.lastBlockTimestamp);
+            uint256 timeElapsed = block.timestamp - poolConfig.lastBlockTimestamp;
 
             if (timeElapsed < poolConfig.blockWindow * BLOCK_TIME) continue;
 
@@ -868,9 +915,6 @@ contract PriceOracle is
     }
 
     /// @notice Gets secondary price for deviation check
-    /// @param asset The asset address
-    /// @param primaryOracle The primary oracle type
-    /// @return price The secondary price, or 0 if none available
     function getSecondaryPrice(address asset, uint8 primaryOracle) internal returns (uint256) {
         for (uint8 i = 0; i < 4; i++) {
             if (i == primaryOracle) continue;
@@ -904,9 +948,6 @@ contract PriceOracle is
     }
 
     /// @notice Updates EMA for price smoothing
-    /// @param asset The asset address
-    /// @param newPrice The new price to incorporate
-    /// @return emaPrice The updated EMA price
     function updateEMA(address asset, uint256 newPrice) internal returns (uint256) {
         if (newPrice == 0) revert InvalidPrice(asset);
         AssetConfig storage config = assetConfigs[asset];
@@ -914,35 +955,26 @@ contract PriceOracle is
             uint256 secondaryPrice = getSecondaryPrice(asset, config.primaryOracle);
             if (secondaryPrice > 0 && config.maxPriceDeviation > 0) {
                 uint256 deviation = newPrice > secondaryPrice
-                    ? newPrice.sub(secondaryPrice).mul(1e18).div(secondaryPrice)
-                    : secondaryPrice.sub(newPrice).mul(1e18).div(newPrice);
+                    ? (newPrice - secondaryPrice) * 1e18 / secondaryPrice
+                    : (secondaryPrice - newPrice) * 1e18 / newPrice;
                 if (deviation > config.maxPriceDeviation) revert InvalidPrice(asset);
             }
             config.emaPrice = newPrice;
             return newPrice;
         }
-        config.emaPrice = config.emaPrice
-            .mul(1e18 - config.emaAlpha)
-            .add(newPrice.mul(config.emaAlpha))
-            .div(1e18);
+        config.emaPrice = (config.emaPrice * (1e18 - config.emaAlpha) + newPrice * config.emaAlpha) / 1e18;
         return config.emaPrice;
     }
 
     /// @notice Calculates dynamic heartbeat based on volatility
-    /// @param asset The asset address
-    /// @return heartbeat The calculated heartbeat
     function calculateDynamicHeartbeat(address asset) internal view returns (uint256) {
         uint256 volatility = assetConfigs[asset].volatilityIndex;
         if (volatility == 0) volatility = 1e18;
-        uint256 heartbeat = DEFAULT_HEARTBEAT.mul(1e18).div(volatility);
+        uint256 heartbeat = DEFAULT_HEARTBEAT * 1e18 / volatility;
         return heartbeat < 5 minutes ? 5 minutes : heartbeat > 30 minutes ? 30 minutes : heartbeat;
     }
 
     /// @notice Calculates Uniswap V2 TWAP
-    /// @param priceCumulativeEnd The ending cumulative price
-    /// @param priceCumulativeStart The starting cumulative price
-    /// @param timeElapsed Time elapsed between prices
-    /// @return price The calculated TWAP
     function calculateUniswapV2TWAP(
         uint256 priceCumulativeEnd,
         uint256 priceCumulativeStart,
@@ -957,9 +989,6 @@ contract PriceOracle is
     }
 
     /// @notice Converts Uniswap V3 tick to price
-    /// @param tick The Uniswap V3 tick
-    /// @param isToken0Base Whether token0 is the base token
-    /// @return price The converted price
     function tickToPrice(int24 tick, bool isToken0Base) internal pure returns (uint256) {
         uint160 sqrtPriceX96 = TickMath.getSqrtRatioAtTick(tick);
         uint256 price;
@@ -981,11 +1010,6 @@ contract PriceOracle is
     }
 
     /// @notice Calculates weighted median price
-    /// @param prices Array of prices
-    /// @param weights Array of weights
-    /// @param validCount Number of valid prices
-    /// @param totalWeight Total weight of valid prices
-    /// @return medianPrice The weighted median price
     function calculateWeightedMedian(
         uint256[] memory prices,
         uint256[] memory weights,
@@ -1015,12 +1039,12 @@ contract PriceOracle is
         }
 
         uint256 cumulativeWeight = 0;
-        uint256 targetWeight = totalWeight.div(2);
+        uint256 targetWeight = totalWeight / 2;
         for (uint256 i = 0; i < validCount; i++) {
-            cumulativeWeight = cumulativeWeight.add(sortedWeights[i]);
+            cumulativeWeight += sortedWeights[i];
             if (cumulativeWeight >= targetWeight) {
                 if (cumulativeWeight == targetWeight && i < validCount - 1) {
-                    return (sortedPrices[i] + sortedPrices[i + 1]).div(2);
+                    return (sortedPrices[i] + sortedPrices[i + 1]) / 2;
                 }
                 return sortedPrices[i];
             }
@@ -1029,9 +1053,6 @@ contract PriceOracle is
     }
 
     /// @notice Calculates median price
-    /// @param prices Array of prices
-    /// @param validCount Number of valid prices
-    /// @return medianPrice The median price
     function calculateMedian(uint256[] memory prices, uint256 validCount) internal pure returns (uint256) {
         if (validCount == 0) revert InvalidInput();
 
@@ -1058,58 +1079,42 @@ contract PriceOracle is
     }
 
     /// @notice Calculates required observation cardinality for Uniswap V3
-    /// @param twapSeconds TWAP window in seconds
-    /// @return cardinality The required observation cardinality
     function calculateRequiredCardinality(uint32 twapSeconds) internal pure returns (uint16) {
         return uint16(twapSeconds / 30) + 1;
     }
 
     /// @notice Calculates dynamic TWAP window based on liquidity
-    /// @param liquidity The pool liquidity
-    /// @return window The calculated TWAP window
     function calculateDynamicTWAPWindow(uint128 liquidity) internal pure returns (uint32) {
         if (liquidity < MIN_LIQUIDITY_THRESHOLD) return MAX_TWAP_SECONDS;
         if (liquidity > 1e18) return MIN_TWAP_SECONDS;
-        uint256 liquidityFactor = uint256(liquidity).mul(1e18).div(1e18 - MIN_LIQUIDITY_THRESHOLD);
-        uint32 window = uint32(MAX_TWAP_SECONDS - (MAX_TWAP_SECONDS - MIN_TWAP_SECONDS).mul(liquidityFactor).div(1e18));
+        uint256 liquidityFactor = uint256(liquidity) * 1e18 / (1e18 - MIN_LIQUIDITY_THRESHOLD);
+        uint32 window = uint32(MAX_TWAP_SECONDS - (MAX_TWAP_SECONDS - MIN_TWAP_SECONDS) * liquidityFactor / 1e18);
         return window < MIN_TWAP_SECONDS ? MIN_TWAP_SECONDS : window;
     }
 
     /// @notice Calculates dynamic block window based on liquidity
-    /// @param liquidity The pool liquidity
-    /// @return window The calculated block window
     function calculateDynamicBlockWindow(uint128 liquidity) internal pure returns (uint32) {
         if (liquidity < MIN_LIQUIDITY_THRESHOLD) return MAX_BLOCK_WINDOW;
         if (liquidity > 1e18) return MIN_BLOCK_WINDOW;
-        uint256 liquidityFactor = uint256(liquidity).mul(1e18).div(1e18 - MIN_LIQUIDITY_THRESHOLD);
-        uint32 window = uint32(MAX_BLOCK_WINDOW - (MAX_BLOCK_WINDOW - MIN_BLOCK_WINDOW).mul(liquidityFactor).div(1e18));
+        uint256 liquidityFactor = uint256(liquidity) * 1e18 / (1e18 - MIN_LIQUIDITY_THRESHOLD);
+        uint32 window = uint32(MAX_BLOCK_WINDOW - (MAX_BLOCK_WINDOW - MIN_BLOCK_WINDOW) * liquidityFactor / 1e18);
         return window < MIN_BLOCK_WINDOW ? MIN_BLOCK_WINDOW : window;
     }
 
     /// @notice Gets price feed configuration
-    /// @param asset The asset address
-    /// @param index The feed index
-    /// @return config The price feed configuration
     function getPriceFeedConfig(address asset, uint256 index) external view returns (PriceFeedConfig memory) {
         return priceFeeds[asset][index];
     }
 
     /// @notice Gets Uniswap V3 pool configuration
-    /// @param asset The asset address
-    /// @param index The pool index
-    /// @return config The Uniswap V3 pool configuration
     function getUniswapV3PoolConfig(address asset, uint256 index) external view returns (UniswapV3PoolConfig memory) {
         return uniswapV3Pools[asset][index];
     }
 
     /// @notice Gets Uniswap V2 pool configuration
-    /// @param asset The asset address
-    /// @param index The pool index
-    /// @param isSushiSwap Whether to fetch SushiSwap (true) or PancakeSwap (false)
-    /// @return config The Uniswap V2 pool configuration
     function getUniswapV2PoolConfig(address asset, uint256 index, bool isSushiSwap) external view returns (UniswapV2PoolConfig memory) {
         return isSushiSwap ? sushiSwapPools[asset][index] : pancakeSwapPools[asset][index];
     }
 
-    uint256[50] private __gap; // Increased for safety
+    uint256[50] private __gap;
 }
