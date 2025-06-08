@@ -11,7 +11,7 @@ import "@openzeppelin/contracts-upgradeable/security/ReentrancyGuardUpgradeable.
 import "@openzeppelin/contracts-upgradeable/token/ERC721/IERC721ReceiverUpgradeable.sol";
 import "@chainlink/contracts/src/v0.8/shared/interfaces/AggregatorV3Interface.sol";
 import {UD60x18, ud} from "@prb/math/src/UD60x18.sol";
-import "@uniswap/v3-core/contracts/libraries/TickMath.sol";
+import "./external/uniswap/v3/TickMath.sol";
 
 // Axelar interfaces
 interface IAxelarGateway {
@@ -545,7 +545,7 @@ contract AMMPool is
         uint256 amountB
     ) external whenNotPaused nonReentrant returns (uint256 positionId) {
         if (amountA == 0 && amountB == 0) revert InvalidAmount(amountA, amountB);
-        if (!_isValidTickRange(tickLower, tickUpper)) revert InvalidTickRange(tickLower, tickUpper));
+        if (!_isValidTickRange(tickLower, tickUpper)) revert InvalidTickRange(tickLower, tickUpper);
 
         uint256 liquidity = _getLiquidityForAmounts(tickLower, tickUpper, amountA, amountB);
         if (liquidity == 0) revert InsufficientLiquidity(liquidity);
@@ -1170,7 +1170,7 @@ contract AMMPool is
         int24 tickLower,
         int24 tickUpper,
         uint256 liquidity
-    ) internal view returns (uint256 amount0, uint256 amount1) {
+)     internal view returns (uint256 amount0, uint256 amount1) {
         uint160 sqrtPriceLowerX96 = TickMath.getSqrtRatioAtTick(tickLower);
         uint160 sqrtPriceUpperX96 = TickMath.getSqrtRatioAtTick(tickUpper);
         uint160 sqrtPriceCurrentX96 = TickMath.getSqrtRatioAtTick(currentTick);
@@ -1181,7 +1181,7 @@ contract AMMPool is
             amount0 = (liquidity * (uint256(sqrtPriceUpperX96) - uint256(sqrtPriceCurrentX96))) / uint256(sqrtPriceUpperX96);
             amount1 = (liquidity * (uint256(sqrtPriceCurrentX96) - uint256(sqrtPriceLowerX96))) / uint256(sqrtPriceCurrentX96);
         } else {
-            amount1 = (liquidity * (uint256(sqrtPriceUpperX96) - uint256(sqrtPriceLowerX96) / uint256(sqrtPriceLowerX96);
+            amount1 = (liquidity * (uint256(sqrtPriceUpperX96) - uint256(sqrtPriceLowerX96))) / uint256(sqrtPriceLowerX96);
         }
     }
 

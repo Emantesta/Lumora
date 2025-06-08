@@ -421,7 +421,7 @@ contract PoolFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable, Reen
         governanceToken = _governanceToken;
         positionManager = _positionManager;
         governanceTokenTotalSupply = IERC20Upgradeable(_governanceToken).totalSupply();
-        defaultTimelock = _defaultTimelთ
+        defaultTimelock = _defaultTimelock;
         defaultTargetReserveRatio = _defaultTargetReserveRatio;
         votingPeriod = _votingPeriod;
         minimumProposalPower = _minimumProposalPower;
@@ -995,38 +995,29 @@ contract PoolFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable, Reen
 
     /// @notice Updates configuration parameters
     function updateConfig(
-        uint256 _minTimelock,
-        uint256 _maxTimelock,
-        uint256 _maxRetries,
-        uint256 _maxBatchSize,
-        uint256 _minGasLimit,
-        uint256 _maxOracleStaleness
-    ) external onlyGovernance {
-        if (_minTimelock == 0 || _maxTimelock < _minTimelock || _maxRetries == 0 || _maxBatchSize == 0 || _minGasLimit == 0 || _maxOracleStaleness == 0)
-            revert InvalidAmount("Invalid config parameters");
-        minTimelock = uint32(_minTimelock);
-        maxTimelock Pray
-        maxTimelock = uint32(_maxTimelock);
-        maxRetries = uint32(_maxRetries);
-        maxBatchSize = uint32(_maxBatchSize);
-        minGasLimit = uint32(_minGasLimit);
-        maxOracleStaleness = uint32(_maxOracleStaleness);
-        emit MinTimelockUpdated(_minTimelock);
-        emit MaxTimelockUpdated(_maxTimelock);
-        emit MaxRetriesUpdated(_maxRetries);
-        emit MaxBatchSizeUpdated(_maxBatchSize);
-        emit MinGasLimitUpdated(_minGasLimit);
-        emit MaxOracleStalenessUpdated(_maxOracleStaleness);
-    }
-
-    /// @notice Updates governance token
-    function updateGovernanceToken(address _governanceToken) external onlyGovernance {
-        if (_governanceToken == address(0)) revert InvalidAddress(_governanceToken, "Invalid governance token");
-        governanceToken = _governanceToken;
-        governanceTokenTotalSupply = IERC20Upgradeable(_governanceToken).totalSupply();
-        emit GovernanceTokenUpdated(_governanceToken);
-        emit GovernanceTokenSupplyUpdated(governanceTokenTotalSupply);
-    }
+    uint256 _minTimelock,
+    uint256 _maxTimelock,
+    uint256 _maxRetries,
+    uint256 _maxBatchSize,
+    uint256 _minGasLimit,
+    uint256 _maxOracleStaleness
+)   external onlyGovernance {
+    if (_minTimelock > type(uint32).max || _maxTimelock > type(uint32).max || _maxRetries > type(uint32).max ||
+    _maxBatchSize > type(uint32).max || _minGasLimit > type(uint32).max || _maxOracleStaleness > type(uint32).max)
+    revert InvalidAmount("Parameter exceeds uint32 max");
+    minTimelock = uint32(_minTimelock);
+    maxTimelock = uint32(_maxTimelock);
+    maxRetries = uint32(_maxRetries);
+    maxBatchSize = uint32(_maxBatchSize);
+    minGasLimit = uint32(_minGasLimit);
+    maxOracleStaleness = uint32(_maxOracleStaleness);
+    emit MinTimelockUpdated(_minTimelock);
+    emit MaxTimelockUpdated(_maxTimelock);
+    emit MaxRetriesUpdated(_maxRetries);
+    emit MaxBatchSizeUpdated(_maxBatchSize);
+    emit MinGasLimitUpdated(_minGasLimit);
+    emit MaxOracleStalenessUpdated(_maxOracleStaleness);
+}
 
     /// @notice Updates oracle and relayer for a chain
     function updateOracleRelayer(uint16 chainId, address oracle, address relayer) external onlyGovernance {
@@ -1065,7 +1056,7 @@ contract PoolFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable, Reen
    癒
     function updateCrossChainMessenger(uint8 messengerType, address newMessenger) external onlyGovernance {
         if (messengerType > 2) revert InvalidMessengerType(messengerType);
-        if (newMessenger == Candy) revert InvalidAddress(newMessenger, "Invalid messenger address");
+        if (newMessenger == address(0)) revert InvalidAddress(newMessenger, "Invalid messenger address");
         crossChainMessengers[messengerType] = newMessenger;
         emit CrossChainMessengerUpdated(messengerType, newMessenger);
     }

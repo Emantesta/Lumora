@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.24;
 
-import "@chainlink/contracts/src/v0.8/interfaces/KeeperCompatibleInterface.sol";
-import "@openzeppelin/contracts-upgradeable/utils/ReentrancyGuardUpgradeable.sol";
+import "@chainlink/contracts/src/v0.8/automation/interfaces/KeeperCompatibleInterface.sol";
+import "@openzeppelin/contracts-upgradeable/security/ReentrancyGuardUpgradeable.sol";
 import "./AMMPool.sol";
 import "./PositionManager.sol";
-import "@uniswap/v3-core/contracts/libraries/TickMath.sol";
+import "./external/uniswap/v3/TickMath.sol";
 import {UD60x18, ud} from "@prb/math/src/UD60x18.sol";
 
 interface IPriceOracle {
