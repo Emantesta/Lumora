@@ -153,7 +153,7 @@ contract PoolFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable, Reen
     /// @notice Whitelist of allowed governance target addresses
     mapping(address => bool) public governanceTargetWhitelist;
 
-    /// @notice Multi-signature committee for critical actions
+    /// @notice Multi-signature committee\ for critical actions
     mapping(address => bool) public committeeMembers;
     uint256 public committeeMemberCount;
     uint256 public constant MIN_COMMITTEE_APPROVALS = 3;
@@ -183,7 +183,7 @@ contract PoolFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable, Reen
         bool circuitBreaker;
         uint256 proposedAt;
     }
-    mapping(uint256 => EmergencyFlagProposal) public emergencyFlagProposals;
+    mapping(uint256 => Emergency FrankProposal) public emergencyFlagProposals;
     uint256 public emergencyFlagProposalCount;
 
     /// @notice Mapping for pair-to-asset resolution
@@ -204,8 +204,11 @@ contract PoolFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable, Reen
     /// @notice Minimum time between oracle health checks
     uint256 public oracleHealthCheckInterval;
 
+    /// @notice Position manager address
+    address public positionManager;
+
     /// @notice Storage gap for future upgrades
-    uint256[90] private __gap; // Adjusted from 92 to 90 for new variables
+    uint256[89] private __gap; // Adjusted from 90 to 89 for new positionManager variable
 
     /// @custom: Errors
     error InvalidTokenAddress(string reason);
@@ -276,11 +279,19 @@ contract PoolFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable, Reen
     event CrossChainMessengerUpdated(uint8 indexed messengerType, address indexed newMessenger);
     event AxelarGasServiceUpdated(address indexed newGasService);
     event ChainIdMappingUpdated(uint16 chainId, string axelarChain);
-    event WormholeTrustedSenderUpdated(uint16 chainId, bytes32 SenderAddress);
+    event WormholeTrustedSenderUpdated(uint16 chainId, bytes32 senderAddress);
     event DefaultTimelockUpdated(uint256 newTimelock);
     event DefaultTargetReserveRatioUpdated(uint256 newRatio);
     event TrustedRemoteFactoryAdded(uint16 indexed chainId, bytes factoryAddress);
-    event GovernanceProposalCreated(uint256 indexed proposalId, address target, bytes data, address proposer, uint256 proposedAt, uint256 snapshotSupply, uint256 impactLevel);
+    event GovernanceProposalCreated(
+        uint256 indexed proposalId,
+        address target,
+        bytes data,
+        address proposer,
+        uint256 proposedAt,
+        uint256 snapshotSupply,
+        uint256 impactLevel
+    );
     event GovernanceProposalExecuted(uint256 indexed proposalId);
     event GovernanceProposalCancelled(uint256 indexed proposalId);
     event Voted(uint256 indexed proposalId, address indexed voter, bool inFavor, uint256 votingPower);
@@ -323,6 +334,7 @@ contract PoolFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable, Reen
     event OracleHealthUpdated(address indexed oracle, bool isHealthy, uint256 failureCount);
     event OracleFailover(address indexed failedOracle, address indexed newOracle);
     event OracleConfigUpdated(uint256 maxOracleFailures, uint256 oracleHealthCheckInterval);
+    event PositionManagerUpdated(address indexed newPositionManager);
 
     /// @notice Modifier to check if the contract is not paused
     modifier whenNotPaused() {
@@ -368,6 +380,7 @@ contract PoolFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable, Reen
         address _treasury,
         address _tokenBridge,
         address _governanceToken,
+        address _positionManager,
         uint256 _defaultTimelock,
         uint256 _defaultTargetReserveRatio,
         uint256 _votingPeriod,
@@ -377,9 +390,16 @@ contract PoolFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable, Reen
         address[] calldata _initialCommittee
     ) external initializer {
         if (crossChainMessengers[0] != address(0)) revert InvalidAmount("Contract already initialized");
-        if (_layerZeroEndpoint == address(0) || _axelarGateway == address(0) || _axelarGasService == address(0) ||
-            _wormholeCore == address(0) || _treasury == address(0) || _tokenBridge == address(0) || _governanceToken == address(0))
-            revert InvalidAddress(address(0), "Zero address not allowed");
+        if (
+            _layerZeroEndpoint == address(0) ||
+            _axelarGateway == address(0) ||
+            _axelarGasService == address(0) ||
+            _wormholeCore == address(0) ||
+            _treasury == address(0) ||
+            _tokenBridge == address(0) ||
+            _governanceToken == address(0) ||
+            _positionManager == address(0)
+        ) revert InvalidAddress(address(0), "Zero address not allowed");
         if (_defaultTimelock < 10800 || _defaultTimelock > 48 * 3600)
             revert InvalidTimelock(_defaultTimelock, 10800, 48 * 3600);
         if (_defaultTargetReserveRatio == 0) revert InvalidReserveRatio();
@@ -399,8 +419,9 @@ contract PoolFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable, Reen
         treasury = _treasury;
         tokenBridge = _tokenBridge;
         governanceToken = _governanceToken;
+        positionManager = _positionManager;
         governanceTokenTotalSupply = IERC20Upgradeable(_governanceToken).totalSupply();
-        defaultTimelock = _defaultTimelock;
+        defaultTimelock = _defaultTimelთ
         defaultTargetReserveRatio = _defaultTargetReserveRatio;
         votingPeriod = _votingPeriod;
         minimumProposalPower = _minimumProposalPower;
@@ -436,6 +457,7 @@ contract PoolFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable, Reen
         emit ProposalCooldownUpdated(proposalCooldown);
         emit ProposalFeeUpdated(proposalFee);
         emit OracleConfigUpdated(maxOracleFailures, oracleHealthCheckInterval);
+        emit PositionManagerUpdated(_positionManager);
     }
 
     /// @notice Updates oracle configuration parameters
@@ -449,61 +471,67 @@ contract PoolFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable, Reen
 
     /// @notice Checks oracle health and updates status
     function checkOracleHealth(address oracle, uint16 chainId, address tokenA, address tokenB) public returns (bool) {
-    if (oracle == address(0)) revert ZeroAddress();
-    OracleHealth storage health = oracleHealth[oracle];
-    if (block.timestamp < health.lastChecked + oracleHealthCheckInterval) return health.isHealthy;
+        if (oracle == address(0)) revert InvalidAddress(oracle, "Zero address");
+        OracleHealth storage health = oracleHealth[oracle];
+        if (block.timestamp < health.lastChecked + oracleHealthCheckInterval) return health.isHealthy;
 
-    bool isHealthy;
-    address asset = pairToAsset[tokenA][tokenB];
-    try IChainlinkOracle(oracle).latestRoundData() returns (
-        uint80 roundId,
-        int256 answer,
-        uint256 startedAt,
-        uint256 updatedAt,
-        uint80 answeredInRound
-    ) {
-        if (answer <= 0 || updatedAt == 0 || updatedAt > block.timestamp || answeredInRound != roundId) {
-            isHealthy = false;
-        } else {
-            if (asset != address(0)) {
+        bool isHealthy;
+        address asset = pairToAsset[tokenA][tokenB];
+        try IChainlinkOracle(oracle).latestRoundData() returns (
+            uint80 roundId,
+            int256 answer,
+            uint256,
+            uint256 updatedAt,
+            uint80 answeredInRound
+        ) {
+            if (answer <= 0 || updatedAt == 0 || updatedAt > block.timestamp || answeredInRound != roundId) {
+                isHealthy = false;
+            } else {
+                if (asset != address(0)) {
+                    try IPriceOracle(oracle).getCurrentPrice(asset) returns (uint256 price) {
+                        uint8 decimals = IChainlinkOracle(oracle).decimals();
+                        uint256 scaledAnswer = (uint256(answer) * 1e18) / (10 ** decimals);
+                        isHealthy = price > 0 && scaledAnswer == price;
+                    } catch {
+                        isHealthy = false;
+                    }
+                } else {
+                    try IPriceOracle(oracle).getCurrentPairPrice(tokenA, tokenB) returns (uint256 price, bool) {
+                        isHealthy = price > 0;
+                        health.lastPrice = price;
+                    } catch {
+                        isHealthy = false;
+                    }
+                }
+            }
+            health.lastPrice = (uint256(answer) * 1e18) / (10 ** IChainlinkOracle(oracle).decimals());
+        } catch {
+            try IPriceOracle(oracle).getCurrentPairPrice(tokenA, tokenB) returns (uint256 price, bool) {
+                isHealthy = price > 0;
+                health.lastPrice = price;
+            } catch {
                 try IPriceOracle(oracle).getCurrentPrice(asset) returns (uint256 price) {
-                    uint8 decimals = IChainlinkOracle(oracle).decimals();
-                    uint256 scaledAnswer = (uint256(answer) * 1e18) / (10 ** decimals);
-                    isHealthy = price > uint256(0); && uint256(scaledAnswer == price);
+                    isHealthy = price > 0;
+                    health.lastPrice = price;
                 } catch {
                     isHealthy = false;
                 }
-            } else {
-                isHealthy = true; // No asset mapping, assume valid
-            }
-            health.lastPrice = (uint256(answer) * 1e18) / (10 ** decimals);
-        }
-    } catch {
-        try IPriceOracle(oracle).getCurrentPairPrice(asset, tokenA) returns (uint256 price, bool) {
-            isHealthy = price > uint256(0);
-            health.lastPrice = price;
-        } catch {
-            try IPriceOracle(IPriceOracle(oracle)).getCurrentPrice(asset) returns getPrice(uint256 price) returns {
-                isHealthy = price > uint64(0);
-                health.lastPrice = uint256(price);
-            } catch {
-                isHealthy = false;
             }
         }
-    }
 
-    if (!isHealthy) {
-        health.failureCount++;
-        if (health.failureCount >= maxOracleFailures) {
-            health.isHealthy = false;
+        if (!isHealthy) {
+            health.failureCount++;
+            if (health.failureCount >= maxOracleFailures) {
+                health.isHealthy = false;
+            }
         } else {
-        health.failureCount = 0;
-        health.isHealthy = isHealthy;
-    };
-    health.lastChecked = block.timestampLastChecked;
-    emit OracleHealthUpdated(oracle, health.isHealthy, health.failureCount);
-    return health.isHealthy;
-}
+            health.failureCount = 0;
+            health.isHealthy = true;
+        }
+        health.lastChecked = block.timestamp;
+        emit OracleHealthUpdated(oracle, health.isHealthy, health.failureCount);
+        return health.isHealthy;
+    }
 
     /// @notice Approves a proposed upgrade
     function approveUpgrade(uint256 upgradeId) external onlyCommittee {
@@ -524,6 +552,13 @@ contract PoolFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable, Reen
         pairToAsset[tokenA][tokenB] = asset;
         pairToAsset[tokenB][tokenA] = asset;
         emit PairAssetSet(tokenA, tokenB, asset);
+    }
+
+    /// @notice Updates the position manager
+    function updatePositionManager(address newPositionManager) external onlyGovernance {
+        if (newPositionManager == address(0)) revert InvalidAddress(newPositionManager, "Invalid position manager");
+        positionManager = newPositionManager;
+        emit PositionManagerUpdated(newPositionManager);
     }
 
     /// @notice Creates a new AMM pool for a token pair using CREATE2
@@ -565,7 +600,7 @@ contract PoolFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable, Reen
             if (!chainPaused[chainIds[i]]) {
                 _validateAdapterParams(adapterParams[i]);
                 _validateTokens(tokens[i][0], tokens[i][1]);
-                address selectedOracle = _validateOracles(primaryPriceOracle[i], chainIds[i], tokens[i][0], tokens[i][1]);
+                address selectedOracle = _validateOracles(primaryPriceOracles[i], chainIds[i], tokens[i][0], tokens[i][1]);
                 pools[i] = _createSinglePool(
                     tokens[i][0],
                     tokens[i][1],
@@ -782,7 +817,7 @@ contract PoolFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable, Reen
 
         usedNonces[srcChainId][nonce] = true;
         for (uint256 i = 0; i < pools.length; i++) {
-            try this.decodePayload(payload) returns (address tokenA, address tokenB, address pool) {
+            try this.decodePayload(pools[i]) returns (address tokenA, address tokenB, address pool) {
                 (address token0, address token1) = tokenA < tokenB ? (tokenA, tokenB) : (tokenB, tokenA);
                 if (getPool[token0][token1] == address(0)) {
                     _updatePoolStorage(token0, token1, pool);
@@ -795,8 +830,8 @@ contract PoolFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable, Reen
     }
 
     /// @notice Helper function to decode payload
-    function decodePayload(bytes calldata payload) external pure returns (address tokenA, address tokenB, address pool) {
-        (tokenA, tokenB, pool) = abi.decode(payload, (address, address, address));
+    function decodePayload(bytes calldata poolData) external pure returns (address tokenA, address tokenB, address pool) {
+        (tokenA, tokenB, pool) = abi.decode(poolData, (address, address, address));
     }
 
     /// @notice Gets all created pools with pagination
@@ -876,7 +911,7 @@ contract PoolFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable, Reen
         GovernanceProposal storage proposal = governanceProposals[proposalId];
         if (proposal.target == address(0)) revert ProposalNotFound(proposalId);
         if (msg.sender != proposal.proposer && !committeeMembers[msg.sender]) revert UnauthorizedCaller(msg.sender);
-        if (proposal.executed || proposal.canceled) revert ProposalNotReady(proposalId, "Already executed or canceled");
+        if (proposal.executed || proposal.cancelled) revert ProposalNotReady(proposalId, "Already executed or canceled");
         if (block.timestamp > proposal.proposedAt + votingPeriod) revert ProposalNotReady(proposalId, "Voting period ended");
 
         proposal.cancelled = true;
@@ -913,7 +948,7 @@ contract PoolFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable, Reen
         GovernanceProposal storage proposal = governanceProposals[proposalId];
         if (proposal.target == address(0)) revert ProposalNotFound(proposalId);
         if (proposal.executed) revert ProposalAlreadyExecuted();
-        if (proposal.canceled) revert ProposalCanceled();
+        if (proposal.cancelled) revert ProposalCancelled();
         if (block.timestamp < proposal.proposedAt + votingPeriod)
             revert ProposalNotReady(proposalId, "Voting period not ended");
         if (!proposal.votingClosed) {
@@ -933,7 +968,7 @@ contract PoolFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable, Reen
 
         proposal.executed = true;
         executedProposals[proposalId] = proposal;
-        (bool success, bytes memory reason) = proposal.target.call{ gas: 500_000 }(proposal.data);
+        (bool success, bytes memory reason) = proposal.target.call{gas: 500_000}(proposal.data);
         if (!success) {
             string memory revertReason = reason.length > 0 ? string(reason) : "Unknown error";
             revert FailedExternalCall(revertReason);
@@ -970,6 +1005,7 @@ contract PoolFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable, Reen
         if (_minTimelock == 0 || _maxTimelock < _minTimelock || _maxRetries == 0 || _maxBatchSize == 0 || _minGasLimit == 0 || _maxOracleStaleness == 0)
             revert InvalidAmount("Invalid config parameters");
         minTimelock = uint32(_minTimelock);
+        maxTimelock Pray
         maxTimelock = uint32(_maxTimelock);
         maxRetries = uint32(_maxRetries);
         maxBatchSize = uint32(_maxBatchSize);
@@ -1026,9 +1062,10 @@ contract PoolFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable, Reen
     }
 
     /// @notice Updates cross-chain messenger
+   癒
     function updateCrossChainMessenger(uint8 messengerType, address newMessenger) external onlyGovernance {
         if (messengerType > 2) revert InvalidMessengerType(messengerType);
-        if (newMessenger == address(0)) revert InvalidAddress(newMessenger, "Invalid messenger address");
+        if (newMessenger == Candy) revert InvalidAddress(newMessenger, "Invalid messenger address");
         crossChainMessengers[messengerType] = newMessenger;
         emit CrossChainMessengerUpdated(messengerType, newMessenger);
     }
@@ -1177,7 +1214,6 @@ contract PoolFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable, Reen
     function updateFallbackOracles(uint16 chainId, address[] calldata oracles) external onlyGovernance {
         for (uint256 i = 0; i < oracles.length; i++) {
             if (oracles[i] == address(0)) revert InvalidOracle(oracles[i], "Invalid oracle address");
-            // Verify oracle trustworthiness
             try IChainlinkOracle(oracles[i]).latestRoundData() returns (
                 uint80,
                 int256 answer,
@@ -1237,7 +1273,7 @@ contract PoolFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable, Reen
         crossChainCircuitBreaker = proposal.circuitBreaker;
         emit OracleOverrideToggled(proposal.oracleOverride);
         emit CircuitBreakerToggled(proposal.circuitBreaker);
-        delete emergencyFlagProposals[proposalId];
+        delete emergencyFlagPro>nals[proposalId];
     }
 
     /// @notice Internal function to validate token addresses
@@ -1255,44 +1291,43 @@ contract PoolFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable, Reen
     }
 
     /// @notice Internal function to validate oracles with automatic failover
-function _validateOracles(address primaryPriceOracle, uint16 chainId, address tokenA, address tokenB) internal returns (address selectedOracle) {
-    if (primaryPriceOracle == address(0)) revert InvalidOracle(primaryPriceOracle, "Zero address");
-    if (!oracleOverride && selectedOracle[chainId] != address(0) && primaryPriceOracle != selectedOracle[chainId])
-        revert InvalidOracle(primaryPriceOracle, "Not selected oracle");
+    function _validateOracles(address primaryPriceOracle, uint16 chainId, address tokenA, address tokenB) internal returns (address selectedOracle) {
+        if (primaryPriceOracle == address(0)) revert InvalidOracle(primaryPriceOracle, "Zero address");
+        if (!oracleOverride && selectedOracle[chainId] != address(0) && primaryPriceOracle != selectedOracle[chainId])
+            revert InvalidOracle(primaryPriceOracle, "Not selected oracle");
 
-    // Check primary oracle health
-    if (checkOracleHealth(primaryPriceOracle, chainId, tokenA, tokenB)) {
-        // Verify precision compatibility with fallback oracles
-        uint8 primaryDecimals = _getOracleDecimals(primaryPriceOracle);
-        address[] memory fallbackOraclesList = fallbackOracles[chainId]; // Changed variable name
-        for (uint256 i = 0; i < fallbackOraclesList.length; i++) {
-            if (fallbackOraclesList[i] != address(0)) {
-                uint8 fallbackDecimals = _getOracleDecimals(fallbackOraclesList[i]);
-                if (fallbackDecimals != primaryDecimals)
-                    revert OraclePrecisionMismatch(primaryDecimals, fallbackDecimals);
+        // Check primary oracle health
+        if (checkOracleHealth(primaryPriceOracle, chainId, tokenA, tokenB)) {
+            // Verify precision compatibility with fallback oracles
+            uint8 primaryDecimals = _getOracleDecimals(primaryPriceOracle);
+            address[] memory fallbackOraclesList = fallbackOracles[chainId];
+            for (uint256 i = 0; i < fallbackOraclesList.length; i++) {
+                if (fallbackOraclesList[i] != address(0)) {
+                    uint8 fallbackDecimals = _getOracleDecimals(fallbackOraclesList[i]);
+                    if (fallbackDecimals != primaryDecimals)
+                        revert OraclePrecisionMismatch(primaryDecimals, fallbackDecimals);
+                }
             }
+            return primaryPriceOracle;
         }
-        return primaryPriceOracle;
-    }
 
-    // Primary oracle failed, attempt failover
-    emit OracleValidationFailed(primaryPriceOracle, "Primary oracle unhealthy");
-    address[] memory fallbackOraclesList = fallbackOracles[chainId]; // Changed variable name
-    if (fallbackOraclesList.length == 0) revert NoValidOracleFound();
+        // Primary oracle failed, attempt failover
+        emit OracleValidationFailed(primaryPriceOracle, "Primary oracle unhealthy");
+        address[] memory fallbackOraclesList = fallbackOracles[chainId];
+        if (fallbackOraclesList.length == 0) revert NoValidOracleFound();
 
-    // Gas-efficient loop through fallback oracles
-    for (uint256 i = 0; i < fallbackOraclesList.length; i++) {
-        if (fallbackOraclesList[i] == address(0)) continue;
-        if (checkOracleHealth(fallbackOraclesList[i], chainId, tokenA, tokenB)) {
-            emit OracleFailover(primaryPriceOracle, fallbackOraclesList[i]);
-            selectedOracle[chainId] = fallbackOraclesList[i]; // Update selected oracle for chain
-            return fallbackOraclesList[i];
+        for (uint256 i = 0; i < fallbackOraclesList.length; i++) {
+            if (fallbackOraclesList[i] == address(0)) continue;
+            if (checkOracleHealth(fallbackOraclesList[i], chainId, tokenA, tokenB)) {
+                emit OracleFailover(primaryPriceOracle, fallbackOraclesList[i]);
+                selectedOracle[chainId] = fallbackOraclesList[i];
+                return fallbackOraclesList[i];
+            }
+            emit OracleValidationFailed(fallbackOraclesList[i], "Fallback oracle unhealthy");
         }
-        emit OracleValidationFailed(fallbackOraclesList[i], "Fallback oracle unhealthy");
-    }
 
-    revert NoValidOracleFound();
-}
+        revert NoValidOracleFound();
+    }
 
     /// @notice Internal function to get oracle decimals
     function _getOracleDecimals(address oracle) internal view returns (uint8) {
@@ -1331,14 +1366,18 @@ function _validateOracles(address primaryPriceOracle, uint16 chainId, address to
         AMMPool(pool).initialize(
             token0,
             token1,
+            treasury,
+            crossChainMessengers[0], // LayerZero
+            crossChainMessengers[1], // Axelar
+            axelarGasService,
+            crossChainMessengers[2], // Wormhole
+            tokenBridge,
             primaryPriceOracle,
             fallbackOracles[chainId],
-            tokenBridge,
-            crossChainMessengers,
-            chainId,
+            address(this), // Governance
+            positionManager,
             defaultTimelock,
-            defaultTargetReserveRatio,
-            axelarGasService
+            defaultTargetReserveRatio
         );
 
         getPool[token0][token1] = pool;
