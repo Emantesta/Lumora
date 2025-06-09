@@ -10,6 +10,7 @@ import "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
 import "@openzeppelin/contracts-upgradeable/security/ReentrancyGuardUpgradeable.sol";
 import "@openzeppelin/contracts-upgradeable/token/ERC721/IERC721ReceiverUpgradeable.sol";
 import "@chainlink/contracts/src/v0.8/shared/interfaces/AggregatorV3Interface.sol";
+import "./Interfaces.sol";
 import {UD60x18, ud} from "@prb/math/src/UD60x18.sol";
 import "./external/uniswap/v3/TickMath.sol";
 
@@ -125,50 +126,6 @@ interface IGovernance {
 // Chainlink Oracle interface
 interface IChainlinkOracle is AggregatorV3Interface {}
 
-// PriceOracle interface
-interface IPriceOracle {
-    function getPrice(address asset) external returns (uint256);
-    function getCurrentPrice(address asset) external view returns (uint256);
-    function getCurrentPairPrice(address baseToken, address quoteToken) external view returns (uint256, bool);
-}
-
-// PositionAdjuster keeper interface
-interface IPositionAdjuster {
-    function adjustPosition(uint256 positionId, int24 newTickLower, int24 newTickUpper) external;
-    function exitFallbackPool(uint256 positionId) external;
-}
-
-// PositionManager interface
-interface IPositionManager {
-    function mintPosition(uint256 positionId, address recipient) external;
-}
-
-// AMMPool interface
-interface IAMMPool {
-    function positions(uint256 positionId) external view returns (
-        address owner,
-        int24 tickLower,
-        int24 tickUpper,
-        uint256 liquidity,
-        uint256 feeGrowthInside0LastX128,
-        uint256 feeGrowthInside1LastX128,
-        uint256 tokensOwed0,
-        uint256 tokensOwed1
-    );
-    function tokenA() external view returns (address);
-    function tokenB() external view returns (address);
-    function positionCounter() external view returns (uint256);
-    function addConcentratedLiquidityCrossChain(
-        uint256 amountA,
-        uint256 amountB,
-        int24 tickLower,
-        int24 tickUpper,
-        uint16 dstChainId,
-        bytes calldata adapterParams
-    ) external payable;
-    function collectFees(uint256 positionId) external;
-    event PositionCreated(uint256 indexed positionId, address indexed owner, int24 tickLower, int24 tickUpper, uint256 liquidity);
-}
 
 /// @title AMMPool - An upgradeable AMM pool with cross-chain capabilities, concentrated liquidity, dynamic curves, and fallback pool
 /// @notice Implements a Uniswap V3-style AMM with cross-chain support, Curve-inspired dynamic curves, and a fallback pool
@@ -332,6 +289,7 @@ contract AMMPool is
     error InvalidFeeRange(uint256 baseFee, uint256 maxFee);
     error InvalidFeeShare(uint256 lpFeeShare, uint256 treasuryFeeShare);
     error InvalidAddress(address addr, string message);
+    error InvalidCrossChainMessage(string message);
     error ContractPaused();
     error ChainPausedError(uint16 chainId);
     error InvalidTimelock(uint256 timelock);
@@ -364,6 +322,8 @@ contract AMMPool is
     error RetryNotReady(uint256 messageId, uint256 nextRetryTimestamp);
     error InvalidBatchSize(uint256 size);
     error InsufficientGasForBatch(uint256 required, uint256 provided);
+    error InvalidMessage();
+    error MessageNotFound(uint256 messageId);
 
     // Events
     event LiquidityAdded(address indexed provider, uint256 amountA, uint256 amountB, uint256 liquidity);
@@ -1454,7 +1414,7 @@ contract AMMPool is
         uint256 timelock = _getDynamicTimelock(dstChainId);
         bytes memory payload = abi.encode(msg.sender, inputToken, amountIn, amountOut, minAmountOut, nonce, block.timestamp + timelock);
 
-        _sendCrossChainMessage(dstChainId,
+        _sendCrossChainMessage(
             dstChainId,
             dstAxelarChain,
             destinationAddress,
@@ -1552,12 +1512,12 @@ contract AMMPool is
     function _validateCrossChainMessage(
         uint16 srcChainId,
         bytes memory srcAddress,
-        bytes memory address payload,
+        bytes memory payload,
         bytes memory additionalParams
     ) internal {
         bytes32 payloadHash = keccak256(payload);
         if (validatedMessages[payloadHash]) revert InvalidMessage();
-        if (!keccak256(srcAddress), keccak256(trustedRemotePools[srcChainId])) revert InvalidAddress(address(0), "Invalid source address");
+        if (keccak256(srcAddress) != keccak256(trustedRemotePools[srcChainId])) revert InvalidAddress(address(0), "Invalid source address");
 
         address messenger = crossChainMessengers[_getMessengerType()];
         if (messenger == address(0)) revert MessengerNotSet(0);
@@ -1591,14 +1551,15 @@ contract AMMPool is
 
     function _getDynamicTimelock(uint16 chainId) internal view returns(uint256) {
         uint256 timelock = chainTimelocks[chainId];
-        if (timelock == (0) timelock < MIN_TIMELOCK || timelock > MAX_TIMELOCK) {
+        if (timelock == (0) || timelock < MIN_TIMELOCK || timelock > MAX_TIMELOCK) {
             return MIN_TIMELOCK;
         }
         return timelock;
     }
 
-    function _estimateSwapAmountOut(bool isTokenAInput, uint256 amountInWithFee) internal view returns(uint256 amountOut) {
-        uint256 reserveIn, reserveOut;
+    function _estimateSwapAmountOut(bool isTokenAInput, uint256 amountInWithFee) internal view returns (uint256 amountOut) {
+        uint256 reserveIn; 
+        uint256 reserveOut;
         if (isTokenAInput) {
             reserveIn = uint256(reserves.reserveA + fallbackReserves.reserveA);
             reserveOut = uint256(reserves.reserveB + fallbackReserves.reserveB);
@@ -1608,20 +1569,20 @@ contract AMMPool is
         }
 
         if (useConstantSum && emaVolatility < volatilityThreshold) {
-            return _swapConstantSum(amountIn, amountInWithFee, reserveIn, reserveOut);
-        } else {
-            return (reserveOut(uint256(reserveOut * amountInWithFee) * amountInWithFee) / (reserveIn + amountInWithFee);
-        }
+            return _swapConstantSum(amountInWithFee, reserveIn, reserveOut);
+    } else {
+            return (reserveOut * amountInWithFee) / (reserveIn + amountInWithFee);
     }
+}
 
-    function _getMessengerType() internal view returns(uint8(uint8)) {
-        for (uint8 i = (0); i < 2; i++) {
-            if (crossChainMessengers[i] != address(0)) {
-                return i;
-            }
+    function _getMessengerType() internal view returns (uint8) {
+    for (uint8 i = 0; i < 2; i++) {
+        if (crossChainMessengers[i] != address(0)) {
+            return i;
         }
-        revert MessengerNotSet(0);
     }
+    revert MessengerNotSet(0);
+}
 
     function sqrt(UD60x18 x) internal pure returns (UD60x18) {
         return x.sqrt();

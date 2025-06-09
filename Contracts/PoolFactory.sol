@@ -1053,7 +1053,6 @@ contract PoolFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable, Reen
     }
 
     /// @notice Updates cross-chain messenger
-   癒
     function updateCrossChainMessenger(uint8 messengerType, address newMessenger) external onlyGovernance {
         if (messengerType > 2) revert InvalidMessengerType(messengerType);
         if (newMessenger == address(0)) revert InvalidAddress(newMessenger, "Invalid messenger address");

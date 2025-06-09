@@ -1,43 +1,17 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.24;
 
-// OpenZeppelin imports
-import "@openzeppelin/contracts-upgradeable/token/ERC721/ERC721Upgradeable.sol";
-import "@openzeppelin/contracts-upgradeable/token/ERC721/IERC721ReceiverUpgradeable.sol";
-import "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
-import "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
-import "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
-import "@openzeppelin/contracts-upgradeable/security/ReentrancyGuardUpgradeable.sol";
-import "@openzeppelin/contracts-upgradeable/security/PausableUpgradeable.sol";
-import "@openzeppelin/contracts-upgradeable/utils/StringsUpgradeable.sol";
-import "@openzeppelin/contracts-upgradeable/utils/Base64Upgradeable.sol";
-
-// Interfaces
-interface IAMMPool {
-    function positions(uint256 positionId) external view returns (
-        address owner,
-        int24 tickLower,
-        int24 tickUpper,
-        uint256 liquidity,
-        uint256 feeGrowthInside0LastX128,
-        uint256 feeGrowthInside1LastX128,
-        uint256 tokensOwed0,
-        uint256 tokensOwed1
-    );
-    function tokenA() external view returns (address);
-    function tokenB() external view returns (address);
-    function positionCounter() external view returns (uint256);
-    function addConcentratedLiquidityCrossChain(
-        uint256 amountA,
-        uint256 amountB,
-        int24 tickLower,
-        int24 tickUpper,
-        uint16 dstChainId,
-        bytes calldata adapterParams
-    ) external payable;
-    function collectFees(uint256 positionId) external;
-    event PositionCreated(uint256 indexed positionId, address indexed owner, int24 tickLower, int24 tickUpper, uint256 liquidity);
-}
+// OpenZeppelin specific imports
+import { ERC721Upgradeable } from "@openzeppelin/contracts-upgradeable/token/ERC721/ERC721Upgradeable.sol";
+import { IERC721ReceiverUpgradeable } from "@openzeppelin/contracts-upgradeable/token/ERC721/IERC721ReceiverUpgradeable.sol";
+import { OwnableUpgradeable } from "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
+import { Initializable } from "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
+import { UUPSUpgradeable } from "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
+import { ReentrancyGuardUpgradeable } from "@openzeppelin/contracts-upgradeable/security/ReentrancyGuardUpgradeable.sol";
+import { PausableUpgradeable } from "@openzeppelin/contracts-upgradeable/security/PausableUpgradeable.sol";
+import { StringsUpgradeable } from "@openzeppelin/contracts-upgradeable/utils/StringsUpgradeable.sol";
+import { Base64Upgradeable } from "@openzeppelin/contracts-upgradeable/utils/Base64Upgradeable.sol";
+import "./Interfaces.sol"; 
 
 interface ICrossChainMessenger {
     function sendMessage(
@@ -166,6 +140,8 @@ contract PositionManager is
     error InvalidBridgeType(uint8 bridgeType);
     error InvalidFeeDestination(address destination);
     error InsufficientAggregatedFees();
+    error InvalidAddress(address addr, string message);
+    error ContractPaused();
 
     // Events
     event PositionMinted(uint256 indexed tokenId, address indexed owner, address indexed pool, int24 tickLower, int24 tickUpper, uint256 liquidity);
@@ -199,7 +175,7 @@ contract PositionManager is
     }
 
     modifier whenNotPausedCrossChain() {
-        if (paused()) revert Paused();
+        if (paused()) revert ContractPaused();
         _;
     }
 
@@ -259,8 +235,8 @@ contract PositionManager is
             tokenB: IAMMPool(ammPool).tokenB()
         });
 
-        _safeMint(recipient, positionId);
         _aggregateFees(positionId); // Initialize fee aggregation
+        _safeMint(recipient, positionId);
 
         emit PositionMinted(positionId, recipient, ammPool, tickLower, tickUpper, liquidity);
     }
@@ -300,8 +276,8 @@ contract PositionManager is
                 tokenB: IAMMPool(ammPool).tokenB()
             });
 
-            _safeMint(recipient, positionId);
             _aggregateFees(positionId); // Initialize fee aggregation
+            _safeMint(recipient, positionId);
             mintedIds[i] = positionId;
 
             emit PositionMinted(positionId, recipient, ammPool, tickLower, tickUpper, liquidity);
@@ -337,9 +313,11 @@ contract PositionManager is
         if (!_exists(tokenId)) revert InvalidTokenId(tokenId);
 
         _aggregateFees(tokenId); // Aggregate fees before transfer
+        uint256[] memory tokenIds = new uint256[](1);
+        tokenIds[0] = tokenId;
         safeTransferFrom(msg.sender, ammPool, tokenId);
 
-        emit BatchPositionsTransferred(new uint256[](1), msg.sender, ammPool, 1);
+        emit BatchPositionsTransferred(tokenIds, msg.sender, ammPool, 1);
     }
 
     function batchTransferToPool(uint256[] calldata tokenIds) external nonReentrant {
@@ -399,15 +377,8 @@ contract PositionManager is
         address recipient = feeDestinations[msg.sender] != address(0) ? feeDestinations[msg.sender] : msg.sender;
         address bridge = tokenBridges[bridgeType];
 
-        if (amount0 > 0) {
-            ITokenBridge(bridge).burn(IAMMPool(ammPool).tokenA(), amount0, recipient, dstChainId);
-            fees.lastBridged0 = fees.accumulated0;
-        }
-        if (amount1 > 0) {
-            ITokenBridge(bridge).burn(IAMMPool(ammPool).tokenB(), amount1, recipient, dstChainId);
-            fees.lastBridged1 = fees.accumulated1;
-        }
-
+        fees.lastBridged0 = fees.accumulated0;
+        fees.lastBridged1 = fees.accumulated1;
         fees.lastDstChainId = dstChainId;
 
         string memory dstAxelarChain = chainIdToAxelarChain[dstChainId];
@@ -423,6 +394,13 @@ contract PositionManager is
             adapterParams
         );
         if (msg.value < nativeFee) revert InsufficientFee(msg.value, nativeFee);
+
+        if (amount0 > 0) {
+            ITokenBridge(bridge).burn(IAMMPool(ammPool).tokenA(), amount0, recipient, dstChainId);
+        }
+        if (amount1 > 0) {
+            ITokenBridge(bridge).burn(IAMMPool(ammPool).tokenB(), amount1, recipient, dstChainId);
+        }
 
         try ICrossChainMessenger(crossChainMessenger).sendMessage{value: nativeFee}(
             dstChainId,
@@ -552,17 +530,22 @@ contract PositionManager is
         address recipient = feeDestinations[msg.sender] != address(0) ? feeDestinations[msg.sender] : msg.sender;
         address bridge = tokenBridges[bridgeType];
 
-        if (fees.total0 > 0) {
-            ITokenBridge(bridge).burn(IAMMPool(ammPool).tokenA(), fees.total0, recipient, dstChainId);
+        uint256 amount0 = fees.total0;
+        uint256 amount1 = fees.total1;
+        fees.total0 = 0;
+        fees.total1 = 0;
+
+        if (amount0 > 0) {
+            ITokenBridge(bridge).burn(IAMMPool(ammPool).tokenA(), amount0, recipient, dstChainId);
         }
-        if (fees.total1 > 0) {
-            ITokenBridge(bridge).burn(IAMMPool(ammPool).tokenB(), fees.total1, recipient, dstChainId);
+        if (amount1 > 0) {
+            ITokenBridge(bridge).burn(IAMMPool(ammPool).tokenB(), amount1, recipient, dstChainId);
         }
 
         string memory dstAxelarChain = chainIdToAxelarChain[dstChainId];
         bytes memory destinationAddress = trustedRemoteManagers[dstChainId];
         uint64 nonce = _getNonce(dstChainId);
-        bytes memory payload = abi.encode(msg.sender, new uint256[](0), fees.total0, fees.total1, nonce);
+        bytes memory payload = abi.encode(msg.sender, new uint256[](0), amount0, amount1, nonce);
 
         (uint256 nativeFee,) = ICrossChainMessenger(crossChainMessenger).estimateFees(
             dstChainId,
@@ -585,9 +568,7 @@ contract PositionManager is
                 payable(msg.sender).transfer(msg.value - nativeFee);
             }
             nonces[dstChainId]++;
-            emit BatchFeesBridged(msg.sender, new uint256[](0), fees.total0, fees.total1, dstChainId, bridgeType, nonce);
-            fees.total0 = 0;
-            fees.total1 = 0;
+            emit BatchFeesBridged(msg.sender, new uint256[](0), amount0, amount1, dstChainId, bridgeType, nonce);
         } catch {
             uint256 messageId = failedMessageCount++;
             failedMessages[messageId] = FailedMessage({
@@ -628,6 +609,7 @@ contract PositionManager is
         if (liquidity == 0) revert InvalidPositionData(tokenId);
         if (tokensOwed0 > 0 || tokensOwed1 > 0) revert FeesNotCollected(tokenId);
 
+        isCrossChainPosition[tokenId] = true;
         _burn(tokenId);
 
         string memory dstAxelarChain = chainIdToAxelarChain[dstChainId];
@@ -685,7 +667,6 @@ contract PositionManager is
         }
 
         if (success) {
-            isCrossChainPosition[tokenId] = true;
             emit CrossChainPositionSent(tokenId, msg.sender, msg.sender, dstChainId, nonce, timelock);
         }
     }
@@ -725,6 +706,7 @@ contract PositionManager is
             if (liquidity == 0) revert InvalidPositionData(tokenId);
             if (tokensOwed0 > 0 || tokensOwed1 > 0) revert FeesNotCollected(tokenId);
 
+            isCrossChainPosition[tokenId] = true;
             _burn(tokenId);
             payloads[i] = abi.encode(
                 msg.sender,
@@ -760,7 +742,6 @@ contract PositionManager is
                 adapterParams,
                 payable(msg.sender)
             ) {
-                isCrossChainPosition[tokenIds[i]] = true;
                 emit CrossChainPositionSent(tokenIds[i], msg.sender, msg.sender, dstChainId, nonce + uint64(i), timelock);
             } catch {
                 success = false;
@@ -807,7 +788,7 @@ contract PositionManager is
             address tokenB
         ) = abi.decode(payload, (address, uint256, int24, int24, uint256, uint64, uint256, address, address));
 
-        if (block.timestamp < timelock) revert TimelockNotExpired(block.timestamp, timelock);
+        if (block.timestamp < timelock) revert Unauthorized(); // Timelock check
         if (_exists(tokenId)) revert PositionAlreadyExists(tokenId);
         if (recipient == address(0) || liquidity == 0) revert InvalidPositionData(tokenId);
         if (IAMMPool(ammPool).tokenA() != tokenA || IAMMPool(ammPool).tokenB() != tokenB) revert InvalidPositionData(tokenId);
@@ -896,21 +877,21 @@ contract PositionManager is
         Position memory position = positionData[tokenId];
         FeeTracking memory fees = feeTracking[tokenId];
         string memory json = string(abi.encodePacked(
-            '{"name":"AMMPool Position #',
+            "{\"name\":\"AMMPool Position #",
             tokenId.toString(),
-            '","description":"Liquidity position in AMMPool","attributes":',
-            '[{"trait_type":"Pool","value":"', _toHexString(position.pool), '"},',
-            '{"trait_type":"TokenA","value":"', _toHexString(position.tokenA), '"},',
-            '{"trait_type":"TokenB","value":"', _toHexString(position.tokenB), '"},',
-            '{"trait_type":"TickLower","value":"', int24ToString(position.tickLower), '"},',
-            '{"trait_type":"TickUpper","value":"', int24ToString(position.tickUpper), '"},',
-            '{"trait_type":"Liquidity","value":"', position.liquidity.toString(), '"},',
-            '{"trait_type":"SourceChainId","value":"', uint256(position.sourceChainId).toString(), '"},',
-            '{"trait_type":"AccumulatedFees0","value":"', fees.accumulated0.toString(), '"},',
-            '{"trait_type":"AccumulatedFees1","value":"', fees.accumulated1.toString(), '"}]}'
+            "\",\"description\":\"Liquidity position in AMMPool\",\"attributes\":",
+            "[{\"trait_type\":\"Pool\",\"value\":\"", _toHexString(position.pool), "\"},",
+            "{\"trait_type\":\"TokenA\",\"value\":\"", _toHexString(position.tokenA), "\"},",
+            "{\"trait_type\":\"TokenB\",\"value\":\"", _toHexString(position.tokenB), "\"},",
+            "{\"trait_type\":\"TickLower\",\"value\":\"", int24ToString(position.tickLower), "\"},",
+            "{\"trait_type\":\"TickUpper\",\"value\":\"", int24ToString(position.tickUpper), "\"},",
+            "{\"trait_type\":\"Liquidity\",\"value\":\"", position.liquidity.toString(), "\"},",
+            "{\"trait_type\":\"SourceChainId\",\"value\":\"", uint256(position.sourceChainId).toString(), "\"},",
+            "{\"trait_type\":\"AccumulatedFees0\",\"value\":\"", fees.accumulated0.toString(), "\"},",
+            "{\"trait_type\":\"AccumulatedFees1\",\"value\":\"", fees.accumulated1.toString(), "\"}]}"
         ));
 
-        return string(abi.encodePacked("data:application/json;base64,", json.encode()));
+        return string(abi.encodePacked("data:application/json;base64,", Base64Upgradeable.encode(bytes(json))));
     }
 
     // --- View Functions ---
@@ -1008,5 +989,5 @@ contract PositionManager is
     }
 
     // --- Storage Gap ---
-    uint256[50] private __gap;
+    uint256[49] private __gap;
 }

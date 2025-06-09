@@ -1,12 +1,15 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.24;
 
-import "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
-import "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
-import "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
-import "@openzeppelin/contracts-upgradeable/security/ReentrancyGuardUpgradeable.sol";
-import "@openzeppelin/contracts-upgradeable/security/PausableUpgradeable.sol";
-import "@chainlink/contracts/src/v0.8/shared/interfaces/AggregatorV3Interface.sol";
+import {Initializable} from "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
+import {UUPSUpgradeable} from "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
+import {OwnableUpgradeable} from "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
+import {ReentrancyGuardUpgradeable} from "@openzeppelin/contracts-upgradeable/security/ReentrancyGuardUpgradeable.sol";
+import {PausableUpgradeable} from "@openzeppelin/contracts-upgradeable/security/PausableUpgradeable.sol";
+import {VRFConsumerBaseV2Plus} from "@chainlink/contracts/src/v0.8/vrf/dev/VRFConsumerBaseV2Plus.sol";
+import {IVRFCoordinatorV2Plus} from "@chainlink/contracts/src/v0.8/vrf/dev/interfaces/IVRFCoordinatorV2Plus.sol";
+import {VRFV2PlusClient} from "@chainlink/contracts/src/v0.8/vrf/dev/libraries/VRFV2PlusClient.sol";
+import {AggregatorV3Interface} from "@chainlink/contracts/src/v0.8/shared/interfaces/AggregatorV3Interface.sol";
 import "./external/uniswap/v3/IUniswapV3Pool.sol";
 import "./external/uniswap/v3/TickMath.sol";
 import "./external/uniswap/v3/FullMath.sol";
@@ -23,7 +26,6 @@ contract PriceOracle is
     PausableUpgradeable,
     VRFConsumerBaseV2Plus
 {
-
     // Structs
     struct PriceFeedConfig {
         address feedAddress;
@@ -78,6 +80,8 @@ contract PriceOracle is
     }
 
     // Storage
+    // Note: Multiple state variables are necessary for tracking asset configurations, price feeds, and pool data.
+    // This exceeds the linter's max-states-count (15), but all are critical for functionality.
     mapping(address => AssetConfig) public assetConfigs; // asset is pair address (e.g., tokenA/tokenB pool)
     mapping(address => mapping(uint256 => PriceFeedConfig)) public priceFeeds;
     mapping(address => uint256) public priceFeedCount;
@@ -148,6 +152,7 @@ contract PriceOracle is
     error InvalidPrice(address asset);
     error InvalidTWAPWindow();
     error InvalidBlockWindow();
+    error InvalidInput();
     error InsufficientObservations(address pool);
     error InsufficientLiquidity(address pool);
     error NoValidPools(address asset);
@@ -172,9 +177,11 @@ contract PriceOracle is
     }
 
     /// @notice Authorizes contract upgrades
+    /// @dev Intentionally empty; only owner can upgrade (enforced by onlyOwner modifier)
     function _authorizeUpgrade(address) internal override onlyOwner {}
 
     /// @notice Initializes the contract
+    /// @dev Single initializer for UUPS proxy, called once during deployment
     function initialize(
         address initialOwner,
         address _vrfCoordinator,
@@ -343,7 +350,7 @@ contract PriceOracle is
 
         IUniswapV2Pair pool = IUniswapV2Pair(poolAddress);
         (uint112 reserve0, uint112 reserve1, ) = pool.getReserves();
-        uint128 liquidity = uint128(uint256(reserve0) * uint256(reserve1));
+        uint128 liquidity = uint128(uint256(reserve0) * uint256(reserve1)); // Used for liquidity check
         if (liquidity < MIN_LIQUIDITY_THRESHOLD) revert InsufficientLiquidity(poolAddress);
 
         uint256 index;
@@ -458,7 +465,7 @@ contract PriceOracle is
 
             IUniswapV2Pair pool = IUniswapV2Pair(poolConfig.poolAddress);
             (uint112 reserve0, uint112 reserve1, uint32 blockTimestampLast) = pool.getReserves();
-            uint128 liquidity = uint128(uint256(reserve0) * uint256(reserve1));
+            uint128 liquidity = uint128(uint256(reserve0) * uint256(reserve1)); // Used for liquidity check
             if (liquidity < MIN_LIQUIDITY_THRESHOLD) revert InsufficientLiquidity(poolConfig.poolAddress);
 
             uint32 newWindow = calculateDynamicBlockWindow(liquidity);
@@ -477,7 +484,7 @@ contract PriceOracle is
     }
 
     /// @notice Gets the current EMA price for an asset
-    function getCurrentPrice(address asset) external view returns (uint256) {
+    function getCurrentPrice(address asset) public view returns (uint256) {
         if (emergencyOverrideActive[asset]) return emergencyPrices[asset];
         if (pendingVRFRequestId[asset] != 0) {
             VRFRequest memory request = vrfRequests[pendingVRFRequestId[asset]];
@@ -489,35 +496,25 @@ contract PriceOracle is
     /// @notice Gets the current price for a specific token pair
     /// @param asset The asset address (e.g., token pair or pool address)
     /// @param inputToken The token to base the price on (tokenA or tokenB)
-    /// @return price The price in 1e18 precision
-    /// @return isCached Whether the price is cached
-    function getCurrentPairPrice(address asset, address inputToken) public view returns (uint256 price, bool isCached) {
-    if (asset == address(0) || inputToken == address(0)) revert ZeroAddress();
-    AssetConfig memory config = assetConfigs[asset];
-    if (inputToken != config.tokenA && inputToken != config.tokenB) revert InvalidTokenPair();
+    /// @return currentPrice The price in 1e18 precision
+    /// @return cachedStatus Whether the price is cached
+    function getCurrentPairPrice(address asset, address inputToken) public view returns (uint256 currentPrice, bool cachedStatus) {
+        if (asset == address(0) || inputToken == address(0)) revert ZeroAddress();
+        AssetConfig memory config = assetConfigs[asset];
+        if (inputToken != config.tokenA && inputToken != config.tokenB) revert InvalidTokenPair();
 
-    price = getCurrentPrice(asset);
-    isCached = emergencyOverrideActive[asset] || pendingVRFRequestId[asset] != 0;
-    if (price == 0) return (0, isCached);
+        currentPrice = getCurrentPrice(asset);
+        cachedStatus = emergencyOverrideActive[asset] || pendingVRFRequestId[asset] != 0;
+        if (currentPrice == 0) return (0, cachedStatus);
 
-    // If inputToken is tokenB, invert the price (tokenB/tokenA = 1 / (tokenA/tokenB))
-    price = inputToken == config.tokenA ? price : (PRICE_PRECISION * PRICE_PRECISION) / price;
-    return (price, isCached);
+        // If inputToken is tokenB, invert the price (tokenB/tokenA = 1 / (tokenA/tokenB))
+        currentPrice = inputToken == config.tokenA ? currentPrice : (PRICE_PRECISION * PRICE_PRECISION) / currentPrice;
+        return (currentPrice, cachedStatus);
     }
 
     /// @notice Checks if a VRF request is pending for an asset
     function getPendingVRFRequest(address asset) external view returns (uint256) {
         return pendingVRFRequestId[asset];
-    }
-
-    /// @notice Gets the price for an asset using the default token pair
-    /// @param asset The asset address (e.g., token pair or pool address)
-    /// @return The price in 1e18 precision
-    function getPrice(address asset) external nonReentrant whenNotPaused returns (uint256) {
-    if (asset == address(0)) revert ZeroAddress();
-    AssetConfig storage config = assetConfigs[asset];
-    if (config.tokenA == address(0)) revert InvalidTokenPair();
-    return getPrice(asset, config.tokenA);
     }
 
     /// @notice Requests price with optional VRF-based oracle selection for a specific token pair
@@ -527,10 +524,10 @@ contract PriceOracle is
         if (inputToken != config.tokenA && inputToken != config.tokenB) revert InvalidTokenPair();
 
         if (emergencyOverrideActive[asset]) {
-            uint256 price = emergencyPrices[asset];
-            price = inputToken == config.tokenA ? price : (PRICE_PRECISION * PRICE_PRECISION) / price;
-            uint256 emaPrice = updateEMA(asset, price);
-            emit PriceFetched(asset, inputToken, price, emaPrice, block.timestamp, 4);
+            uint256 currentPrice = emergencyPrices[asset];
+            currentPrice = inputToken == config.tokenA ? currentPrice : (PRICE_PRECISION * PRICE_PRECISION) / currentPrice;
+            uint256 emaPrice = updateEMA(asset, currentPrice);
+            emit PriceFetched(asset, inputToken, currentPrice, emaPrice, block.timestamp, 4);
             return emaPrice;
         }
 
@@ -562,11 +559,21 @@ contract PriceOracle is
             return assetConfigs[asset].emaPrice; // Return cached price while VRF is pending
         }
 
-        uint256 price = fetchPriceDeterministic(asset);
-        price = inputToken == config.tokenA ? price : (PRICE_PRECISION * PRICE_PRECISION) / price;
-        uint256 emaPrice = updateEMA(asset, price);
-        emit PriceFetched(asset, inputToken, price, emaPrice, block.timestamp, config.primaryOracle);
+        uint256 currentPrice = fetchPriceDeterministic(asset);
+        currentPrice = inputToken == config.tokenA ? currentPrice : (PRICE_PRECISION * PRICE_PRECISION) / currentPrice;
+        uint256 emaPrice = updateEMA(asset, currentPrice);
+        emit PriceFetched(asset, inputToken, currentPrice, emaPrice, block.timestamp, config.primaryOracle);
         return emaPrice;
+    }
+
+    /// @notice Gets the price for an asset using the default token pair
+    /// @param asset The asset address (e.g., token pair or pool address)
+    /// @return The price in 1e18 precision
+    function getPrice(address asset) external nonReentrant whenNotPaused returns (uint256) {
+        if (asset == address(0)) revert ZeroAddress();
+        AssetConfig storage config = assetConfigs[asset];
+        if (config.tokenA == address(0)) revert InvalidTokenPair();
+        return getPrice(asset, config.tokenA);
     }
 
     /// @notice Fulfills VRF request with weighted oracle selection
@@ -618,9 +625,9 @@ contract PriceOracle is
             }
         }
 
-        uint256 price;
+        uint256 currentPrice;
         try this.fetchPriceWithOracle(request.asset, oracleType) returns (uint256 _price) {
-            price = _price;
+            currentPrice = _price;
         } catch {
             request.attempts++;
             if (request.attempts < MAX_ORACLE_ATTEMPTS) {
@@ -651,7 +658,7 @@ contract PriceOracle is
                 emit VRFRequestSent(newRequestId, request.asset, request.inputToken);
                 return;
             } else {
-                price = fetchPriceDeterministic(request.asset);
+                currentPrice = fetchPriceDeterministic(request.asset);
                 oracleType = config.primaryOracle;
             }
         }
@@ -659,9 +666,9 @@ contract PriceOracle is
         if (config.maxPriceDeviation > 0) {
             uint256 secondaryPrice = getSecondaryPrice(request.asset, oracleType);
             if (secondaryPrice > 0) {
-                uint256 deviation = price > secondaryPrice
-                    ? (price - secondaryPrice) * 1e18 / secondaryPrice
-                    : (secondaryPrice - price) * 1e18 / price;
+                uint256 deviation = currentPrice > secondaryPrice
+                    ? (currentPrice - secondaryPrice) * 1e18 / secondaryPrice
+                    : (secondaryPrice - currentPrice) * 1e18 / currentPrice;
                 if (deviation > config.maxPriceDeviation) {
                     request.attempts++;
                     if (request.attempts < MAX_ORACLE_ATTEMPTS) {
@@ -692,7 +699,7 @@ contract PriceOracle is
                         emit VRFRequestSent(newRequestId, request.asset, request.inputToken);
                         return;
                     } else {
-                        price = fetchPriceDeterministic(request.asset);
+                        currentPrice = fetchPriceDeterministic(request.asset);
                         oracleType = config.primaryOracle;
                     }
                 }
@@ -700,60 +707,60 @@ contract PriceOracle is
         }
 
         // Adjust price based on inputToken
-        price = request.inputToken == config.tokenA ? price : (PRICE_PRECISION * PRICE_PRECISION) / price;
-        price = updateEMA(request.asset, price);
-        request.price = price;
+        currentPrice = request.inputToken == config.tokenA ? currentPrice : (PRICE_PRECISION * PRICE_PRECISION) / currentPrice;
+        currentPrice = updateEMA(request.asset, currentPrice);
+        request.price = currentPrice;
         request.timestamp = block.timestamp;
         request.isPending = false;
         pendingVRFRequestId[request.asset] = 0;
-        emit VRFRequestFulfilled(requestId, request.asset, request.inputToken, price, oracleType);
-        emit PriceFetched(request.asset, request.inputToken, price, price, block.timestamp, oracleType);
+        emit VRFRequestFulfilled(requestId, request.asset, request.inputToken, currentPrice, oracleType);
+        emit PriceFetched(request.asset, request.inputToken, currentPrice, currentPrice, block.timestamp, oracleType);
     }
 
     /// @notice Fetches price using deterministic logic
     function fetchPriceDeterministic(address asset) internal returns (uint256) {
         AssetConfig storage config = assetConfigs[asset];
         uint8 oracleType = config.primaryOracle;
-        uint256 price;
+        uint256 currentPrice;
 
         if (oracleType == 0) {
             try this.getChainlinkPrice(asset) returns (uint256 _price) {
-                price = _price;
+                currentPrice = _price;
             } catch {
                 try this.getUniswapV3TWAP(asset) returns (uint256 _price) {
-                    price = _price;
+                    currentPrice = _price;
                 } catch {
                     try this.getUniswapV2TWAP(asset, true) returns (uint256 _price) {
-                        price = _price;
+                        currentPrice = _price;
                     } catch {
-                        price = getUniswapV2TWAP(asset, false);
+                        currentPrice = getUniswapV2TWAP(asset, false);
                     }
                 }
             }
         } else if (oracleType == 1) {
             try this.getUniswapV3TWAP(asset) returns (uint256 _price) {
-                price = _price;
+                currentPrice = _price;
             } catch {
                 try this.getUniswapV2TWAP(asset, true) returns (uint256 _price) {
-                    price = _price;
+                    currentPrice = _price;
                 } catch {
-                    price = getUniswapV2TWAP(asset, false);
+                    currentPrice = getUniswapV2TWAP(asset, false);
                 }
             }
         } else if (oracleType == 2) {
             try this.getUniswapV2TWAP(asset, true) returns (uint256 _price) {
-                price = _price;
+                currentPrice = _price;
             } catch {
-                price = getUniswapV2TWAP(asset, false);
+                currentPrice = getUniswapV2TWAP(asset, false);
             }
         } else {
             try this.getUniswapV2TWAP(asset, false) returns (uint256 _price) {
-                price = _price;
+                currentPrice = _price;
             } catch {
                 try this.getUniswapV3TWAP(asset) returns (uint256 _price) {
-                    price = _price;
+                    currentPrice = _price;
                 } catch {
-                    price = getChainlinkPrice(asset);
+                    currentPrice = getChainlinkPrice(asset);
                 }
             }
         }
@@ -761,14 +768,14 @@ contract PriceOracle is
         if (config.maxPriceDeviation > 0) {
             uint256 secondaryPrice = getSecondaryPrice(asset, oracleType);
             if (secondaryPrice > 0) {
-                uint256 deviation = price > secondaryPrice
-                    ? (price - secondaryPrice) * 1e18 / secondaryPrice
-                    : (secondaryPrice - price) * 1e18 / price;
+                uint256 deviation = currentPrice > secondaryPrice
+                    ? (currentPrice - secondaryPrice) * 1e18 / secondaryPrice
+                    : (secondaryPrice - currentPrice) * 1e18 / currentPrice;
                 if (deviation > config.maxPriceDeviation) revert PriceDeviationTooHigh(asset);
             }
         }
 
-        return price;
+        return currentPrice;
     }
 
     /// @notice Fetches price with specific oracle type
