@@ -153,7 +153,7 @@ contract PoolFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable, Reen
     /// @notice Whitelist of allowed governance target addresses
     mapping(address => bool) public governanceTargetWhitelist;
 
-    /// @notice Multi-signature committee\ for critical actions
+    /// @notice Multi-signature committee for critical actions
     mapping(address => bool) public committeeMembers;
     uint256 public committeeMemberCount;
     uint256 public constant MIN_COMMITTEE_APPROVALS = 3;
@@ -183,7 +183,7 @@ contract PoolFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable, Reen
         bool circuitBreaker;
         uint256 proposedAt;
     }
-    mapping(uint256 => Emergency FrankProposal) public emergencyFlagProposals;
+    mapping(uint256 => EmergencyFlagProposal) public emergencyFlagProposals;
     uint256 public emergencyFlagProposalCount;
 
     /// @notice Mapping for pair-to-asset resolution
@@ -210,7 +210,7 @@ contract PoolFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable, Reen
     /// @notice Storage gap for future upgrades
     uint256[89] private __gap; // Adjusted from 90 to 89 for new positionManager variable
 
-    /// @custom: Errors
+    /// @custom:errors Lists all custom errors used in the contract
     error InvalidTokenAddress(string reason);
     error IdenticalTokens();
     error PoolAlreadyExists();
@@ -572,8 +572,8 @@ contract PoolFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable, Reen
     ) external payable whenNotPaused whenChainNotPaused(chainId) whenCircuitBreakerNotTriggered nonReentrant returns (address pool) {
         _validateAdapterParams(adapterParams);
         _validateTokens(tokenA, tokenB);
-        address selectedOracle = _validateOracles(primaryPriceOracle, chainId, tokenA, tokenB);
-        pool = _createSinglePool(tokenA, tokenB, selectedOracle, chainId, adapterParams, customSalt);
+        address validatedOracle = _validateOracles(primaryPriceOracle, chainId, tokenA, tokenB);
+        pool = _createSinglePool(tokenA, tokenB, validatedOracle, chainId, adapterParams, customSalt);
     }
 
     /// @notice Creates multiple AMM pools in a single transaction
@@ -600,11 +600,11 @@ contract PoolFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable, Reen
             if (!chainPaused[chainIds[i]]) {
                 _validateAdapterParams(adapterParams[i]);
                 _validateTokens(tokens[i][0], tokens[i][1]);
-                address selectedOracle = _validateOracles(primaryPriceOracles[i], chainIds[i], tokens[i][0], tokens[i][1]);
+                address validatedOracle = _validateOracles(primaryPriceOracles[i], chainIds[i], tokens[i][0], tokens[i][1]);
                 pools[i] = _createSinglePool(
                     tokens[i][0],
                     tokens[i][1],
-                    selectedOracle,
+                    validatedOracle,
                     chainIds[i],
                     adapterParams[i],
                     customSalts[i]
@@ -995,29 +995,29 @@ contract PoolFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable, Reen
 
     /// @notice Updates configuration parameters
     function updateConfig(
-    uint256 _minTimelock,
-    uint256 _maxTimelock,
-    uint256 _maxRetries,
-    uint256 _maxBatchSize,
-    uint256 _minGasLimit,
-    uint256 _maxOracleStaleness
-)   external onlyGovernance {
-    if (_minTimelock > type(uint32).max || _maxTimelock > type(uint32).max || _maxRetries > type(uint32).max ||
-    _maxBatchSize > type(uint32).max || _minGasLimit > type(uint32).max || _maxOracleStaleness > type(uint32).max)
-    revert InvalidAmount("Parameter exceeds uint32 max");
-    minTimelock = uint32(_minTimelock);
-    maxTimelock = uint32(_maxTimelock);
-    maxRetries = uint32(_maxRetries);
-    maxBatchSize = uint32(_maxBatchSize);
-    minGasLimit = uint32(_minGasLimit);
-    maxOracleStaleness = uint32(_maxOracleStaleness);
-    emit MinTimelockUpdated(_minTimelock);
-    emit MaxTimelockUpdated(_maxTimelock);
-    emit MaxRetriesUpdated(_maxRetries);
-    emit MaxBatchSizeUpdated(_maxBatchSize);
-    emit MinGasLimitUpdated(_minGasLimit);
-    emit MaxOracleStalenessUpdated(_maxOracleStaleness);
-}
+        uint256 _minTimelock,
+        uint256 _maxTimelock,
+        uint256 _maxRetries,
+        uint256 _maxBatchSize,
+        uint256 _minGasLimit,
+        uint256 _maxOracleStaleness
+    ) external onlyGovernance {
+        if (_minTimelock > type(uint32).max || _maxTimelock > type(uint32).max || _maxRetries > type(uint32).max ||
+            _maxBatchSize > type(uint32).max || _minGasLimit > type(uint32).max || _maxOracleStaleness > type(uint32).max)
+            revert InvalidAmount("Parameter exceeds uint32 max");
+        minTimelock = uint32(_minTimelock);
+        maxTimelock = uint32(_maxTimelock);
+        maxRetries = uint32(_maxRetries);
+        maxBatchSize = uint32(_maxBatchSize);
+        minGasLimit = uint32(_minGasLimit);
+        maxOracleStaleness = uint32(_maxOracleStaleness);
+        emit MinTimelockUpdated(_minTimelock);
+        emit MaxTimelockUpdated(_maxTimelock);
+        emit MaxRetriesUpdated(_maxRetries);
+        emit MaxBatchSizeUpdated(_maxBatchSize);
+        emit MinGasLimitUpdated(_minGasLimit);
+        emit MaxOracleStalenessUpdated(_maxOracleStaleness);
+    }
 
     /// @notice Updates oracle and relayer for a chain
     function updateOracleRelayer(uint16 chainId, address oracle, address relayer) external onlyGovernance {
@@ -1263,7 +1263,7 @@ contract PoolFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable, Reen
         crossChainCircuitBreaker = proposal.circuitBreaker;
         emit OracleOverrideToggled(proposal.oracleOverride);
         emit CircuitBreakerToggled(proposal.circuitBreaker);
-        delete emergencyFlagPro>nals[proposalId];
+        delete emergencyFlagProposals[proposalId];
     }
 
     /// @notice Internal function to validate token addresses
@@ -1281,43 +1281,43 @@ contract PoolFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable, Reen
     }
 
     /// @notice Internal function to validate oracles with automatic failover
-    function _validateOracles(address primaryPriceOracle, uint16 chainId, address tokenA, address tokenB) internal returns (address selectedOracle) {
-        if (primaryPriceOracle == address(0)) revert InvalidOracle(primaryPriceOracle, "Zero address");
-        if (!oracleOverride && selectedOracle[chainId] != address(0) && primaryPriceOracle != selectedOracle[chainId])
-            revert InvalidOracle(primaryPriceOracle, "Not selected oracle");
+    function _validateOracles(address primaryPriceOracle, uint16 chainId, address tokenA, address tokenB) internal returns (address validatedOracle) {
+    if (primaryPriceOracle == address(0)) revert InvalidOracle(primaryPriceOracle, "Zero address");
+    if (!oracleOverride && selectedOracle[chainId] != address(0) && primaryPriceOracle != selectedOracle[chainId])
+        revert InvalidOracle(primaryPriceOracle, "Not selected oracle");
 
-        // Check primary oracle health
-        if (checkOracleHealth(primaryPriceOracle, chainId, tokenA, tokenB)) {
-            // Verify precision compatibility with fallback oracles
-            uint8 primaryDecimals = _getOracleDecimals(primaryPriceOracle);
-            address[] memory fallbackOraclesList = fallbackOracles[chainId];
-            for (uint256 i = 0; i < fallbackOraclesList.length; i++) {
-                if (fallbackOraclesList[i] != address(0)) {
-                    uint8 fallbackDecimals = _getOracleDecimals(fallbackOraclesList[i]);
-                    if (fallbackDecimals != primaryDecimals)
-                        revert OraclePrecisionMismatch(primaryDecimals, fallbackDecimals);
-                }
+    // Check primary oracle health
+    if (checkOracleHealth(primaryPriceOracle, chainId, tokenA, tokenB)) {
+        // Verify precision compatibility with fallback oracles
+        uint8 primaryDecimals = _getOracleDecimals(primaryPriceOracle);
+        address[] memory fallbackOracleList = fallbackOracles[chainId]; // Line 1293
+        for (uint256 i = 0; i < fallbackOracleList.length; i++) {
+            if (fallbackOracleList[i] != address(0)) {
+                uint8 fallbackDecimals = _getOracleDecimals(fallbackOracleList[i]);
+                if (fallbackDecimals != primaryDecimals)
+                    revert OraclePrecisionMismatch(primaryDecimals, fallbackDecimals);
             }
-            return primaryPriceOracle;
         }
-
-        // Primary oracle failed, attempt failover
-        emit OracleValidationFailed(primaryPriceOracle, "Primary oracle unhealthy");
-        address[] memory fallbackOraclesList = fallbackOracles[chainId];
-        if (fallbackOraclesList.length == 0) revert NoValidOracleFound();
-
-        for (uint256 i = 0; i < fallbackOraclesList.length; i++) {
-            if (fallbackOraclesList[i] == address(0)) continue;
-            if (checkOracleHealth(fallbackOraclesList[i], chainId, tokenA, tokenB)) {
-                emit OracleFailover(primaryPriceOracle, fallbackOraclesList[i]);
-                selectedOracle[chainId] = fallbackOraclesList[i];
-                return fallbackOraclesList[i];
-            }
-            emit OracleValidationFailed(fallbackOraclesList[i], "Fallback oracle unhealthy");
-        }
-
-        revert NoValidOracleFound();
+        return primaryPriceOracle;
     }
+
+    // Primary oracle failed, attempt failover
+    emit OracleValidationFailed(primaryPriceOracle, "Primary oracle unhealthy");
+    // Reuse the existing fallbackOracleList variable
+    if (fallbackOracleList.length == 0) revert NoValidOracleFound();
+
+    for (uint256 i = 0; i < fallbackOracleList.length; i++) {
+        if (fallbackOracleList[i] == address(0)) continue;
+        if (checkOracleHealth(fallbackOracleList[i], chainId, tokenA, tokenB)) {
+            emit OracleFailover(primaryPriceOracle, fallbackOracleList[i]);
+            selectedOracle[chainId] = fallbackOracleList[i];
+            return fallbackOracleList[i];
+        }
+        emit OracleValidationFailed(fallbackOracleList[i], "Fallback oracle unhealthy");
+    }
+
+    revert NoValidOracleFound();
+}
 
     /// @notice Internal function to get oracle decimals
     function _getOracleDecimals(address oracle) internal view returns (uint8) {

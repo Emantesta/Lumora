@@ -523,10 +523,13 @@ contract PriceOracle is
         AssetConfig storage config = assetConfigs[asset];
         if (inputToken != config.tokenA && inputToken != config.tokenB) revert InvalidTokenPair();
 
+        uint256 currentPrice; // Declare once at function scope
+        uint256 emaPrice; // Declare once at function scope
+
         if (emergencyOverrideActive[asset]) {
-            uint256 currentPrice = emergencyPrices[asset];
+            currentPrice = emergencyPrices[asset];
             currentPrice = inputToken == config.tokenA ? currentPrice : (PRICE_PRECISION * PRICE_PRECISION) / currentPrice;
-            uint256 emaPrice = updateEMA(asset, currentPrice);
+            emaPrice = updateEMA(asset, currentPrice);
             emit PriceFetched(asset, inputToken, currentPrice, emaPrice, block.timestamp, 4);
             return emaPrice;
         }
@@ -541,30 +544,30 @@ contract PriceOracle is
                     callbackGasLimit: callbackGasLimit,
                     numWords: numWords,
                     extraArgs: VRFV2PlusClient._argsToBytes(
-                        VRFV2PlusClient.ExtraArgsV1({nativePayment: false})
-                    )
-                })
-            );
-            vrfRequests[requestId] = VRFRequest({
-                asset: asset,
-                inputToken: inputToken,
-                requestId: requestId,
-                isPending: true,
-                price: assetConfigs[asset].emaPrice, // Cache last valid price
-                timestamp: block.timestamp,
-                attempts: 0
-            });
-            pendingVRFRequestId[asset] = requestId;
-            emit VRFRequestSent(requestId, asset, inputToken);
-            return assetConfigs[asset].emaPrice; // Return cached price while VRF is pending
-        }
-
-        uint256 currentPrice = fetchPriceDeterministic(asset);
-        currentPrice = inputToken == config.tokenA ? currentPrice : (PRICE_PRECISION * PRICE_PRECISION) / currentPrice;
-        uint256 emaPrice = updateEMA(asset, currentPrice);
-        emit PriceFetched(asset, inputToken, currentPrice, emaPrice, block.timestamp, config.primaryOracle);
-        return emaPrice;
+                    VRFV2PlusClient.ExtraArgsV1({nativePayment: false})
+                )
+            })
+        );
+        vrfRequests[requestId] = VRFRequest({
+            asset: asset,
+            inputToken: inputToken,
+            requestId: requestId,
+            isPending: true,
+            price: assetConfigs[asset].emaPrice, // Cache last valid price
+            timestamp: block.timestamp,
+            attempts: 0
+        });
+        pendingVRFRequestId[asset] = requestId;
+        emit VRFRequestSent(requestId, asset, inputToken);
+        return assetConfigs[asset].emaPrice; // Return cached price while VRF is pending
     }
+
+    currentPrice = fetchPriceDeterministic(asset);
+    currentPrice = inputToken == config.tokenA ? currentPrice : (PRICE_PRECISION * PRICE_PRECISION) / currentPrice;
+    emaPrice = updateEMA(asset, currentPrice);
+    emit PriceFetched(asset, inputToken, currentPrice, emaPrice, block.timestamp, config.primaryOracle);
+    return emaPrice;
+   }
 
     /// @notice Gets the price for an asset using the default token pair
     /// @param asset The asset address (e.g., token pair or pool address)

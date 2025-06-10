@@ -4,7 +4,14 @@
     "func-visibility": [
       "error",
       {
-        "ignoreConstructors": true
+        "ignoreConstructors": true,
+        "var-name-mixedcase": [
+          "warn",
+          {
+            "constants": "allow-uppercase",
+            "avoid-low-level-calls": "off"
+          }
+        ]
       }
     ],
     "max-line-length": [

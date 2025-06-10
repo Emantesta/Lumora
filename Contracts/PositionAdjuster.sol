@@ -102,6 +102,7 @@ contract PositionAdjuster is KeeperCompatibleInterface, ReentrancyGuardUpgradeab
     error InvalidFeeConfig(uint256 baseFee, uint256 maxFee);
     error InvalidBridgeType(uint8 bridgeType);
     error InsufficientAggregatedFees();
+    error InvalidOperation(string message);
     error InvalidAddress(address addr, string message);
 
     constructor(address _pool, address _positionManager, address _priceOracle, address[] memory _fallbackPriceOracles) {
@@ -186,7 +187,7 @@ contract PositionAdjuster is KeeperCompatibleInterface, ReentrancyGuardUpgradeab
         uint24 volatilityThreshold,
         uint24 volumePercentile,
         uint24 twapPeriod,
-        bool compoundFees,
+        bool shouldcompoundFees,
         uint8 bridgeType
     ) external nonReentrant {
         if (uint8(strategyType) > uint8(StrategyType.Predictive)) revert InvalidStrategyType();
@@ -349,7 +350,7 @@ contract PositionAdjuster is KeeperCompatibleInterface, ReentrancyGuardUpgradeab
         message.nextRetryTimestamp = block.timestamp + 3600 * (2 ** message.retries);
     }
 
-    try pool.batchCrossChainMessages{value: msg.value}(message.dstChainIdpand, message.payload, message.adapterParams) {
+    try pool.batchCrossChainMessages{value: msg.value}(message.dstChainId, message.payload, message.adapterParams) {
         Strategy storage strategy = _getStrategy(message.positionId);
         if (message.fallbackActive) {
             if (strategy.compoundFees) {
@@ -398,7 +399,7 @@ contract PositionAdjuster is KeeperCompatibleInterface, ReentrancyGuardUpgradeab
        emit FeesAggregated(owner, id, amount0, amount1);
   }
 
-        function compoundFees(uint256 id) external nonReentrant {
+    function compoundFees(uint256 id) external nonReentrant {
     (, int24 tickLower, int24 tickUpper, uint256 balance, bool fallbackActive, address owner) = pool.positions(id);
     if (!fallbackActive) revert();
     if (balance == 0) revert InsufficientLiquidity(balance);
@@ -420,7 +421,7 @@ contract PositionAdjuster is KeeperCompatibleInterface, ReentrancyGuardUpgradeab
     emit FeesAggregated(owner, id, amount0, amount1);
 }
 
-        function batchExitFallback(uint256[] memory ids) external nonReentrant {
+    function batchExitFallback(uint256[] memory ids) external nonReentrant {
     uint256 count = ids.length;
     if (count == 0 || count > maxAdjustmentsPerUpkeep) revert InvalidBatchSize(count);
     if (pausedAssets[address(pool)]) revert AssetPaused(address(pool));
@@ -447,7 +448,99 @@ contract PositionAdjuster is KeeperCompatibleInterface, ReentrancyGuardUpgradeab
     } else {
         revert InvalidBatchSize(0);
     }
-}
+} 
+
+    /// @dev Collects fees for a position in the fallback pool and transfers them to the owner or designated recipient
+    function collectFallbackFees(uint256 positionId) internal {
+        // Ensure the position is in the fallback pool
+        if (!pool.inFallbackPool(positionId)) revert InvalidOperation("Position not in fallback pool");
+
+        // Update fees owed for the position
+        pool.collectFeesInternal(positionId);
+
+        // Get the position details
+        (, , , , , , uint256 tokensOwed0, uint256 tokensOwed1, address owner) = pool.positions(positionId);
+        if (tokensOwed0 == 0 && tokensOwed1 == 0) return;
+
+        // Transfer fees to the owner or position manager's destination
+        address destination = positionManager.feeDestinations(owner);
+        address recipient = destination != address(0) ? destination : owner;
+
+        // Reset tokens owed after transfer
+        if (tokensOwed0 > 0) {
+            pool.transferToken(address(pool.tokenA()), recipient, tokensOwed0);
+            (, , , , , , uint256 newTokensOwed0, , ) = pool.positions(positionId);
+            if (newTokensOwed0 != 0) {
+                pool.call(abi.encodeWithSelector(AMMPool.positions.selector, positionId).tokensOwed0 = 0);
+            }
+            aggregatedFees[owner].total0 += tokensOwed0;
+            emit FallbackFeesCollected(positionId, tokensOwed0, 0);
+        }
+        if (tokensOwed1 > 0) {
+            pool.transferToken(address(pool.tokenB()), recipient, tokensOwed1);
+            (, , , , , , , uint256 newTokensOwed1, ) = pool.positions(positionId);
+            if (newTokensOwed1 != 0) {
+                pool.call(abi.encodeWithSelector(AMMPool.positions.selector, positionId).tokensOwed1 = 0);
+            }
+            aggregatedFees[owner].total1 += tokensOwed1;
+            emit FallbackFeesCollected(positionId, 0, tokensOwed1);
+        }
+
+        emit FeesAggregated(owner, positionId, tokensOwed0, tokensOwed1);
+    }
+
+    /// @dev Compounds fees for a position in the fallback pool by reinvesting them into additional liquidity
+    function compoundFallbackFees(uint256 positionId) internal {
+        // Ensure the position is in the fallback pool
+        if (!pool.inFallbackPool(positionId)) revert InvalidOperation("Position not in fallback pool");
+
+        // Update fees owed for the position
+        pool.collectFeesInternal(positionId);
+
+        // Get the position details
+        (, , , , , , uint256 tokensOwed0, uint256 tokensOwed1, address owner) = pool.positions(positionId);
+        if (tokensOwed0 == 0 && tokensOwed1 == 0) return;
+
+        // Compound fees via AMMPool
+        pool.compoundFallbackFeesInternal(positionId, tokensOwed0, tokensOwed1);
+
+        // Update aggregated fees and emit events
+        aggregatedFees[owner].total0 += tokensOwed0;
+        aggregatedFees[owner].total1 += tokensOwed1;
+        emit FallbackFeesCompounded(positionId, tokensOwed0, tokensOwed1);
+        emit FeesAggregated(owner, positionId, tokensOwed0, tokensOwed1);
+    }
+
+    /// @dev Exits multiple positions from the fallback pool in a batch
+    function batchExitFallbackPool(uint256[] memory positionIds, uint256 count) internal {
+        if (count == 0 || count > pool.MAX_BATCH_SIZE() || count != positionIds.length) revert InvalidBatchSize(count);
+        uint256 requiredGas = count * MIN_GAS_PER_EXIT;
+        if (gasleft() < requiredGas) revert InsufficientGas(requiredGas, gasleft());
+
+        uint256[] memory validIds = new uint256[](count);
+        uint256 validCount = 0;
+
+        for (uint256 i = 0; i < count; i++) {
+            uint256 positionId = positionIds[i];
+            if (!pool.inFallbackPool(positionId)) continue;
+            (, , , uint256 liquidity, , , , , address owner) = pool.positions(positionId);
+            if (liquidity == 0) continue;
+
+            // Exit fallback pool
+            pool.exitFallbackPoolInternal(positionId);
+
+            // Aggregate fees before exiting
+            _aggregateFees(positionId, owner);
+
+            validIds[validCount++] = positionId;
+        }
+
+        if (validCount > 0) {
+            emit BatchFallbackPoolExited(validIds[:validCount]);
+        } else {
+            revert InvalidBatchSize(0);
+        }
+    }
 
         function updateFeeConfig(
             uint256 newBaseFee,
@@ -457,11 +550,11 @@ contract PositionAdjuster is KeeperCompatibleInterface, ReentrancyGuardUpgradeab
         ) external {
             if (sender != owner.governance()) revert Unauthorized();
             if (newBaseFee > newMaxFee || newFee < 10 || newMaxFee > 1000) revert InvalidFeeConfig(newBaseFee, newMaxFee);
-            baseFeeRate = newBaseFeeRate;
-            maxFeeRate = newMaxFeeRate;
+            baseFeeRate = newBaseFee;
+            maxFeeRate = newMaxFee;
             feeMultiplier = newFeeMultiplier;
             durationThreshold = newThresholdDuration;
-            emit FeeConfigUpdated(newBaseFee, newMaxFee, newFeeMultiplier, newThresholdDuration);
+            emit FallbackFeeConfigUpdated(newBaseFee, newMaxFee, newFeeMultiplier, newThresholdDuration);
         }
 
         function getDynamicFeeRate(uint256 id) public view returns(uint256) {
@@ -526,9 +619,9 @@ contract PositionAdjuster is KeeperCompatibleInterface, ReentrancyGuardUpgradeab
             return priceDiff > currentPrice / 100 ? 1000 : 500;
         }
 
-        function getOracleVolatility(address pool) internal view returns (uint256) {
-            (, , , , , , , , uint256 volatilityIndex) = IPriceOracle(priceOracle).assetConfigs(pool);
-            return volatilityIndex;
+        function getOracleVolatility(address poolAddress) internal view returns (uint256) {
+           (, , , , , , , , uint256 volatilityIndex) = IPriceOracle(priceOracle).assetConfigs(poolAddress);
+           return volatilityIndex;
         }
 
         function _getTWAP(uint24 twapPeriod) internal view returns (uint256) {
