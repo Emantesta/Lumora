@@ -207,6 +207,23 @@ contract PriceOracle is
         emit VRFConfigUpdated(_vrfCoordinator, _subscriptionId, _keyHash);
     }
 
+    function _transferOwnership(address newOwner) internal override(OwnableUpgradeable, ConfirmedOwnerWithProposal) {
+    OwnableUpgradeable._transferOwnership(newOwner);
+    }
+
+    function owner() public view override(OwnableUpgradeable, ConfirmedOwnerWithProposal) returns (address) {
+    return OwnableUpgradeable.owner();
+    }
+
+    function transferOwnership(address newOwner) public override(OwnableUpgradeable, ConfirmedOwnerWithProposal) onlyOwner {
+    OwnableUpgradeable.transferOwnership(newOwner);
+    }
+
+    modifier onlyOwner() override(OwnableUpgradeable, ConfirmedOwnerWithProposal) {
+    OwnableUpgradeable.onlyOwner();
+    _;
+    }
+
     /// @notice Updates VRF configuration
     function updateVRFConfig(
         address _vrfCoordinator,
@@ -518,32 +535,32 @@ contract PriceOracle is
     }
 
     /// @notice Requests price with optional VRF-based oracle selection for a specific token pair
-    function getPrice(address asset, address inputToken) external nonReentrant whenNotPaused returns (uint256) {
-        if (asset == address(0) || inputToken == address(0)) revert PriceOracleZeroAddress();
-        AssetConfig storage config = assetConfigs[asset];
-        if (inputToken != config.tokenA && inputToken != config.tokenB) revert InvalidTokenPair();
+function getPrice(address asset, address inputToken) external nonReentrant whenNotPaused returns (uint256) {
+    if (asset == address(0) || inputToken == address(0)) revert PriceOracleZeroAddress();
+    AssetConfig storage config = assetConfigs[asset];
+    if (inputToken != config.tokenA && inputToken != config.tokenB) revert InvalidTokenPair();
 
-        uint256 currentPrice; // Declare once at function scope
-        uint256 emaPrice; // Declare once at function scope
+    uint256 currentPrice; // Declare once at function scope
+    uint256 emaPrice; // Declare once at function scope
 
-        if (emergencyOverrideActive[asset]) {
-            currentPrice = emergencyPrices[asset];
-            currentPrice = inputToken == config.tokenA ? currentPrice : (PRICE_PRECISION * PRICE_PRECISION) / currentPrice;
-            emaPrice = updateEMA(asset, currentPrice);
-            emit PriceFetched(asset, inputToken, currentPrice, emaPrice, block.timestamp, 4);
-            return emaPrice;
-        }
+    if (emergencyOverrideActive[asset]) {
+        currentPrice = emergencyPrices[asset];
+        currentPrice = inputToken == config.tokenA ? currentPrice : (PRICE_PRECISION * PRICE_PRECISION) / currentPrice;
+        emaPrice = updateEMA(asset, currentPrice);
+        emit PriceFetched(asset, inputToken, currentPrice, emaPrice, block.timestamp, 4);
+        return emaPrice;
+    }
 
-        if (config.useVRF && address(vrfCoordinator) != address(0)) {
-            if (pendingVRFRequestId[asset] != 0) revert VRFRequestPending(asset);
-            uint256 requestId = vrfCoordinator.requestRandomWords(
-                VRFV2PlusClient.RandomWordsRequest({
-                    keyHash: keyHash,
-                    subId: subscriptionId,
-                    requestConfirmations: requestConfirmations,
-                    callbackGasLimit: callbackGasLimit,
-                    numWords: numWords,
-                    extraArgs: VRFV2PlusClient._argsToBytes(
+    if (config.useVRF && address(vrfCoordinator) != address(0)) {
+        if (pendingVRFRequestId[asset] != 0) revert VRFRequestPending(asset);
+        uint256 requestId = vrfCoordinator.requestRandomWords(
+            VRFV2PlusClient.RandomWordsRequest({
+                keyHash: keyHash,
+                subId: subscriptionId,
+                requestConfirmations: requestConfirmations,
+                callbackGasLimit: callbackGasLimit,
+                numWords: numWords,
+                extraArgs: VRFV2PlusClient._argsToBytes(
                     VRFV2PlusClient.ExtraArgsV1({nativePayment: false})
                 )
             })
@@ -567,7 +584,7 @@ contract PriceOracle is
     emaPrice = updateEMA(asset, currentPrice);
     emit PriceFetched(asset, inputToken, currentPrice, emaPrice, block.timestamp, config.primaryOracle);
     return emaPrice;
-   }
+    }
 
     /// @notice Gets the price for an asset using the default token pair
     /// @param asset The asset address (e.g., token pair or pool address)
@@ -580,7 +597,7 @@ contract PriceOracle is
     }
 
     /// @notice Fulfills VRF request with weighted oracle selection
-    function fulfillRandomWords(uint256 requestId, uint256[] memory randomWords) internal override {
+    function fulfillRandomWords(uint256 requestId, uint256[] calldata randomWords) internal override {
         VRFRequest storage request = vrfRequests[requestId];
         if (request.asset == address(0) || !request.isPending) revert InvalidVRFRequest(requestId);
         if (request.attempts >= MAX_ORACLE_ATTEMPTS) revert MaxOracleAttemptsReached();

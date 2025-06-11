@@ -984,7 +984,7 @@ contract PositionManager is
         address,
         uint256,
         bytes calldata
-    ) external pure override returns (bytes4) {
+    ) external pure returns (bytes4) {
         return this.onERC721Received.selector;
     }
 

@@ -533,6 +533,23 @@ contract PoolFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable, Reen
         return health.isHealthy;
     }
 
+    /// @notice Proposes a new contract upgrade
+    /// @param newImplementation The address of the new implementation contract
+    /// @return upgradeId The ID of the proposed upgrade
+    function proposeUpgrade(address newImplementation) external onlyCommittee returns (uint256) {
+    if (newImplementation == address(0)) revert InvalidAddress(newImplementation, "Invalid implementation address");
+    uint256 upgradeId;
+    unchecked {
+        upgradeId = upgradeProposalCount++;
+    }
+    PendingUpgrade storage upgrade = pendingUpgrades[upgradeId];
+    upgrade.newImplementation = newImplementation;
+    upgrade.proposedAt = block.timestamp;
+    upgrade.approvals = 0;
+    emit UpgradeProposed(upgradeId, newImplementation, block.timestamp);
+    return upgradeId;
+    }
+
     /// @notice Approves a proposed upgrade
     function approveUpgrade(uint256 upgradeId) external onlyCommittee {
         PendingUpgrade storage upgrade = pendingUpgrades[upgradeId];
@@ -544,6 +561,26 @@ contract PoolFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable, Reen
         }
         emit UpgradeApproved(upgradeId, msg.sender);
     }
+
+    /// @notice Authorizes an upgrade to a new implementation
+    /// @param newImplementation The address of the new implementation contract
+    function _authorizeUpgrade(address newImplementation) internal override onlyGovernance {
+    if (newImplementation == address(0)) revert InvalidAddress(newImplementation, "Invalid implementation address");
+
+    // Ensure the upgrade has been proposed and approved by the committee
+    uint256 upgradeId = upgradeProposalCount;
+    PendingUpgrade storage upgrade = pendingUpgrades[upgradeId];
+    if (upgrade.newImplementation != newImplementation || upgrade.approvals < MIN_COMMITTEE_APPROVALS) {
+        revert UpgradeNotApproved(upgradeId);
+    if (block.timestamp < upgrade.proposedAt + governanceTimelock)
+    revert ProposalNotReady(upgradeId, "Timelock not elapsed");    
+    }
+
+    // Clear the pending upgrade after authorization
+    delete pendingUpgrades[upgradeId];
+    emit UpgradeExecuted(upgradeId, newImplementation);
+    }
+    
 
     /// @notice Sets the asset for a token pair
     function setPairAsset(address tokenA, address tokenB, address asset) external onlyOwner {
