@@ -1286,14 +1286,16 @@ contract PoolFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable, Reen
     if (!oracleOverride && selectedOracle[chainId] != address(0) && primaryPriceOracle != selectedOracle[chainId])
         revert InvalidOracle(primaryPriceOracle, "Not selected oracle");
 
+    // Declare fallbackOracleArray once
+    address[] memory fallbackOracleArray = fallbackOracles[chainId]; // Use state variable directly
+
     // Check primary oracle health
     if (checkOracleHealth(primaryPriceOracle, chainId, tokenA, tokenB)) {
         // Verify precision compatibility with fallback oracles
         uint8 primaryDecimals = _getOracleDecimals(primaryPriceOracle);
-        address[] memory fallbackOracleList = fallbackOracles[chainId]; // Line 1293
-        for (uint256 i = 0; i < fallbackOracleList.length; i++) {
-            if (fallbackOracleList[i] != address(0)) {
-                uint8 fallbackDecimals = _getOracleDecimals(fallbackOracleList[i]);
+        for (uint256 i = 0; i < fallbackOracleArray.length; i++) {
+            if (fallbackOracleArray[i] != address(0)) {
+                uint8 fallbackDecimals = _getOracleDecimals(fallbackOracleArray[i]);
                 if (fallbackDecimals != primaryDecimals)
                     revert OraclePrecisionMismatch(primaryDecimals, fallbackDecimals);
             }
@@ -1303,22 +1305,21 @@ contract PoolFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable, Reen
 
     // Primary oracle failed, attempt failover
     emit OracleValidationFailed(primaryPriceOracle, "Primary oracle unhealthy");
-    // Reuse the existing fallbackOracleList variable
-    if (fallbackOracleList.length == 0) revert NoValidOracleFound();
+    if (fallbackOracleArray.length == 0) revert NoValidOracleFound();
 
-    for (uint256 i = 0; i < fallbackOracleList.length; i++) {
-        if (fallbackOracleList[i] == address(0)) continue;
-        if (checkOracleHealth(fallbackOracleList[i], chainId, tokenA, tokenB)) {
-            emit OracleFailover(primaryPriceOracle, fallbackOracleList[i]);
-            selectedOracle[chainId] = fallbackOracleList[i];
-            return fallbackOracleList[i];
+    for (uint256 i = 0; i < fallbackOracleArray.length; i++) {
+        if (fallbackOracleArray[i] == address(0)) continue;
+        if (checkOracleHealth(fallbackOracleArray[i], chainId, tokenA, tokenB)) {
+            emit OracleFailover(primaryPriceOracle, fallbackOracleArray[i]);
+            selectedOracle[chainId] = fallbackOracleArray[i];
+            return fallbackOracleArray[i];
         }
-        emit OracleValidationFailed(fallbackOracleList[i], "Fallback oracle unhealthy");
+        emit OracleValidationFailed(fallbackOracleArray[i], "Fallback oracle unhealthy");
     }
 
     revert NoValidOracleFound();
 }
-
+    
     /// @notice Internal function to get oracle decimals
     function _getOracleDecimals(address oracle) internal view returns (uint8) {
         try IChainlinkOracle(oracle).decimals() returns (uint8 decimals) {

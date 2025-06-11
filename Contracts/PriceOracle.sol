@@ -145,7 +145,7 @@ contract PriceOracle is
     event PoolStateUpdated(address indexed asset, address pool, uint8 oracleType, uint256 index, uint128 liquidity, uint256 timestamp);
 
     // Errors
-    error ZeroAddress();
+    error PriceOracleZeroAddress();
     error InvalidPriceFeed(address asset);
     error InvalidPool(address asset);
     error StalePrice(address asset);
@@ -190,7 +190,7 @@ contract PriceOracle is
         uint32 _callbackGasLimit,
         uint16 _requestConfirmations
     ) external initializer {
-        if (initialOwner == address(0) || _vrfCoordinator == address(0)) revert ZeroAddress();
+        if (initialOwner == address(0) || _vrfCoordinator == address(0)) revert PriceOracleZeroAddress();
         if (_callbackGasLimit < MIN_CALLBACK_GAS_LIMIT || _callbackGasLimit > MAX_CALLBACK_GAS_LIMIT) revert InvalidVRFConfig();
         if (_requestConfirmations < MIN_REQUEST_CONFIRMATIONS || _requestConfirmations > MAX_REQUEST_CONFIRMATIONS) revert InvalidVRFConfig();
 
@@ -215,7 +215,7 @@ contract PriceOracle is
         uint32 _callbackGasLimit,
         uint16 _requestConfirmations
     ) external onlyOwner {
-        if (_vrfCoordinator == address(0)) revert ZeroAddress();
+        if (_vrfCoordinator == address(0)) revert PriceOracleZeroAddress();
         if (_callbackGasLimit < MIN_CALLBACK_GAS_LIMIT || _callbackGasLimit > MAX_CALLBACK_GAS_LIMIT) revert InvalidVRFConfig();
         if (_requestConfirmations < MIN_REQUEST_CONFIRMATIONS || _requestConfirmations > MAX_REQUEST_CONFIRMATIONS) revert InvalidVRFConfig();
 
@@ -249,7 +249,7 @@ contract PriceOracle is
         uint256 emaAlpha,
         uint256 volatilityIndex
     ) external onlyOwner {
-        if (asset == address(0) || tokenA == address(0) || tokenB == address(0)) revert ZeroAddress();
+        if (asset == address(0) || tokenA == address(0) || tokenB == address(0)) revert PriceOracleZeroAddress();
         if (tokenA == tokenB) revert InvalidTokenPair();
         if (primaryOracle > 3 || emaAlpha > 1e18) revert InvalidInput();
 
@@ -278,7 +278,7 @@ contract PriceOracle is
         uint256 weight,
         uint256 reliabilityScore
     ) external onlyOwner {
-        if (asset == address(0) || feed == address(0)) revert ZeroAddress();
+        if (asset == address(0) || feed == address(0)) revert PriceOracleZeroAddress();
         if (reliabilityScore > MAX_RELIABILITY_SCORE) revert InvalidReliabilityScore();
         if (priceFeedCount[asset] >= MAX_FEEDS_PER_ASSET) revert PoolLimitReached(asset);
 
@@ -311,7 +311,7 @@ contract PriceOracle is
         uint32 twapSeconds,
         bool isToken0Base
     ) external onlyOwner {
-        if (asset == address(0) || poolAddress == address(0)) revert ZeroAddress();
+        if (asset == address(0) || poolAddress == address(0)) revert PriceOracleZeroAddress();
         if (twapSeconds < MIN_TWAP_SECONDS || twapSeconds > MAX_TWAP_SECONDS) revert InvalidTWAPWindow();
         if (uniswapV3PoolCount[asset] >= MAX_POOLS_PER_ASSET) revert PoolLimitReached(asset);
 
@@ -387,7 +387,7 @@ contract PriceOracle is
 
     /// @notice Sets emergency price override
     function setEmergencyPrice(address asset, uint256 price) external onlyOwner {
-        if (asset == address(0)) revert ZeroAddress();
+        if (asset == address(0)) revert PriceOracleZeroAddress();
         if (price == 0) revert ZeroValue();
 
         AssetConfig storage config = assetConfigs[asset];
@@ -409,7 +409,7 @@ contract PriceOracle is
 
     /// @notice Disables emergency price override
     function disableEmergencyOverride(address asset) external onlyOwner {
-        if (asset == address(0)) revert ZeroAddress();
+        if (asset == address(0)) revert PriceOracleZeroAddress();
         emergencyOverrideActive[asset] = false;
         emit EmergencyOverrideToggled(asset, false);
     }
@@ -499,7 +499,7 @@ contract PriceOracle is
     /// @return currentPrice The price in 1e18 precision
     /// @return cachedStatus Whether the price is cached
     function getCurrentPairPrice(address asset, address inputToken) public view returns (uint256 currentPrice, bool cachedStatus) {
-        if (asset == address(0) || inputToken == address(0)) revert ZeroAddress();
+        if (asset == address(0) || inputToken == address(0)) revert PriceOracleZeroAddress();
         AssetConfig memory config = assetConfigs[asset];
         if (inputToken != config.tokenA && inputToken != config.tokenB) revert InvalidTokenPair();
 
@@ -519,7 +519,7 @@ contract PriceOracle is
 
     /// @notice Requests price with optional VRF-based oracle selection for a specific token pair
     function getPrice(address asset, address inputToken) external nonReentrant whenNotPaused returns (uint256) {
-        if (asset == address(0) || inputToken == address(0)) revert ZeroAddress();
+        if (asset == address(0) || inputToken == address(0)) revert PriceOracleZeroAddress();
         AssetConfig storage config = assetConfigs[asset];
         if (inputToken != config.tokenA && inputToken != config.tokenB) revert InvalidTokenPair();
 
@@ -573,10 +573,10 @@ contract PriceOracle is
     /// @param asset The asset address (e.g., token pair or pool address)
     /// @return The price in 1e18 precision
     function getPrice(address asset) external nonReentrant whenNotPaused returns (uint256) {
-        if (asset == address(0)) revert ZeroAddress();
+        if (asset == address(0)) revert PriceOracleZeroAddress();
         AssetConfig storage config = assetConfigs[asset];
         if (config.tokenA == address(0)) revert InvalidTokenPair();
-        return getPrice(asset, config.tokenA);
+        return this.getPrice(asset, config.tokenA);
     }
 
     /// @notice Fulfills VRF request with weighted oracle selection
