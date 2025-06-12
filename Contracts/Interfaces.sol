@@ -22,6 +22,9 @@ interface IAMMPool {
         uint256 tokensOwed0,
         uint256 tokensOwed1
     );
+    
+    function getcurrentTick() external view returns (int24);
+    
     function tokenA() external view returns (address);
     function tokenB() external view returns (address);
     function positionCounter() external view returns (uint256);
@@ -34,16 +37,25 @@ interface IAMMPool {
         bytes calldata adapterParams
     ) external payable;
     function collectFeesInternal(uint256 positionId) external;
+    function adjust(uint256 positionId, int24 tickLower, int24 tickUpper, uint256 liquidity) external;
     function exitFallbackPoolInternal(uint256 positionId) external;
     function compoundFallbackFeesInternal(uint256 positionId, uint256 tokensOwed0, uint256 tokensOwed1) external;
     function transferToken(address token, address recipient, uint256 amount) external;
     function MAX_BATCH_SIZE() external view returns (uint256);
+    function MAX_RETRIES() external view returns (uint256);
+    function authorizeAdjuster(uint256 positionId, address adjuster) external;
     function collectFees(uint256 positionId) external;
     function inFallbackPool(uint256 positionId) external view returns (bool);
+    function batchCrossChainMessages(uint16 dstChainId, bytes memory payload, bytes memory adapterParams) external payable;
     function exitFallbackPool(uint256 positionId) external;
+    function trustedRemotePools(uint16 chainId) external view returns (bytes memory);
+    function chainIdToAxelarChain(uint16 chainId) external view returns (string memory);
+    function governance() external view returns (address);
     function emaVolatility() external view returns (uint256);
+    function emaVol() external view returns (uint256);
+    function volatilityThreshold() external view returns (uint24);
     function getReserves() external view returns (uint64 reserveA, uint64 reserveB);
-    function TICK_SPACING() external view returns (int24);
+    function TICK_SPACING() external view returns (uint24);
     event PositionCreated(uint256 indexed positionId, address indexed owner, int24 tickLower, int24 tickUpper, uint256 liquidity);
 }
 
@@ -88,4 +100,5 @@ interface IPositionManager {
 interface IPositionAdjuster {
     function adjustPosition(uint256 positionId, int24 newTickLower, int24 newTickUpper) external;
     function exitFallbackPool(uint256 positionId) external;
+    function adjust(uint256 positionId, int24 tickLower, int24 tickUpper, uint256 liquidity) external;
 }

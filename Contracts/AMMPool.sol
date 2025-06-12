@@ -63,7 +63,7 @@ interface IWormhole {
 interface ICrossChainMessenger {
     function sendMessage(
         uint16 dstChainId,
-        string calldata dstAxelarChain,
+        string memory dstAxelarChain,
         bytes calldata destinationAddress,
         bytes calldata payload,
         bytes calldata adapterParams,
@@ -72,7 +72,7 @@ interface ICrossChainMessenger {
 
     function estimateFees(
         uint16 dstChainId,
-        string calldata dstAxelarChain,
+        string memory dstAxelarChain,
         address userApplication,
         bytes calldata payload,
         bytes calldata adapterParams
@@ -80,7 +80,7 @@ interface ICrossChainMessenger {
 
     function receiveMessage(
         uint16 srcChainId,
-        string calldata srcAxelarChain,
+        string memory srcAxelarChain,
         bytes calldata srcAddress,
         bytes calldata payload,
         bytes calldata additionalParams
@@ -143,7 +143,7 @@ contract AMMPool is
     using TickMath for uint160;
 
     // Immutable constants
-    string public immutable VERSION;
+    bytes32 public immutable VERSION;
     uint256 public immutable MIN_TIMELOCK;
     uint256 public immutable MAX_TIMELOCK;
     uint256 public immutable MAX_BATCH_SIZE;
@@ -264,6 +264,7 @@ contract AMMPool is
         uint256 proposedAt;
         bool executed;
     }
+    mapping(uint256 => address) public authorizedAdjusters;
     mapping(uint256 => GovernanceProposal) public governanceProposals;
     uint256 public proposalCount;
 
@@ -324,6 +325,7 @@ contract AMMPool is
     error InvalidBatchSize(uint256 size);
     error InsufficientGasForBatch(uint256 required, uint256 provided);
     error InvalidOperation(string message);
+    error UnauthorizedAdjuster(address caller);
     error InvalidMessage();
     error MessageNotFound(uint256 messageId);
 
@@ -357,7 +359,7 @@ contract AMMPool is
     event WormholeTrustedSenderUpdated(uint16 chainId, bytes32 senderAddress);
     event GovernanceProposalCreated(uint256 indexed proposalId, address target, bytes data, uint256 proposedAt);
     event GovernanceProposalExecuted(uint256 indexed proposalId);
-    event FailedMessageStored(uint256 indexed messageId, uint16 dstChainId, bytes payload, uint8 messengerType);
+    event FailedMessageStored(uint256 indexed messageId, uint16 dstChainId, bytes sender, uint256 timestamp, uint8 messengerType);
     event FailedMessageRetried(uint256 indexed messageId, uint16 dstChainId, uint256 retries, uint8 messengerType);
     event FailedMessageRecovered(uint256 indexed messageId, address indexed recipient);
     event AllLPFeesClaimed(address indexed provider, uint256 amountA, uint256 amountB);
@@ -367,6 +369,8 @@ contract AMMPool is
     event FallbackPoolEntered(uint256 indexed positionId, uint256 liquidity);
     event FallbackPoolExited(uint256 indexed positionId, uint256 liquidity);
     event AmplificationFactorUpdated(uint256 newA);
+    event TokenTransferred(address indexed token, address indexed from, address indexed to, uint256 amount);
+    event PositionUpdated(uint256 indexed positionId, int24 tickLower, int24 tickUpper, uint256 liquidity);
     event PositionAdjusterUpdated(address indexed newAdjuster);
     event FailedMessageRetryScheduled(uint256 indexed messageId, uint256 nextRetryTimestamp);
     event BatchRetryProcessed(uint256[] messageIds, uint256 successfulRetries, uint256 failedRetries);
@@ -393,6 +397,14 @@ contract AMMPool is
         _;
     }
 
+    modifier onlyAuthorizedAdjusters(uint256 positionId) {
+    Position storage position = positions[positionId];
+    if (msg.sender != position.owner && msg.sender != authorizedAdjusters[positionId]) {
+        revert Unauthorized();
+    }
+    _;
+    }
+
     modifier onlyPositionAdjuster() {
     if (msg.sender != positionAdjuster) revert Unauthorized();
     _;
@@ -413,7 +425,7 @@ contract AMMPool is
         uint256 _governanceTimelock,
         uint256 _maxRetries
     ) {
-        VERSION = _version;
+        VERSION = bytes32(bytes(_version));
         MIN_TIMELOCK = _minTimelock;
         MAX_TIMELOCK = _maxTimelock;
         MAX_BATCH_SIZE = _maxBatchSize;
@@ -585,6 +597,115 @@ contract AMMPool is
     function collectFeesInternal(uint256 positionId) external onlyPositionAdjuster {
     _collectFees(positionId);
     }
+
+    function authorizeAdjuster(uint256 positionId, address adjuster) external onlyPositionOwner(positionId) {
+    if (adjuster == address(0)) revert InvalidAddress(adjuster, "Invalid adjuster address");
+    authorizedAdjusters[positionId] = adjuster;
+    emit PositionAdjusterUpdated(adjuster);
+    }
+
+    function emaVol() external view returns (uint256) {
+        return emaVolatility;
+    }
+
+    function getcurrentTick() external view returns (int24) {
+        return currentTick;
+    }
+
+    /// @notice Adjusts an existing position's tick range and liquidity
+    /// @param positionId The ID of the position to adjust
+    /// @param tickLower The new lower tick of the position
+    /// @param tickUpper The new upper tick of the position
+    /// @param liquidity The new liquidity amount for the position
+    function adjust(
+        uint256 positionId,
+        int24 tickLower,
+        int24 tickUpper,
+        uint256 liquidity
+    ) external override whenNotPaused nonReentrant onlyAuthorizedAdjusters(positionId) {
+        // Validate position and inputs
+        Position storage position = positions[positionId];
+        if (position.liquidity == 0) revert PositionNotFound(positionId);
+        if (!_isValidTickRange(tickLower, tickUpper)) revert InvalidTickRange(tickLower, tickUpper);
+        if (liquidity == 0) revert InsufficientLiquidity(liquidity);
+
+        // Collect outstanding fees
+        _collectFees(positionId);
+
+        // Cache position owner for gas efficiency
+        address owner = position.owner;
+
+        // Remove liquidity from old tick range
+        _updateTick(position.tickLower, position.liquidity, false);
+        _updateTick(position.tickUpper, position.liquidity, true);
+
+        // Calculate token amounts for new liquidity
+        (uint256 amount0, uint256 amount1) = _getAmountsForLiquidity(tickLower, tickUpper, liquidity);
+
+        // Validate reserve updates to prevent overflow
+        if (amount0 > type(uint64).max || amount1 > type(uint64).max) {
+            revert InvalidAmount(amount0, amount1);
+        }
+
+        // Handle token transfers
+        if (amount0 > 0 || amount1 > 0) {
+            // Check allowances
+            if (amount0 > 0) {
+                uint256 allowanceA = IERC20Upgradeable(tokenA).allowance(owner, address(this));
+                if (allowanceA < amount0) revert InvalidAmount(allowanceA, amount0);
+                IERC20Upgradeable(tokenA).safeTransferFrom(owner, address(this), amount0);
+                emit TokenTransferred(tokenA, owner, address(this), amount0);
+            }
+            if (amount1 > 0) {
+                uint256 allowanceB = IERC20Upgradeable(tokenB).allowance(owner, address(this));
+                if (allowanceB < amount1) revert InvalidAmount(allowanceB, amount1);
+                IERC20Upgradeable(tokenB).safeTransferFrom(owner, address(this), amount1);
+                emit TokenTransferred(tokenB, owner, address(this), amount1);
+            }
+        }
+
+        // Handle liquidity delta (refund excess if new liquidity is lower)
+        if (liquidity < position.liquidity) {
+            uint256 excessLiquidity = position.liquidity - liquidity;
+            (uint256 excessAmount0, uint256 excessAmount1) = _getAmountsForLiquidity(
+                tickLower,
+                tickUpper,
+                excessLiquidity
+            );
+            if (excessAmount0 > 0) {
+                IERC20Upgradeable(tokenA).safeTransfer(owner, excessAmount0);
+                emit TokenTransferred(tokenA, address(this), owner, excessAmount0);
+            }
+            if (excessAmount1 > 0) {
+                IERC20Upgradeable(tokenB).safeTransfer(owner, excessAmount1);
+                emit TokenTransferred(tokenB, address(this), owner, excessAmount1);
+            }
+        }
+
+        // Update position
+        position.tickLower = tickLower;
+        position.tickUpper = tickUpper;
+        position.liquidity = liquidity;
+        position.feeGrowthInside0LastX128 = _getFeeGrowthInside(tickLower, tickUpper, 0);
+        position.feeGrowthInside1LastX128 = _getFeeGrowthInside(tickLower, tickUpper, 1);
+
+        // Add liquidity to new tick range
+        _updateTick(tickLower, liquidity, true);
+        _updateTick(tickUpper, liquidity, false);
+
+        // Update reserves
+        unchecked {
+            reserves.reserveA += uint64(amount0);
+            reserves.reserveB += uint64(amount1);
+        }
+
+        // Check fallback pool eligibility
+        _checkAndMoveToFallback(positionId);
+
+        // Update volatility and emit event
+        _updateVolatility();
+        emit PositionUpdated(positionId, tickLower, tickUpper, liquidity);
+        }
 
     // --- Fallback Pool Functions ---
 
@@ -842,6 +963,7 @@ contract AMMPool is
 
     function receiveMessage(
     uint16 srcChainId,
+    string memory srcAxelarChain,
     bytes calldata srcAddress,
     bytes calldata payload,
     bytes calldata additionalParams
@@ -1512,7 +1634,7 @@ contract AMMPool is
 
     function _sendCrossChainMessage(
         uint16 dstChainId,
-        string calldata AxelarChain,
+        string memory AxelarChain,
         bytes memory destinationAddress,
         bytes memory payload,
         bytes memory adapterParams,
@@ -1548,7 +1670,7 @@ contract AMMPool is
             uint256 messageId = failedMessageCount++;
             failedMessages[messageId] = FailedMessage({
                 dstChainId: dstChainId,
-                AxelarChain: AxelarChain,
+                dstAxelarChain: AxelarChain,
                 payload: payload,
                 adapterParams: adapterParams,
                 retries: 0,
@@ -1556,7 +1678,7 @@ contract AMMPool is
                 messengerType: messengerType,
                 nextRetryTimestamp: block.timestamp + RETRY_DELAY
             });
-            emit FailedMessageStored(messageId, dstChainId, msg.sender, block.timestamp);
+            emit FailedMessageStored(messageId, dstChainId, abi.encodePacked(msg.sender), block.timestamp, messengerType);
         }
     }
 

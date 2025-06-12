@@ -49,7 +49,7 @@ contract DebtToken is Initializable, ERC20Upgradeable, OwnableUpgradeable, UUPSU
         require(_upgradeDelay >= 1 hours && _upgradeDelay <= 30 days, "Invalid upgrade delay");
         __ERC20_init(name_, symbol_);
         underlyingAsset = _underlyingAsset;
-        __Ownable_init(msg.sender);
+        __Ownable_init();
         __UUPSUpgradeable_init();
         __Pausable_init();
         __ReentrancyGuard_init();

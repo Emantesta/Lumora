@@ -408,7 +408,7 @@ contract PoolFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable, Reen
         if (_maxOracleStaleness == 0) revert InvalidAmount("Invalid oracle staleness");
         if (_initialCommittee.length < MIN_COMMITTEE_APPROVALS) revert InvalidAmount("Insufficient committee members");
 
-        __Ownable_init(msg.sender);
+        __Ownable_init();
         __UUPSUpgradeable_init();
         __ReentrancyGuard_init();
 
@@ -432,7 +432,8 @@ contract PoolFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable, Reen
         maxRetries = 3;
         maxBatchSize = 10;
         minGasLimit = 200_000;
-        maxOracleStaleness = _maxOracleStaleness;
+        if (_maxOracleStaleness > type(uint32).max) revert InvalidAmount("Max oracle staleness exceeds uint32 max");
+        maxOracleStaleness = uint32(_maxOracleStaleness);
         proposalCooldown = 1 days;
         proposalFee = 0.01 ether;
         maxOracleFailures = 3;
@@ -848,7 +849,7 @@ contract PoolFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable, Reen
         if (keccak256(srcAddress) != keccak256(abi.encodePacked(trustedRemoteFactories[srcChainId], address(this))))
             revert InvalidAddress(address(0), "Invalid source address");
 
-        (address[] memory pools, uint256 timestamp, uint64 nonce) = abi.decode(payload, (address[], uint256, uint64));
+        (bytes[] memory pools, uint256 timestamp, uint64 nonce) = abi.decode(payload, (bytes[], uint256, uint64));
         if (usedNonces[srcChainId][nonce]) revert InvalidNonce();
         if (pools.length == 0) revert InvalidPayload();
 
@@ -1140,7 +1141,7 @@ contract PoolFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable, Reen
 
     /// @notice Pauses a specific chain
     function pauseChain(uint16 chainId) external onlyGovernance {
-        if (chainPaused[chainId]) revert ChainPaused(chainId);
+        if (chainPaused[chainId]) revert ChainPausedError(chainId);
         chainPaused[chainId] = true;
         emit ChainPaused(chainId, msg.sender);
     }
@@ -1369,13 +1370,10 @@ contract PoolFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable, Reen
     /// @notice Internal function to validate adapter parameters
     function _validateAdapterParams(bytes calldata adapterParams) internal pure {
         if (adapterParams.length > 0) {
-            try abi.decode(adapterParams, (uint256)) returns (uint256 gasLimit) {
+            uint256 gasLimit = abi.decode(adapterParams, (uint256));
                 if (gasLimit < 200_000) revert InvalidAdapterParams("Gas limit too low");
-            } catch {
-                revert InvalidAdapterParams("Invalid adapter params format");
-            }
-        }
     }
+}
 
     /// @notice Internal function to create a single pool
     function _createSinglePool(
