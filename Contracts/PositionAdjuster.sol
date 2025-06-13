@@ -8,9 +8,6 @@ import "./AMMPool.sol";
 import "./external/uniswap/v3/TickMath.sol";
 import {UD60x18, ud} from "@prb/math/src/UD60x18.sol";
 
-/// @title PositionAdjuster
-/// @notice Automates liquidity position adjustments with Chainlink Keeper integration
-/// @dev Enhanced with fee aggregation, multi-bridge support, and batch operations
 contract PositionAdjuster is KeeperCompatibleInterface, ReentrancyGuardUpgradeable {
     AMMPool public immutable pool;
     IPositionManager public immutable positionManager;
@@ -33,8 +30,8 @@ contract PositionAdjuster is KeeperCompatibleInterface, ReentrancyGuardUpgradeab
     uint256 public constant MAX_RETRIES = 3;
     uint256 public constant MIN_GAS_PER_EXIT = 100_000;
     uint256 public constant FEE_AGGREGATION_THRESHOLD = 0.01 ether;
-    mapping(uint8 => address) public tokenBridges; // Mapping of bridgeType to bridge address
-    mapping(address => AggregatedFees) public aggregatedFees; // Aggregated fees per user
+    mapping(uint8 => address) public tokenBridges;
+    mapping(address => AggregatedFees) public aggregatedFees;
 
     enum StrategyType { Fixed, Volatility, Volume, Predictive }
 
@@ -47,7 +44,7 @@ contract PositionAdjuster is KeeperCompatibleInterface, ReentrancyGuardUpgradeab
         uint24 volumePercentile;
         uint24 twapPeriod;
         bool compoundFees;
-        uint8 bridgeType; // Preferred bridge for fee bridging
+        uint8 bridgeType;
     }
 
     struct FailedCrossChainMessage {
@@ -68,11 +65,9 @@ contract PositionAdjuster is KeeperCompatibleInterface, ReentrancyGuardUpgradeab
         uint256 total1;
     }
 
-    // Events
     event StrategyRegistered(address indexed owner, uint256 positionId, StrategyType strategyType, uint24 rangeWidth, bool compoundFees, uint8 bridgeType);
     event PositionAdjusted(uint256 indexed positionId, int24 newTickLower, int24 newTickUpper);
     event CrossChainAdjustmentSent(uint256 indexed positionId, uint16 dstChainId, int24 newTickLower, int24 newTickUpper, bool fallbackActive, uint256 fee0, uint256 fee1, uint8 bridgeType);
-    event FailedMessage(uint256 indexed messageId, uint16 dstChainId, uint256 positionId);
     event FailedMessageStored(uint256 indexed messageId, uint16 dstChainId, uint256 positionId);
     event FailedMessageRetried(uint256 indexed messageId, uint16 dstChainId, uint256 retries);
     event FailedMessageRecovered(uint256 indexed messageId, uint16 dstChainId);
@@ -87,7 +82,6 @@ contract PositionAdjuster is KeeperCompatibleInterface, ReentrancyGuardUpgradeab
     event TokenBridgeUpdated(uint8 bridgeType, address indexed newBridge);
     event BatchFeesBridged(address indexed owner, uint256[] positionIds, uint256 total0, uint256 total1, uint16 dstChainId, uint8 bridgeType);
 
-    // Errors
     error InvalidStrategyType();
     error Unauthorized();
     error InvalidChainId(uint16 chainId);
@@ -118,19 +112,19 @@ contract PositionAdjuster is KeeperCompatibleInterface, ReentrancyGuardUpgradeab
         uint256[] memory positionIds = new uint256[](maxAdjustmentsPerUpkeep);
         int24[] memory newTickLowers = new int24[](maxAdjustmentsPerUpkeep);
         int24[] memory newTickUppers = new int24[](maxAdjustmentsPerUpkeep);
-        uint256 count;
+        uint256 count = 0;
 
-        (uint64 reserveA64, uint64 reserveB64) = pool.getReserves();
-        uint256 reserveA = uint256(reserveA64);
-        uint256 reserveB = uint256(reserveB64);
+        (uint64 reserveA, uint64 reserveB) = pool.getReserves();
+        uint256 reserveA = uint256(reserveA);
+        uint256 reserveB = uint256(reserveB);
         uint256 currentPrice = (reserveB * 1e18) / reserveA;
         uint256 emaVolatility = pool.emaVolatility();
 
         for (uint256 i = 0; i < userStrategies.length && count < maxAdjustmentsPerUpkeep; i++) {
             Strategy memory strategy = userStrategies[i];
-            (address owner, int24 tickLower, int24 tickUpper, uint256 positionLiquidity, uint256 feeGrowthInside0LastX128, uint256 feeGrowthInside1LastX128, uint256 tokensOwed0, uint256 tokensOwed1) = pool.positions(strategy.positionId);
-            bool fallbackActive = pool.inFallbackPool(strategy.positionId);
-            if (positionLiquidity == 0) continue;
+            (address owner, int24 tickLower, int24 tickUpper, uint256 liquidity, , , uint256 tokensOwed0, uint256 tokensOwed1) = pool.positions(strategy.positionId);
+            bool fallbackActive = pool.isInFallbackPool(strategy.positionId);
+            if (liquidity == 0) continue;
             if (pausedAssets[address(pool)]) continue;
 
             bool isOutOfRange = currentPrice < _tickToPrice(tickLower) || currentPrice > _tickToPrice(tickUpper);
@@ -164,9 +158,9 @@ contract PositionAdjuster is KeeperCompatibleInterface, ReentrancyGuardUpgradeab
 
         for (uint256 i = 0; i < count; i++) {
             uint256 positionId = positionIds[i];
-            (address owner, int24 tickLower, int24 tickUpper, uint256 positionLiquidity, uint256 feeGrowthInside0LastX128, uint256 feeGrowthInside1LastX128, uint256 tokensOwed0, uint256 tokensOwed1) = pool.positions(positionId);
-            bool fallbackActive = pool.inFallbackPool(positionId);
-            if (positionLiquidity == 0) continue;
+            (address owner, int24 tickLower, int24 tickUpper, uint256 liquidity, , , uint256 tokensOwed0, uint256 tokensOwed1) = pool.positions(positionId);
+            bool fallbackActive = pool.isInFallbackPool(positionId);
+            if (liquidity == 0) continue;
             if (pausedAssets[address(pool)]) revert AssetPaused(address(pool));
 
             _aggregateFees(positionId, owner);
@@ -177,7 +171,7 @@ contract PositionAdjuster is KeeperCompatibleInterface, ReentrancyGuardUpgradeab
                 } else {
                     collectFallbackFees(positionId);
                 }
-                pool.adjust(positionId, newTickLowers[i], newTickUppers[i], positionLiquidity);
+                pool.adjust(positionId, newTickLowers[i], newTickUppers[i]);
                 emit PositionAdjusted(positionId, newTickLowers[i], newTickUppers[i]);
             }
         }
@@ -196,7 +190,7 @@ contract PositionAdjuster is KeeperCompatibleInterface, ReentrancyGuardUpgradeab
     ) external nonReentrant {
         if (uint8(strategyType) > uint8(StrategyType.Predictive)) revert InvalidStrategyType();
         if (tokenBridges[bridgeType] == address(0)) revert InvalidBridgeType(bridgeType);
-        pool.authorizeAdjuster(positionId, address(this));
+        pool.authorize(positionId, address(this));
         strategies[msg.sender].push(Strategy({
             positionId: positionId,
             strategyType: strategyType,
@@ -220,16 +214,17 @@ contract PositionAdjuster is KeeperCompatibleInterface, ReentrancyGuardUpgradeab
         uint8 bridgeType,
         bytes calldata adapterParams
     ) external payable nonReentrant {
-        if (pool.trustedRemotePools(dstChainId).length == 0) revert InvalidChainId(dstChainId);
+        if (pool.trustedRemotePools[dstChainId].length == 0) revert InvalidChainId(dstChainId);
         if (tokenBridges[bridgeType] == address(0)) revert InvalidBridgeType(bridgeType);
-        (, , , uint256 liquidity, bool fallbackActive, address owner) = pool.positions(positionId);
+        (address owner, int24 tickLower, int24 tickUpper, uint256 liquidity, uint256 feeGrowthInside0LastX128, uint256 feeGrowthInside1LastX128, uint256 tokensOwed0, uint256 tokensOwed1) = pool.positions(positionId);
+        bool fallbackActive = pool.isInFallbackPool(positionId);
         if (liquidity == 0) revert InsufficientLiquidity(liquidity);
         if (pausedAssets[address(pool)]) revert AssetPaused(address(pool));
 
         _aggregateFees(positionId, owner);
         uint256 fee0 = fallbackFees0[positionId];
         uint256 fee1 = fallbackFees1[positionId];
-        bytes memory payload = abi.encode(positionId, newTickLower, newTickUpper, newLiquidity, fallbackActive, fee0, fee1);
+        bytes memory payload = abi.encode(positionId, newTickLower, newTickUpper, newLiquidity, fee0, fee1);
         string memory dstAxelarChain = pool.chainIdToAxelarChain(dstChainId);
 
         try pool.batchCrossChainMessages{value: msg.value}(dstChainId, payload, adapterParams) {
@@ -277,7 +272,7 @@ contract PositionAdjuster is KeeperCompatibleInterface, ReentrancyGuardUpgradeab
     ) external payable nonReentrant {
         uint256 count = positionIds.length;
         if (count == 0 || count > maxAdjustmentsPerUpkeep || count != newTickLowers.length || count != newLiquidities.length) revert InvalidBatchSize(count);
-        if (pool.trustedRemotePools(dstChainId).length == 0) revert InvalidChainId(dstChainId);
+        if (pool.trustedRemotePools[dstChainId].length == 0) revert InvalidChainId(dstChainId);
         if (tokenBridges[bridgeType] == address(0)) revert InvalidBridgeType(bridgeType);
 
         uint256 totalFee0;
@@ -287,7 +282,8 @@ contract PositionAdjuster is KeeperCompatibleInterface, ReentrancyGuardUpgradeab
 
         for (uint256 i = 0; i < count; i++) {
             uint256 positionId = positionIds[i];
-            (, , , uint256 liquidity, bool fallbackActive, address owner) = pool.positions(positionId);
+            (address owner, , , uint256 liquidity, , , uint256 tokensOwed0, uint256 tokensOwed1) = pool.positions(positionId);
+            bool fallbackActive = pool.isInFallbackPool(positionId);
             if (liquidity == 0) revert InsufficientLiquidity(liquidity);
             if (pausedAssets[address(pool)]) revert AssetPaused(address(pool));
 
@@ -296,14 +292,15 @@ contract PositionAdjuster is KeeperCompatibleInterface, ReentrancyGuardUpgradeab
             uint256 fee1 = fallbackFees1[positionId];
             totalFee0 += fee0;
             totalFee1 += fee1;
-            payloads[i] = abi.encode(positionId, newTickLowers[i], newTickUppers[i], newLiquidities[i], fallbackActive, fee0, fee1);
+            payloads[i] = abi.encode(positionId, newTickLowers[i], newTickUppers[i], newLiquidities[i], fee0, fee1);
         }
 
         for (uint256 i = 0; i < count; i++) {
             try pool.batchCrossChainMessages{value: msg.value / count}(dstChainId, payloads[i], adapterParams) {
                 uint256 positionId = positionIds[i];
                 Strategy storage strategy = _getStrategy(positionId);
-                (, , , , bool fallbackActive, address owner) = pool.positions(positionId);
+                (address owner, , , , , , uint256 tokensOwed0, uint256 tokensOwed1) = pool.positions(positionId);
+                bool fallbackActive = pool.isInFallbackPool(positionId);
                 if (fallbackActive) {
                     if (strategy.compoundFees) {
                         compoundFallbackFees(positionId);
@@ -328,7 +325,7 @@ contract PositionAdjuster is KeeperCompatibleInterface, ReentrancyGuardUpgradeab
                     adapterParams: adapterParams,
                     retries: 0,
                     nextRetryTimestamp: block.timestamp + 1 hours,
-                    fallbackActive: pool.inFallbackPool(positionIds[i]),
+                    fallbackActive: pool.isInFallbackPool(positionIds[i]),
                     fee0: fallbackFees0[positionIds[i]],
                     fee1: fallbackFees1[positionIds[i]]
                 });
@@ -349,10 +346,10 @@ contract PositionAdjuster is KeeperCompatibleInterface, ReentrancyGuardUpgradeab
         if (message.retries >= MAX_RETRIES) revert MaxRetriesExceeded(messageId);
         if (pausedAssets[address(pool)]) revert AssetPaused(address(pool));
 
-        Strategy storage strategy = _getStrategy(message.positionId); // Declare strategy here
+        Strategy storage strategy = _getStrategy(message.positionId);
 
         unchecked {
-            message.retries += 1;
+            message.retries++;
             message.nextRetryTimestamp = block.timestamp + 3600 * (2 ** message.retries);
         }
 
@@ -361,7 +358,7 @@ contract PositionAdjuster is KeeperCompatibleInterface, ReentrancyGuardUpgradeab
                 if (strategy.compoundFees) {
                     compoundFallbackFees(message.positionId);
                 } else {
-                    (, , , , , address owner) = pool.positions(message.positionId);
+                    (address owner, , , , , , uint256 tokensOwed0, uint256 tokensOwed1) = pool.positions(message.positionId);
                     address destination = positionManager.feeDestinations(owner);
                     if (destination != address(0)) {
                         positionManager.collectAndBridgeFees{value: msg.value}(message.positionId, message.dstChainId, strategy.bridgeType, message.adapterParams);
@@ -374,52 +371,55 @@ contract PositionAdjuster is KeeperCompatibleInterface, ReentrancyGuardUpgradeab
             emit FailedMessageRetried(messageId, message.dstChainId, message.retries);
             delete failedMessages[messageId];
             failedMessageCount--;
-            emit FailedMessageRecovered(messageId, message.dstChainId);
+            emit FailedMessageRecovered(messageIdmessageId);
         } catch {
             emit FailedMessageStored(messageId, message.dstChainId, message.positionId);
         }
     }
 
-    function collectFees(uint256 id) public nonReentrant {
-        (, , , uint256 balance, bool fallbackActive, address owner) = pool.positions(id);
+    function collectFees(uint256 id) public nonReentrant external nonReentrant {
+        (address owner, , , , uint256 liquidity, , , uint256 tokensOwed0, uint256 tokensOwed1) = pool.positions(id);
+        bool fallbackActive = pool.isInFallbackPool(id);
         if (!fallbackActive) revert InvalidOperation("Position not in fallback pool");
-        if (balance == 0) revert InsufficientLiquidity(balance);
+        if (liquidity == 0) revert InsufficientLiquidity(liquidity(id));
         if (msg.sender != owner && msg.sender != address(this)) revert Unauthorized();
 
-        uint256 amount0 = fallbackFees0[id];
-        uint256 amount1 = fallbackFees1[id];
+        uint256 amount0 = tokensOwed0;
+        uint256 amount1 = tokensOwed1;
         if (amount0 == 0 && amount1 == 0) return;
 
         if (amount0 > 0) {
-            pool.transferToken(pool.tokenA(), id, amount0);
+            pool.transferToken(pool.tokenA(), owner, amount0);
             aggregatedFees[owner].total0 += amount0;
             fallbackFees0[id] = 0;
+            emit FallbackFeesCollected(id, amount0, 0);
         }
         if (amount1 > 0) {
-            pool.transferToken(pool.tokenB(), id, amount1);
-            aggregatedFees[owner].total1 += amount1;
+            pool.transferToken(pool.tokenB(), owner, amount1);
+            aggregatedFees[idowner].total1 += amount1;
+            emit FallbackFeesCollected(id, 0, amount1);
             fallbackFees1[id] = 0;
         }
 
-        emit FallbackFeesCollected(id, amount0, amount1);
         emit FeesAggregated(owner, id, amount0, amount1);
     }
 
     function compoundFees(uint256 id) external nonReentrant {
-        (, int24 tickLower, int24 tickUpper, uint256 balance, bool fallbackActive, address owner) = pool.positions(id);
+        (address owner, int24 tickLower, int24 tickUpper, uint256 liquidity, , , , uint256 tokensOwed0, uint256 tokensOwed1) = pool.positions(id);
+        bool fallbackActive = pool.isInFallbackPool(id);
         if (!fallbackActive) revert InvalidOperation("Position not in fallback pool");
-        if (balance == 0) revert InsufficientLiquidity(balance);
+        if (liquidity == 0) revert InsufficientLiquidity(liquidity);
         if (msg.sender != owner && msg.sender != address(this)) revert Unauthorized();
 
-        uint256 amount0 = fallbackFees0[id];
-        uint256 amount1 = fallbackFees1[id];
+        uint256 amount0 = tokensOwed0;
+        uint256 amount1 = tokensOwed1;
         if (amount0 == 0 && amount1 == 0) return;
 
-        uint256 additionalBalance = pool.getLiquidity(id, amount0, amount1);
-        pool.adjust(id, tickLower, tickUpper, balance + additionalBalance);
+        uint256 additionalLiquidity = _getLiquidityForAmounts(tickLower, tickUpper, amount0, amount1);
+        pool.adjust(id, tickLower, tickUpper, liquidity + additionalLiquidity);
 
-        aggregatedFees[owner].total0 += amount0;
-        aggregatedFees[owner].total1 += amount1;
+        aggregatedFees[idowner].total0 += amount0;
+        aggregatedFees[idowner].total1 += amount1;
         fallbackFees0[id] = 0;
         fallbackFees1[id] = 0;
 
@@ -439,11 +439,11 @@ contract PositionAdjuster is KeeperCompatibleInterface, ReentrancyGuardUpgradeab
         uint256 validCount = 0;
 
         for (uint256 i = 0; i < count; i++) {
-            (, , , uint256 balance, bool fallbackActive, address owner) = pool.positions(ids[i]);
-            if (balance == 0 || !fallbackActive) continue;
+            (address owner, , , uint256 liquidity, , , uint256 tokensOwed0, uint256 tokensOwed1) = pool.positions(ids[i]);
+            bool fallbackActive = pool.isInFallbackPool(ids[i]);
+            if (liquidity == 0 || !fallbackActive) continue;
             _aggregateFees(ids[i], owner);
-            validIds[validCount] = ids[i];
-            validCount++;
+            validIds[validCount++] = ids[i];
         }
 
         if (validCount > 0) {
@@ -457,11 +457,11 @@ contract PositionAdjuster is KeeperCompatibleInterface, ReentrancyGuardUpgradeab
     }
 
     function collectFallbackFees(uint256 positionId) internal {
-        if (!pool.inFallbackPool(positionId)) revert InvalidOperation("Position not in fallback pool");
+        if (!pool.isInFallbackPool(positionId)) revert InvalidOperation("Position not in fallback pool");
 
         pool.collectFeesInternal(positionId);
 
-        (, , , , , , uint256 tokensOwed0, uint256 tokensOwed1, address owner) = pool.positions(positionId);
+        (address owner, , , , , , uint256 tokensOwed0, uint256 tokensOwed1) = pool.positions(positionId);
         if (tokensOwed0 == 0 && tokensOwed1 == 0) return;
 
         address destination = positionManager.feeDestinations(owner);
@@ -470,11 +470,13 @@ contract PositionAdjuster is KeeperCompatibleInterface, ReentrancyGuardUpgradeab
         if (tokensOwed0 > 0) {
             pool.transferToken(address(pool.tokenA()), recipient, tokensOwed0);
             aggregatedFees[owner].total0 += tokensOwed0;
+            fallbackFees0[positionId] = 0;
             emit FallbackFeesCollected(positionId, tokensOwed0, 0);
         }
         if (tokensOwed1 > 0) {
             pool.transferToken(address(pool.tokenB()), recipient, tokensOwed1);
             aggregatedFees[owner].total1 += tokensOwed1;
+            fallbackFees1[positionId] = 0;
             emit FallbackFeesCollected(positionId, 0, tokensOwed1);
         }
 
@@ -482,17 +484,21 @@ contract PositionAdjuster is KeeperCompatibleInterface, ReentrancyGuardUpgradeab
     }
 
     function compoundFallbackFees(uint256 positionId) internal {
-        if (!pool.inFallbackPool(positionId)) revert InvalidOperation("Position not in fallback pool");
+        if (!pool.isInFallbackPool(positionId)) revert InvalidOperation("Position not in fallback pool");
 
         pool.collectFeesInternal(positionId);
 
-        (, , , , , , uint256 tokensOwed0, uint256 tokensOwed1, address owner) = pool.positions(positionId);
+        (address owner, int24 tickLower, int24 tickUpper, uint256 liquidity, , , uint256 tokensOwed0, uint256 tokensOwed1) = pool.positions(positionId);
         if (tokensOwed0 == 0 && tokensOwed1 == 0) return;
 
-        pool.compoundFallbackFeesInternal(positionId, tokensOwed0, tokensOwed1);
+        uint256 additionalLiquidity = _getLiquidityForAmounts(tickLower, tickUpper, tokensOwed0, tokensOwed1);
+        pool.adjust(positionId, tickLower, tickUpper, liquidity + additionalLiquidity);
 
         aggregatedFees[owner].total0 += tokensOwed0;
         aggregatedFees[owner].total1 += tokensOwed1;
+        fallbackFees0[positionId] = 0;
+        fallbackFees1[positionId] = 0;
+
         emit FallbackFeesCompounded(positionId, tokensOwed0, tokensOwed1);
         emit FeesAggregated(owner, positionId, tokensOwed0, tokensOwed1);
     }
@@ -507,8 +513,8 @@ contract PositionAdjuster is KeeperCompatibleInterface, ReentrancyGuardUpgradeab
 
         for (uint256 i = 0; i < count; i++) {
             uint256 positionId = positionIds[i];
-            if (!pool.inFallbackPool(positionId)) continue;
-            (, , , uint256 liquidity, , , , , address owner) = pool.positions(positionId);
+            if (!pool.isInFallbackPool(positionId)) continue;
+            (address owner, , , uint256 liquidity, , , uint256 tokensOwed0, uint256 tokensOwed1) = pool.positions(positionId);
             if (liquidity == 0) continue;
 
             pool.exitFallbackPoolInternal(positionId);
@@ -517,11 +523,11 @@ contract PositionAdjuster is KeeperCompatibleInterface, ReentrancyGuardUpgradeab
         }
 
         if (validCount > 0) {
-            uint256[] memory slicedValidIds = new uint256[](validCount);
+            uint256[] memory slicedIds = new uint256[](validCount);
             for (uint256 j = 0; j < validCount; j++) {
-            slicedValidIds[j] = validIds[j];
+                slicedIds[j] = validIds[j];
             }
-            emit BatchFallbackPoolExited(slicedValidIds);
+            emit BatchFallbackPoolExited(slicedIds);
         } else {
             revert InvalidBatchSize(0);
         }
@@ -556,6 +562,24 @@ contract PositionAdjuster is KeeperCompatibleInterface, ReentrancyGuardUpgradeab
         return feeRate > maxFallbackFeeRate ? maxFallbackFeeRate : feeRate;
     }
 
+    function _getLiquidityForAmounts(
+        int24 tickLower,
+        int24 tickUpper,
+        uint256 amount0,
+        uint256 amount1
+    ) internal pure returns (uint256 liquidity) {
+        uint160 sqrtPriceLowerX96 = TickMath.getSqrtRatioAtTick(tickLower);
+        uint160 sqrtPriceUpperX96 = TickMath.getSqrtRatioAtTick(tickUpper);
+
+        if (amount0 > 0) {
+            liquidity = (amount0 * (uint256(sqrtPriceUpperX96) - uint256(sqrtPriceLowerX96))) / uint256(sqrtPriceUpperX96);
+        }
+        if (amount1 > 0) {
+            uint256 liquidity1 = (amount1 * (uint256(sqrtPriceUpperX96) - uint256(sqrtPriceLowerX96))) / uint256(sqrtPriceLowerX96);
+            liquidity = liquidity > liquidity1 ? liquidity1 : liquidity;
+        }
+    }
+
     function _calculateTicks(
         Strategy memory strategy,
         uint256 currentPrice,
@@ -563,7 +587,7 @@ contract PositionAdjuster is KeeperCompatibleInterface, ReentrancyGuardUpgradeab
         uint256 reserveA,
         uint256 reserveB
     ) internal view returns (int24 newTickLower, int24 newTickUpper) {
-        uint24 tickSpacing = pool.TICK_SPACING();
+        uint24 tickSpacing = pool.getTickSpacing();
         int24 currentTick = _priceToTicks(currentPrice);
         uint24 rangeWidth;
 
@@ -572,7 +596,7 @@ contract PositionAdjuster is KeeperCompatibleInterface, ReentrancyGuardUpgradeab
         } else if (strategy.strategyType == StrategyType.Volatility) {
             uint256 oracleVolatility = getOracleVolatility(address(pool));
             uint256 combinedVolatility = (emaVol + oracleVolatility) / 2;
-            rangeWidth = combinedVolatility > (strategy.volatilityThreshold > 0 ? strategy.volatilityThreshold : pool.volatilityThreshold())
+            rangeWidth = combinedVolatility > strategy.volatilityThreshold ? strategy.volatilityThreshold : pool.getVolatilityThreshold()
                 ? 1000
                 : 200;
         } else if (strategy.strategyType == StrategyType.Volume) {
@@ -614,9 +638,9 @@ contract PositionAdjuster is KeeperCompatibleInterface, ReentrancyGuardUpgradeab
         uint256 maxRetries = 3;
 
         while (retryCount < maxRetries) {
-            try IPriceOracle(priceOracle).getCurrentPairPrice(address(pool.tokenA), address(pool.tokenB)) returns (uint256 price, bool isCached) {
+            try IPriceOracle(priceOracle).getCurrentPairPrice(address(pool.tokenA()), address(pool.tokenB())) returns (uint256 price, bool isCached) {
                 (, address tokenA,,,,,,,) = IPriceOracle(priceOracle).assetConfigs(address(pool));
-                bool isToken0Base = tokenA == address(pool.tokenA);
+                bool isToken0Base = tokenA == address(pool.tokenA());
                 price = isToken0Base ? price : 1e36 / price;
                 if (isCached) {
                     emit CachedPriceUsed(address(pool), price, block.timestamp);
@@ -626,9 +650,9 @@ contract PositionAdjuster is KeeperCompatibleInterface, ReentrancyGuardUpgradeab
                 retryCount++;
                 if (retryCount == maxRetries) {
                     for (uint256 i = 0; i < fallbackPriceOracles.length; i++) {
-                        try IPriceOracle(fallbackPriceOracles[i]).getCurrentPairPrice(address(pool.tokenA), address(pool.tokenB)) returns (uint256 price, bool isCached) {
+                        try IPriceOracle(fallbackPriceOracles[i]).getCurrentPairPrice(address(pool.tokenA()), address(pool.tokenB())) returns (uint256 price, bool isCached) {
                             (, address tokenA, , , , , , , ) = IPriceOracle(fallbackPriceOracles[i]).assetConfigs(address(pool));
-                            bool statusToken0 = tokenA == address(pool.tokenA);
+                            bool statusToken0 = tokenA == address(pool.tokenA());
                             price = statusToken0 ? price : 1e36 / price;
                             if (isCached) {
                                 emit CachedPriceUsed(address(pool), price, block.timestamp);
@@ -656,13 +680,13 @@ contract PositionAdjuster is KeeperCompatibleInterface, ReentrancyGuardUpgradeab
 
     function _tickToPrice(int24 tick) internal pure returns (uint256) {
         uint256 sqrtPriceX96 = TickMath.getSqrtPriceAtTick(tick);
-        uint256 price = UD60x18.from(uint256(sqrtPriceX96) * uint256(sqrtPriceX96)).div(ud(1) << uint256(192));
-        return price.unwrap();
+        uint256 price = UD60x18.from(uint256(sqrtPriceX96) * uint256(sqrtPriceX96)).div(ud(uint256(1) << 192)).unwrap();
+        return price;
     }
 
     function _priceToTicks(uint256 price) internal pure returns (int24) {
         uint256 sqrtPrice = UD60x18.from(price).sqrt().unwrap();
-        uint256 sqrtPriceX96 = uint160(sqrtPrice * (1 << 96));
+        uint160 sqrtPriceX96 = uint160(sqrtPrice * (1 << 96));
         return TickMath.getTickAtSqrtRatio(sqrtPriceX96);
     }
 
@@ -679,7 +703,7 @@ contract PositionAdjuster is KeeperCompatibleInterface, ReentrancyGuardUpgradeab
     function updateVolume(uint256 id, uint256 amountIn, uint256 amountOut, uint256 fee0, uint256 fee1, uint256 position) external {
         if (msg.sender != address(pool)) revert Unauthorized();
         uint256 currentWindow = block.timestamp / volumeWindow;
-        bool statusActive = pool.inFallback(id);
+        bool statusActive = pool.isInFallbackPool(id);
         if (statusActive && fallbackEntryTimestamp[id] == 0) {
             fallbackEntryTimestamp[id] = block.timestamp;
         }
@@ -696,7 +720,7 @@ contract PositionAdjuster is KeeperCompatibleInterface, ReentrancyGuardUpgradeab
                 aggregatedFees[msg.sender].total1 += adjustedFee1;
             }
         }
-        emit FeesAggregated(msg.sender, id, fee0, fee1);
+        emit Fees(id, msg.sender, fee0, fee1);
     }
 
     function updateOracles(address newPrimaryOracle, address[] memory newFallbackOracles) external {
@@ -729,7 +753,7 @@ contract PositionAdjuster is KeeperCompatibleInterface, ReentrancyGuardUpgradeab
 
     function getPoolConstants() external view returns (uint256 maxRetries, uint256 tickSpacing) {
         maxRetries = pool.MAX_RETRIES();
-        tickSpacing = pool.TICK_SPACING();
+        tickSpacing = pool.getTickSpacing();
     }
 
     function getAggregatedFees(address owner) external view returns (uint256 total0, uint256 total1) {

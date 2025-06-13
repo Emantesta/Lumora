@@ -126,7 +126,6 @@ interface IGovernance {
 // Chainlink Oracle interface
 interface IChainlinkOracle is AggregatorV3Interface {}
 
-
 /// @title AMMPool - An upgradeable AMM pool with cross-chain capabilities, concentrated liquidity, dynamic curves, and fallback pool
 /// @notice Implements a Uniswap V3-style AMM with cross-chain support, Curve-inspired dynamic curves, and a fallback pool
 /// @dev Uses OpenZeppelin upgradeable contracts, integrates with PriceOracle.sol, and handles token pair orientation
@@ -151,7 +150,7 @@ contract AMMPool is
     uint256 public immutable GOVERNANCE_TIMELOCK;
     uint256 public immutable MAX_RETRIES;
     uint256 public immutable MAX_ORACLE_RETRIES;
-    int24 public immutable TICK_SPACING;
+    uint24 public immutable TICK_SPACING; // Changed from int24 to uint24
     uint256 public immutable MAX_LIQUIDITY_PER_TICK;
     uint256 public immutable RETRY_DELAY;
 
@@ -352,7 +351,6 @@ contract AMMPool is
     event GovernanceUpdated(address indexed newGovernance);
     event PriceOracleUpdated(address indexed primaryOracle, address[] fallbackOracles);
     event EmaPeriodUpdated(uint256 newPeriod);
-    event VolatilityThresholdUpdated(uint256 newThreshold);
     event CrossChainMessengerUpdated(uint8 indexed messengerType, address indexed newMessenger);
     event AxelarGasServiceUpdated(address indexed newGasService);
     event ChainIdMappingUpdated(uint16 chainId, string axelarChain);
@@ -360,11 +358,11 @@ contract AMMPool is
     event GovernanceProposalCreated(uint256 indexed proposalId, address target, bytes data, uint256 proposedAt);
     event GovernanceProposalExecuted(uint256 indexed proposalId);
     event FailedMessageStored(uint256 indexed messageId, uint16 dstChainId, bytes sender, uint256 timestamp, uint8 messengerType);
+    event BatchMessagesSent(uint16[] dstChainIds, uint8 messengerType, uint256 totalNativeFee);
     event FailedMessageRetried(uint256 indexed messageId, uint16 dstChainId, uint256 retries, uint8 messengerType);
     event FailedMessageRecovered(uint256 indexed messageId, address indexed recipient);
     event AllLPFeesClaimed(address indexed provider, uint256 amountA, uint256 amountB);
     event OracleFailover(address indexed failedOracle, address indexed newOracle);
-    event PositionUpdated(uint256 indexed positionId, int24 tickLower, int24 tickUpper, uint256 liquidity);
     event FeesCollected(uint256 indexed positionId, uint256 amount0, uint256 amount1);
     event FallbackPoolEntered(uint256 indexed positionId, uint256 liquidity);
     event FallbackPoolExited(uint256 indexed positionId, uint256 liquidity);
@@ -398,16 +396,16 @@ contract AMMPool is
     }
 
     modifier onlyAuthorizedAdjusters(uint256 positionId) {
-    Position storage position = positions[positionId];
-    if (msg.sender != position.owner && msg.sender != authorizedAdjusters[positionId]) {
-        revert Unauthorized();
-    }
-    _;
+        Position storage position = positions[positionId];
+        if (msg.sender != position.owner && msg.sender != authorizedAdjusters[positionId]) {
+            revert Unauthorized();
+        }
+        _;
     }
 
     modifier onlyPositionAdjuster() {
-    if (msg.sender != positionAdjuster) revert Unauthorized();
-    _;
+        if (msg.sender != positionAdjuster) revert Unauthorized();
+        _;
     }
 
     modifier onlyPositionManager() {
@@ -595,13 +593,13 @@ contract AMMPool is
     }
 
     function collectFeesInternal(uint256 positionId) external onlyPositionAdjuster {
-    _collectFees(positionId);
+        _collectFees(positionId);
     }
 
     function authorizeAdjuster(uint256 positionId, address adjuster) external onlyPositionOwner(positionId) {
-    if (adjuster == address(0)) revert InvalidAddress(adjuster, "Invalid adjuster address");
-    authorizedAdjusters[positionId] = adjuster;
-    emit PositionAdjusterUpdated(adjuster);
+        if (adjuster == address(0)) revert InvalidAddress(adjuster, "Invalid adjuster address");
+        authorizedAdjusters[positionId] = adjuster;
+        emit PositionAdjusterUpdated(adjuster);
     }
 
     function emaVol() external view returns (uint256) {
@@ -705,7 +703,7 @@ contract AMMPool is
         // Update volatility and emit event
         _updateVolatility();
         emit PositionUpdated(positionId, tickLower, tickUpper, liquidity);
-        }
+    }
 
     // --- Fallback Pool Functions ---
 
@@ -760,45 +758,45 @@ contract AMMPool is
     }
 
     function exitFallbackPool(uint256 positionId) external override whenNotPaused nonReentrant onlyPositionOwner(positionId) {
-    _exitFallbackPool(positionId);
+        _exitFallbackPool(positionId);
     }
 
     function exitFallbackPoolInternal(uint256 positionId) external onlyPositionAdjuster {
-    _exitFallbackPool(positionId);
+        _exitFallbackPool(positionId);
     }
 
     function compoundFallbackFeesInternal(uint256 positionId, uint256 tokensOwed0, uint256 tokensOwed1) external onlyPositionAdjuster {
-    Position storage position = positions[positionId];
-    if (!inFallbackPool[positionId]) revert InvalidOperation("Position not in fallback pool");
-    if (tokensOwed0 == 0 && tokensOwed1 == 0) revert InvalidAmount(0, 0);
+        Position storage position = positions[positionId];
+        if (!inFallbackPool[positionId]) revert InvalidOperation("Position not in fallback pool");
+        if (tokensOwed0 == 0 && tokensOwed1 == 0) revert InvalidAmount(0, 0);
 
-    uint256 additionalLiquidity;
-    if (fallbackReserves.totalLiquidity == 0) {
-        UD60x18 sqrtResult = sqrt(ud(tokensOwed0 * tokensOwed1));
-        additionalLiquidity = sqrtResult.unwrap();
-    } else {
-        additionalLiquidity = (tokensOwed0 * fallbackReserves.totalLiquidity) / fallbackReserves.reserveA;
-        uint256 liquidityB = (tokensOwed1 * fallbackReserves.totalLiquidity) / fallbackReserves.reserveB;
-        additionalLiquidity = liquidityB < additionalLiquidity ? liquidityB : additionalLiquidity;
-    }
+        uint256 additionalLiquidity;
+        if (fallbackReserves.totalLiquidity == 0) {
+            UD60x18 sqrtResult = sqrt(ud(tokensOwed0 * tokensOwed1));
+            additionalLiquidity = sqrtResult.unwrap();
+        } else {
+            additionalLiquidity = (tokensOwed0 * fallbackReserves.totalLiquidity) / fallbackReserves.reserveA;
+            uint256 liquidityB = (tokensOwed1 * fallbackReserves.totalLiquidity) / fallbackReserves.reserveB;
+            additionalLiquidity = liquidityB < additionalLiquidity ? liquidityB : additionalLiquidity;
+        }
 
-    unchecked {
-        fallbackReserves.reserveA += tokensOwed0;
-        fallbackReserves.reserveB += tokensOwed1;
-        fallbackReserves.totalLiquidity += additionalLiquidity;
-        fallbackLiquidityBalance[position.owner] += additionalLiquidity;
-        position.liquidity += additionalLiquidity;
-        position.tokensOwed0 = 0;
-        position.tokensOwed1 = 0;
-    }
+        unchecked {
+            fallbackReserves.reserveA += tokensOwed0;
+            fallbackReserves.reserveB += tokensOwed1;
+            fallbackReserves.totalLiquidity += additionalLiquidity;
+            fallbackLiquidityBalance[position.owner] += additionalLiquidity;
+            position.liquidity += additionalLiquidity;
+            position.tokensOwed0 = 0;
+            position.tokensOwed1 = 0;
+        }
 
-    emit FallbackPoolEntered(positionId, additionalLiquidity);
+        emit FallbackPoolEntered(positionId, additionalLiquidity);
     }
 
     function transferToken(address token, address recipient, uint256 amount) external onlyPositionAdjuster {
-    if (token != tokenA && token != tokenB) revert InvalidToken(token);
-    if (amount == 0) revert InvalidAmount(amount, 0);
-    IERC20Upgradeable(token).safeTransfer(recipient, amount);
+        if (token != tokenA && token != tokenB) revert InvalidToken(token);
+        if (amount == 0) revert InvalidAmount(amount, 0);
+        IERC20Upgradeable(token).safeTransfer(recipient, amount);
     }
 
     // --- Core AMM Functions ---
@@ -962,77 +960,278 @@ contract AMMPool is
     }
 
     function receiveMessage(
-    uint16 srcChainId,
-    string memory srcAxelarChain,
-    bytes calldata srcAddress,
-    bytes calldata payload,
-    bytes calldata additionalParams
-) external nonReentrant whenNotPaused whenChainNotPaused(srcChainId) {
-    _validateCrossChainMessage(srcChainId, srcAddress, payload, additionalParams);
+        uint16 srcChainId,
+        string memory srcAxelarChain,
+        bytes calldata srcAddress,
+        bytes calldata payload,
+        bytes calldata additionalParams
+    ) external nonReentrant whenNotPaused whenChainNotPaused(srcChainId) {
+        _validateCrossChainMessage(srcChainId, srcAddress, payload, additionalParams);
 
-    (
-        address provider,
-        uint256 amountA,
-        uint256 amountB,
-        uint64 nonce,
-        uint256 timelock,
-        bool isConcentrated,
-        int24 tickLower,
-        int24 tickUpper,
-        address receivedTokenA,
-        address receivedTokenB
-    ) = abi.decode(payload, (address, uint256, uint256, uint64, uint256, bool, int24, int24, address, address));
+        (
+            address provider,
+            uint256 amountA,
+            uint256 amountB,
+            uint64 nonce,
+            uint256 timelock,
+            bool isConcentrated,
+            int24 tickLower,
+            int24 tickUpper,
+            address receivedTokenA,
+            address receivedTokenB
+        ) = abi.decode(payload, (address, uint256, uint256, uint64, uint256, bool, int24, int24, address, address));
 
-    if (usedNonces[srcChainId][nonce]) revert InvalidNonce(nonce, nonce);
-    if (block.timestamp < timelock) revert TimelockNotExpired(block.timestamp, timelock);
-    if (amountA == 0 && amountB == 0) revert InvalidAmount(amountA, amountB);
-    if (isConcentrated && (receivedTokenA != tokenA || receivedTokenB != tokenB)) revert InvalidToken(receivedTokenA);
+        if (usedNonces[srcChainId][nonce]) revert InvalidNonce(nonce, nonce);
+        if (block.timestamp < timelock) revert TimelockNotExpired(block.timestamp, timelock);
+        if (amountA == 0 && amountB == 0) revert InvalidAmount(amountA, amountB);
+        if (isConcentrated && (receivedTokenA != tokenA || receivedTokenB != tokenB)) revert InvalidToken(receivedTokenA);
 
-    usedNonces[srcChainId][nonce] = true;
+        usedNonces[srcChainId][nonce] = true;
 
-    _receiveBridgedTokens(tokenA, amountA);
-    _receiveBridgedTokens(tokenB, amountB);
+        _receiveBridgedTokens(tokenA, amountA);
+        _receiveBridgedTokens(tokenB, amountB);
 
-    uint256 liquidity;
-    uint256 positionId;
-    if (isConcentrated) {
-        if (!_isValidTickRange(tickLower, tickUpper)) revert InvalidTickRange(tickLower, tickUpper);
-        liquidity = _getLiquidityForAmounts(tickLower, tickUpper, amountA, amountB);
-        positionId = positionCounter++;
-        positions[positionId] = Position({
-            owner: provider,
-            tickLower: tickLower,
-            tickUpper: tickUpper,
-            liquidity: liquidity,
-            feeGrowthInside0LastX128: _getFeeGrowthInside(tickLower, tickUpper, 0),
-            feeGrowthInside1LastX128: _getFeeGrowthInside(tickLower, tickUpper, 1),
-            tokensOwed0: 0,
-            tokensOwed1: 0
-        });
-        _updateTick(tickLower, liquidity, true);
-        _updateTick(tickUpper, liquidity, false);
-        IPositionManager(positionManager).mintPosition(positionId, provider);
-        emit PositionCreated(positionId, provider, tickLower, tickUpper, liquidity);
-        _checkAndMoveToFallback(positionId);
-    } else {
-        if (totalLiquidity == 0) {
-            UD60x18 sqrtResult = sqrt(ud(amountA * amountB));
-            liquidity = sqrtResult.unwrap();
+        uint256 liquidity;
+        uint256 positionId;
+        if (isConcentrated) {
+            if (!_isValidTickRange(tickLower, tickUpper)) revert InvalidTickRange(tickLower, tickUpper);
+            liquidity = _getLiquidityForAmounts(tickLower, tickUpper, amountA, amountB);
+            positionId = positionCounter++;
+            positions[positionId] = Position({
+                owner: provider,
+                tickLower: tickLower,
+                tickUpper: tickUpper,
+                liquidity: liquidity,
+                feeGrowthInside0LastX128: _getFeeGrowthInside(tickLower, tickUpper, 0),
+                feeGrowthInside1LastX128: _getFeeGrowthInside(tickLower, tickUpper, 1),
+                tokensOwed0: 0,
+                tokensOwed1: 0
+            });
+            _updateTick(tickLower, liquidity, true);
+            _updateTick(tickUpper, liquidity, false);
+            IPositionManager(positionManager).mintPosition(positionId, provider);
+            emit PositionCreated(positionId, provider, tickLower, tickUpper, liquidity);
+            _checkAndMoveToFallback(positionId);
         } else {
-            liquidity = (amountA * totalLiquidity) / reserves.reserveA;
-            uint256 liquidityB = (amountB * totalLiquidity) / reserves.reserveB;
-            liquidity = liquidity < liquidityB ? liquidity : liquidityB;
+            if (totalLiquidity == 0) {
+                UD60x18 sqrtResult = sqrt(ud(amountA * amountB));
+                liquidity = sqrtResult.unwrap();
+            } else {
+                liquidity = (amountA * totalLiquidity) / reserves.reserveA;
+                uint256 liquidityB = (amountB * totalLiquidity) / reserves.reserveB;
+                liquidity = liquidity < liquidityB ? liquidity : liquidityB;
+            }
+            unchecked {
+                liquidityBalance[provider] += liquidity;
+                totalLiquidity += liquidity;
+                reserves.crossChainReserveA += uint128(amountA);
+                reserves.crossChainReserveB += uint128(amountB);
+            }
         }
-        unchecked {
-            liquidityBalance[provider] += liquidity;
-            totalLiquidity += liquidity;
-            reserves.crossChainReserveA += uint128(amountA);
-            reserves.crossChainReserveB += uint128(amountB);
+
+        _updateVolatility();
+        emit CrossChainLiquidityReceived(provider, amountA, amountB, srcChainId, nonce, _getMessengerType());
+    }
+
+    // --- Cross-Chain Batch Messaging ---
+
+    /**
+ * @dev Sends a single cross-chain message to a specified destination chain
+ * @param dstChainId The destination chain ID
+ * @param payload The message payload
+ * @param adapterParams Adapter parameters for the cross-chain message
+ */
+function batchCrossChainMessages(
+    uint16 dstChainId,
+    bytes memory payload,
+    bytes memory adapterParams
+) external payable override whenNotPaused nonReentrant {
+    // Early validation to save gas
+    if (payload.length == 0) revert InvalidMessage();
+    if (trustedRemotePools[dstChainId].length == 0) revert InvalidChainId(dstChainId);
+    if (bytes(chainIdToAxelarChain[dstChainId]).length == 0) revert InvalidAxelarChain("");
+
+    // Convert single inputs to arrays for _batchCrossChainMessages
+    uint16[] memory dstChainIds = new uint16[](1);
+    string[] memory dstAxelarChains = new string[](1);
+    bytes[] memory payloads = new bytes[](1);
+    bytes[] memory adapterParamsArray = new bytes[](1);
+    uint256[] memory timelocks = new uint256[](1);
+
+    dstChainIds[0] = dstChainId;
+    dstAxelarChains[0] = chainIdToAxelarChain[dstChainId];
+    payloads[0] = payload;
+    adapterParamsArray[0] = adapterParams;
+    timelocks[0] = _getDynamicTimelock(dstChainId);
+
+    // Call the internal batch function with the default messenger type
+    _batchCrossChainMessages(
+        dstChainIds,
+        dstAxelarChains,
+        payloads,
+        adapterParamsArray,
+        timelocks,
+        _getMessengerType()
+    );
+}
+
+/**
+ * @dev External function to batch cross-chain messages
+ * @param dstChainIds Array of destination chain IDs
+ * @param dstAxelarChains Array of destination Axelar chain names
+ * @param payloads Array of message payloads
+ * @param adapterParams Array of adapter parameters
+ * @param timelocks Array of timelocks for messages
+ */
+function batchCrossChainMessages(
+    uint16[] calldata dstChainIds,
+    string[] calldata dstAxelarChains,
+    bytes[] calldata payloads,
+    bytes[] calldata adapterParams,
+    uint256[] calldata timelocks
+) external payable whenNotPaused nonReentrant {
+    _batchCrossChainMessages(
+        dstChainIds,
+        dstAxelarChains,
+        payloads,
+        adapterParams,
+        timelocks,
+        _getMessengerType()
+    );
+}
+
+/**
+ * @dev Internal function to process batched cross-chain messages
+ * @param dstChainIds Array of destination chain IDs
+ * @param dstAxelarChains Array of destination Axelar chain names
+ * @param payloads Array of message payloads
+ * @param adapterParams Array of adapter parameters
+ * @param timelocks Array of timelocks for messages
+ * @param messengerType Type of messenger to use
+ * @notice Uses memory arrays to support dynamic construction from single-message calls. Large batches may incur higher gas costs due to memory allocation.
+ */
+function _batchCrossChainMessages(
+    uint16[] memory dstChainIds,
+    string[] memory dstAxelarChains,
+    bytes[] memory payloads,
+    bytes[] memory adapterParams,
+    uint256[] memory timelocks,
+    uint8 messengerType
+) internal {
+    // Validate batch size and array lengths
+    uint256 batchSize = dstChainIds.length;
+    if (batchSize == 0 || batchSize > MAX_BATCH_SIZE) {
+        revert InvalidBatchSize(batchSize);
+    }
+    if (
+        batchSize != dstAxelarChains.length ||
+        batchSize != payloads.length ||
+        batchSize != adapterParams.length ||
+        batchSize != timelocks.length
+    ) {
+        revert InvalidBatchSize(batchSize);
+    }
+
+    // Validate messenger
+    address messenger = crossChainMessengers[messengerType];
+    if (messenger == address(0)) {
+        revert MessengerNotSet(messengerType);
+    }
+
+    // Estimate total fees
+    uint256 totalNativeFee;
+    for (uint256 i = 0; i < batchSize; ++i) {
+        if (trustedRemotePools[dstChainIds[i]].length == 0) {
+            revert InvalidChainId(dstChainIds[i]);
+        }
+        if (bytes(dstAxelarChains[i]).length == 0) {
+            revert InvalidAxelarChain(dstAxelarChains[i]);
+        }
+        if (payloads[i].length == 0) {
+            revert InvalidMessage();
+        }
+        if (chainPaused[dstChainIds[i]]) {
+            revert ChainPausedError(dstChainIds[i]);
+        }
+        if (
+            keccak256(bytes(chainIdToAxelarChain[dstChainIds[i]])) !=
+            keccak256(bytes(dstAxelarChains[i]))
+        ) {
+            revert InvalidAxelarChain(dstAxelarChains[i]);
+        }
+
+        (uint256 nativeFee, ) = ICrossChainMessenger(messenger).estimateFees(
+            dstChainIds[i],
+            dstAxelarChains[i],
+            address(this),
+            payloads[i],
+            adapterParams[i]
+        );
+        totalNativeFee += nativeFee;
+    }
+
+    if (msg.value < totalNativeFee) {
+        revert InsufficientFee(msg.value, totalNativeFee);
+    }
+
+    uint256 gasPerMessage = gasleft() / batchSize;
+    uint256 refundAmount = msg.value;
+
+    // Process each message
+    for (uint256 i = 0; i < batchSize; ++i) {
+        if (gasleft() < gasPerMessage) {
+            revert InsufficientGasForBatch(gasPerMessage, gasleft());
+        }
+
+        uint64 nonce = _getNonce(dstChainIds[i], messengerType);
+        (uint256 nativeFee, ) = ICrossChainMessenger(messenger).estimateFees(
+            dstChainIds[i],
+            dstAxelarChains[i],
+            address(this),
+            payloads[i],
+            adapterParams[i]
+        );
+
+        try
+            ICrossChainMessenger(messenger).sendMessage{value: nativeFee}(
+                dstChainIds[i],
+                dstAxelarChains[i],
+                trustedRemotePools[dstChainIds[i]],
+                payloads[i],
+                adapterParams[i],
+                payable(msg.sender)
+            )
+        {
+            refundAmount -= nativeFee;
+        } catch {
+            uint256 messageId = failedMessageCount++;
+            failedMessages[messageId] = FailedMessage({
+                dstChainId: dstChainIds[i],
+                dstAxelarChain: dstAxelarChains[i],
+                payload: payloads[i],
+                adapterParams: adapterParams[i],
+                retries: 0,
+                timestamp: block.timestamp,
+                messengerType: messengerType,
+                nextRetryTimestamp: block.timestamp + RETRY_DELAY
+            });
+            emit FailedMessageStored(
+                messageId,
+                dstChainIds[i],
+                abi.encodePacked(msg.sender),
+                block.timestamp,
+                messengerType
+            );
         }
     }
 
-    _updateVolatility();
-    emit CrossChainLiquidityReceived(provider, amountA, amountB, srcChainId, nonce, _getMessengerType());
+    // Refund excess ETH
+    if (refundAmount > 0) {
+        (bool success, ) = payable(msg.sender).call{value: refundAmount}("");
+        require(success, "Refund failed");
+    }
+    // Emit the BatchMessagesSent event
+    emit BatchMessagesSent(dstChainIds, messengerType, totalNativeFee - refundAmount);
 }
 
     // --- Cross-Chain Retry Mechanism ---
@@ -1251,8 +1450,8 @@ contract AMMPool is
 
     function _isValidTickRange(int24 tickLower, int24 tickUpper) internal view returns (bool) {
         return tickLower < tickUpper &&
-               tickLower % TICK_SPACING == 0 &&
-               tickUpper % TICK_SPACING == 0 &&
+               tickLower % int24(TICK_SPACING) == 0 &&
+               tickUpper % int24(TICK_SPACING) == 0 &&
                tickLower >= TickMath.MIN_TICK &&
                tickUpper <= TickMath.MAX_TICK;
     }
@@ -1385,9 +1584,9 @@ contract AMMPool is
     }
 
     function _getLiquidityAtTick(int24 tick) internal view returns (uint256 liquidity) {
-        int24 tickLower = (tick / TICK_SPACING) * TICK_SPACING;
-        int24 tickUpper = tickLower + TICK_SPACING;
-        for (int24 i = TickMath.MIN_TICK; i <= tickUpper; i += TICK_SPACING) {
+        int24 tickLower = (tick / int24(TICK_SPACING)) * int24(TICK_SPACING);
+        int24 tickUpper = tickLower + int24(TICK_SPACING);
+        for (int24 i = TickMath.MIN_TICK; i <= tickUpper; i += int24(TICK_SPACING)) {
             if (i > tick) break;
             if (ticks[i].liquidityGross > 0) {
                 liquidity += uint256(ticks[i].liquidityNet);
@@ -1403,13 +1602,19 @@ contract AMMPool is
         fee = config.baseFee + volatilityAdjustment;
         if (fee > config.maxFee) fee = config.maxFee;
 
-        if (emaVolatility < volatilityThreshold / 2) {
+        if (emaVolatility < uint256(volatilityThreshold) / 2) {
             fee = config.baseFee;
-        } else if (emaVolatility > volatilityThreshold * 2) {
+        } else if (emaVolatility > uint256(volatilityThreshold) * 2) {
             fee = config.maxFee;
         }
 
         if (fee < 10 || fee > 1000) revert InvalidFeeRange(fee, config.maxFee);
+    }
+
+    function updateVolatilityThreshold(uint256 newThreshold) external override onlyGovernance {
+        if (newThreshold == 0) revert InvalidAmount(newThreshold, 0);
+        volatilityThreshold = newThreshold;
+        emit VolatilityThresholdUpdated(newThreshold);
     }
 
     function _updateVolatility() internal {
@@ -1451,7 +1656,7 @@ contract AMMPool is
         }
 
         lastPrice = price;
-        useConstantSum = emaVolatility < volatilityThreshold;
+        useConstantSum = emaVolatility < uint256(volatilityThreshold);
     }
 
     function _getOraclePrice() internal returns (uint256 price, bool success) {
@@ -1688,99 +1893,113 @@ contract AMMPool is
         bytes memory payload,
         bytes memory additionalParams
     ) internal {
-        bytes32 payloadHash = keccak256(payload);
-        if (validatedMessages[payloadHash]) revert InvalidMessage();
-        if (keccak256(srcAddress) != keccak256(trustedRemotePools[srcChainId])) revert InvalidAddress(address(0), "Invalid source address");
+        bytes32 messageHash = keccak256(abi.encode(srcChainId, srcAddress, payload));
+        if (validatedMessages[messageHash]) revert InvalidCrossChainMessage("Message already processed");
+        validatedMessages[messageHash] = true;
 
-        address messenger = crossChainMessengers[_getMessengerType()];
-        if (messenger == address(0)) revert MessengerNotSet(0);
-
-        try ICrossChainMessenger(messenger).receiveMessage(
-            srcChainId,
-            chainIdToAxelarChain[srcChainId],
-            srcAddress,
-            payload,
-            additionalParams
-        ) {
-            validatedMessages[payloadHash] = true;
-        } catch {
-            revert InvalidCrossChainMessage("Validation failed");
+        // Validate trusted sender
+        bytes memory trustedAddress = trustedRemotePools[srcChainId];
+        if (trustedAddress.length == 0 || keccak256(srcAddress) != keccak256(trustedAddress)) {
+            revert InvalidCrossChainMessage("Untrusted source address");
         }
-    }
 
-    function _getNonce(uint16 chainId, uint8 messengerType) internal view returns(uint64) {
+        // Messenger-specific validation
+        uint8 messengerType = _getMessengerType();
         address messenger = crossChainMessengers[messengerType];
         if (messenger == address(0)) revert MessengerNotSet(messengerType);
 
         if (messengerType == 0) {
-            return ILayerZeroEndpoint(messenger).getInboundNonce(chainId, trustedRemotePools[chainId]);
+            // LayerZero
+            uint64 nonce = ILayerZeroEndpoint(messenger).getInboundNonce(srcChainId, srcAddress);
+            if (nonce == 0) revert InvalidNonce(nonce, 1);
+        } else if (messengerType == 1) {
+            // Axelar
+            bytes32 payloadHash = keccak256(payload);
+            bool valid = IAxelarGateway(messenger).validateContractCall(
+                bytes32(additionalParams),
+                chainIdToAxelarChain[srcChainId],
+                string(srcAddress),
+                payloadHash
+            );
+            if (!valid) revert InvalidCrossChainMessage("Invalid Axelar message");
         } else if (messengerType == 2) {
-            (, , uint64 sequence, ) = IWormhole(messenger).parseAndVerifyVM(new bytes(0));
-            return sequence;
+            // Wormhole
+            (uint16 emitterChainId, bytes32 emitterAddress, uint64 sequence, bytes memory wormholePayload) = IWormhole(messenger).parseAndVerifyVM(additionalParams);
+            if (emitterChainId != srcChainId || emitterAddress != wormholeTrustedSenders[srcChainId] || keccak256(wormholePayload) != keccak256(payload)) {
+                revert InvalidWormholeVAA();
+            }
         } else {
-            return uint64(block.timestamp % type(uint64).max);
+            revert InvalidMessengerType(messengerType);
         }
     }
 
-    function _getDynamicTimelock(uint16 chainId) internal view returns(uint256) {
-        uint256 timelock = chainTimelocks[chainId];
-        if (timelock == (0) || timelock < MIN_TIMELOCK || timelock > MAX_TIMELOCK) {
-            return MIN_TIMELOCK;
-        }
-        return timelock;
-    }
-
-    function _estimateSwapAmountOut(bool isTokenAInput, uint256 amountInWithFee) internal view returns (uint256 amountOut) {
-        uint256 reserveIn; 
-        uint256 reserveOut;
-        if (isTokenAInput) {
-            reserveIn = uint256(reserves.reserveA + fallbackReserves.reserveA);
-            reserveOut = uint256(reserves.reserveB + fallbackReserves.reserveB);
-        } else {
-            reserveIn = uint256(reserves.reserveB + fallbackReserves.reserveB);
-            reserveOut = uint256(reserves.reserveA + fallbackReserves.reserveA);
-        }
+    function _estimateSwapAmountOut(bool isTokenAInput, uint256 amountIn) internal view returns (uint256 amountOut) {
+        (uint256 reserveIn, uint256 reserveOut) = isTokenAInput
+            ? (uint256(reserves.reserveA), uint256(reserves.reserveB))
+            : (uint256(reserves.reserveB), uint256(reserves.reserveA));
 
         if (useConstantSum && emaVolatility < volatilityThreshold) {
-            return _swapConstantSum(amountInWithFee, reserveIn, reserveOut);
-    } else {
-            return (reserveOut * amountInWithFee) / (reserveIn + amountInWithFee);
+            amountOut = _swapConstantSum(amountIn, reserveIn, reserveOut);
+        } else {
+            amountOut = (reserveOut * amountIn) / (reserveIn + amountIn);
+        }
+
+        if (amountOut == 0) {
+            (reserveIn, reserveOut) = isTokenAInput
+                ? (fallbackReserves.reserveA, fallbackReserves.reserveB)
+                : (fallbackReserves.reserveB, fallbackReserves.reserveA);
+            amountOut = _swapFallbackPool(isTokenAInput, amountIn);
+        }
     }
- }
+
+    function _getNonce(uint16 chainId, uint8 messengerType) internal view returns (uint64 nonce) {
+        address messenger = crossChainMessengers[messengerType];
+        if (messenger == address(0)) revert MessengerNotSet(messengerType);
+
+        if (messengerType == 0) {
+            nonce = ILayerZeroEndpoint(messenger).getInboundNonce(chainId, trustedRemotePools[chainId]);
+        } else if (messengerType == 2) {
+            // For Wormhole, use a simple counter-based nonce for simulation
+            nonce = uint64(block.timestamp % type(uint64).max);
+        } else {
+            // Axelar or others can use timestamp-based nonce for simplicity
+            nonce = uint64(block.timestamp);
+        }
+    }
+
+    function _getDynamicTimelock(uint16 chainId) internal view returns (uint256 timelock) {
+        timelock = chainTimelocks[chainId];
+        if (timelock < MIN_TIMELOCK || timelock > MAX_TIMELOCK) {
+            timelock = MIN_TIMELOCK;
+        }
+        // Adjust timelock based on volatility
+        if (emaVolatility > volatilityThreshold) {
+            timelock += timelock / 2;
+            if (timelock > MAX_TIMELOCK) timelock = MAX_TIMELOCK;
+        }
+    }
 
     function _getMessengerType() internal view returns (uint8) {
-    for (uint8 i = 0; i < 2; i++) {
-        if (crossChainMessengers[i] != address(0)) {
-            return i;
-        }
+        // Default to LayerZero for simplicity; in practice, this could be configurable
+        if (crossChainMessengers[0] != address(0)) return 0;
+        if (crossChainMessengers[1] != address(0)) return 1;
+        if (crossChainMessengers[2] != address(0)) return 2;
+        revert MessengerNotSet(0);
     }
-    revert MessengerNotSet(0);
- }
 
     function sqrt(UD60x18 x) internal pure returns (UD60x18) {
-        return x.sqrt();
+    return x.sqrt();
     }
 
-    // --- Emergency Functions ---
+    // --- Additional Required Functions ---
 
-    function emergencyWithdraw() external nonReentrant {
-        uint256 liquidity = liquidityBalance[msg.sender];
-        if (liquidity == (0)) revert InvalidAmount(0, (0));
-
-        uint256 amountA = (liquidity * reserves.reserveA) / totalLiquidity;
-        uint256 amountB = (liquidity * reserves.reserveB) / totalLiquidity;
-
-        unchecked {
-            liquidityBalance[msg.sender] -= liquidity;
-            totalLiquidity -= liquidity;
-            reserves.reserveA -= uint64(amountA);
-            reserves.reserveB -= uint64(amountB);
-        }
-
-        IERC20Upgradeable(tokenA).safeTransfer(msg.sender, amountA);
-        IERC20Upgradeable(tokenB).safeTransfer(msg.sender, amountB);
-
-        emit EmergencyWithdrawal(msg.sender, amountA, amountB);
+    function onERC721Received(
+        address,
+        address,
+        uint256,
+        bytes calldata
+    ) external pure override returns (bytes4) {
+        return IERC721ReceiverUpgradeable.onERC721Received.selector;
     }
 
     function pause() external onlyOwner {
@@ -1803,107 +2022,6 @@ contract AMMPool is
         emit ChainUnpaused(chainId, msg.sender);
     }
 
-    // --- Getter Functions ---
-
-    function getReserves() external view returns (uint64 reserveA, uint64 reserveB) {
-        return (reserves.reserveA, reserves.reserveB);
-    }
-
-    function getCrossChainReserves() external view returns (uint128 crossChainReserveA, uint128 crossChainReserveB) {
-        return (reserves.crossChainReserveA, reserves.crossChainReserveB);
-    }
-
-    function getFallbackReserves() external view returns (uint256 reserveA, uint256 reserveB, uint256 fallbackTotalLiquidity) {
-    return (fallbackReserves.reserveA, fallbackReserves.reserveB, fallbackReserves.totalLiquidity);
-    }
-
-    function getFeeConfig(uint16 chainId) external view returns (uint256 baseFee, uint256 maxFee, uint256 volatilityMultiplier) {
-        FeeConfig memory config = chainFees[chainId];
-        return (config.baseFee, config.maxFee, config.volatilityMultiplier);
-    }
-
-    function getLiquidityBalance(address provider) external view returns (uint256) {
-        return liquidityBalance[provider];
-    }
-
-    function getFallbackLiquidityBalance(address provider) external view returns (uint256) {
-        return fallbackLiquidityBalance[provider];
-    }
-
-    function getLPFees(address provider, address token) external view returns (uint256) {
-        return lpFees[provider][token];
-    }
-
-    function getChainTimelock(uint16 chainId) external view returns (uint256) {
-        return chainTimelocks[chainId];
-    }
-
-    function getTrustedRemotePool(uint16 chainId) external view returns (bytes memory) {
-        return trustedRemotePools[chainId];
-    }
-
-    function getTokenBridgeType(address token) external view returns (uint8) {
-        return tokenBridgeType[token];
-    }
-
-    function getCrossChainMessenger(uint8 messengerType) external view returns (address) {
-        return crossChainMessengers[messengerType];
-    }
-
-    function getChainIdMapping(uint16 chainId) external view returns (string memory) {
-        return chainIdToAxelarChain[chainId];
-    }
-
-    function getWormholeTrustedSender(uint16 chainId) external view returns (bytes32) {
-        return wormholeTrustedSenders[chainId];
-    }
-
-    function getFailedMessage(uint256 messageId) external view returns (
-        uint16 dstChainId,
-        string memory dstAxelarChain,
-        bytes memory payload,
-        bytes memory adapterParams,
-        uint256 retries,
-        uint256 timestamp,
-        uint8 messengerType,
-        uint256 nextRetryTimestamp
-    ) {
-        FailedMessage memory message = failedMessages[messageId];
-        return (
-            message.dstChainId,
-            message.dstAxelarChain,
-            message.payload,
-            message.adapterParams,
-            message.retries,
-            message.timestamp,
-            message.messengerType,
-            message.nextRetryTimestamp
-        );
-    }
-
-    function getGovernanceProposal(uint256 proposalId) external view returns (
-        address target,
-        bytes memory data,
-        uint256 proposedAt,
-        bool executed
-    ) {
-        GovernanceProposal memory proposal = governanceProposals[proposalId];
-        return (proposal.target, proposal.data, proposal.proposedAt, proposal.executed);
-    }
-
-    // --- IERC721Receiver Implementation ---
-
-    function onERC721Received(
-        address,
-        address,
-        uint256,
-        bytes calldata
-    ) external pure override returns (bytes4) {
-        return this.onERC721Received.selector;
-    }
-
-    // --- Configuration Functions ---
-
     function updateTrustedRemotePool(uint16 chainId, bytes calldata poolAddress) external onlyGovernance {
         if (poolAddress.length == 0) revert InvalidAddress(address(0), "Invalid pool address");
         trustedRemotePools[chainId] = poolAddress;
@@ -1920,6 +2038,25 @@ contract AMMPool is
         if (bridgeType == 0) revert InvalidBridgeType(bridgeType);
         tokenBridgeType[token] = bridgeType;
         emit TokenBridgeTypeUpdated(token, bridgeType);
+    }
+
+    function updateTargetReserveRatio(uint256 newRatio) external onlyGovernance {
+        if (newRatio == 0) revert InvalidReserveRatio(newRatio);
+        targetReserveRatio = newRatio;
+        emit TargetReserveRatioUpdated(newRatio);
+    }
+
+    function updatePriceOracle(address newPrimaryOracle, address[] calldata newFallbackOracles) external onlyGovernance {
+        if (newPrimaryOracle == address(0)) revert InvalidAddress(newPrimaryOracle, "Invalid oracle address");
+        primaryPriceOracle = newPrimaryOracle;
+        fallbackPriceOracles = newFallbackOracles;
+        emit PriceOracleUpdated(newPrimaryOracle, newFallbackOracles);
+    }
+
+    function updateEmaPeriod(uint256 newPeriod) external onlyGovernance {
+        if (newPeriod == 0) revert InvalidTimelock(newPeriod);
+        emaPeriod = newPeriod;
+        emit EmaPeriodUpdated(newPeriod);
     }
 
     function updateCrossChainMessenger(uint8 messengerType, address newMessenger) external onlyGovernance {
@@ -1942,52 +2079,31 @@ contract AMMPool is
     }
 
     function updateWormholeTrustedSender(uint16 chainId, bytes32 senderAddress) external onlyGovernance {
-        if (senderAddress == bytes32(0)) revert InvalidAddress(address(0), "Invalid sender address");
         wormholeTrustedSenders[chainId] = senderAddress;
         emit WormholeTrustedSenderUpdated(chainId, senderAddress);
     }
 
-    function updateChainTimelock(uint16 chainId, uint256 newTimelock) external onlyGovernance {
-        if (newTimelock < MIN_TIMELOCK || newTimelock > MAX_TIMELOCK) revert InvalidTimelock(newTimelock);
-        chainTimelocks[chainId] = newTimelock;
-        emit ChainTimelockUpdated(chainId, newTimelock);
-    }
+    function emergencyWithdraw() external nonReentrant {
+        if (!paused) revert InvalidOperation("Contract not paused");
+        uint256 liquidity = liquidityBalance[msg.sender];
+        if (liquidity == 0) revert InvalidAmount(0, 0);
 
-    function updateTargetReserveRatio(uint256 newRatio) external onlyGovernance {
-        if (newRatio == 0) revert InvalidReserveRatio(newRatio);
-        targetReserveRatio = newRatio;
-        emit TargetReserveRatioUpdated(newRatio);
-    }
+        uint256 amountA = (liquidity * reserves.reserveA) / totalLiquidity;
+        uint256 amountB = (liquidity * reserves.reserveB) / totalLiquidity;
 
-    function updatePriceOracle(address newPrimaryOracle, address[] calldata newFallbackOracles) external onlyGovernance {
-        if (newPrimaryOracle == address(0)) revert InvalidAddress(newPrimaryOracle, "Invalid oracle address");
-        bool hasValidOracle;
-        for (uint256 i = 0; i < newFallbackOracles.length; i++) {
-            if (newFallbackOracles[i] != address(0)) {
-                hasValidOracle = true;
-                break;
-            }
+        unchecked {
+            liquidityBalance[msg.sender] -= liquidity;
+            totalLiquidity -= liquidity;
+            reserves.reserveA -= uint64(amountA);
+            reserves.reserveB -= uint64(amountB);
         }
-        if (!hasValidOracle) revert InvalidAddress(address(0), "No valid fallback oracle");
-        primaryPriceOracle = newPrimaryOracle;
-        fallbackPriceOracles = newFallbackOracles;
-        emit PriceOracleUpdated(newPrimaryOracle, newFallbackOracles);
+
+        IERC20Upgradeable(tokenA).safeTransfer(msg.sender, amountA);
+        IERC20Upgradeable(tokenB).safeTransfer(msg.sender, amountB);
+        emit EmergencyWithdrawal(msg.sender, amountA, amountB);
     }
 
-    function updateEmaPeriod(uint256 newPeriod) external onlyGovernance {
-        if (newPeriod == 0) revert InvalidAmount(newPeriod, 0);
-        emaPeriod = newPeriod;
-        emit EmaPeriodUpdated(newPeriod);
-    }
-
-    function updateVolatilityThreshold(uint256 newThreshold) external onlyGovernance {
-        if (newThreshold == 0) revert InvalidAmount(newThreshold, 0);
-        volatilityThreshold = newThreshold;
-        emit VolatilityThresholdUpdated(newThreshold);
-    }
-
-    function proposeGovernanceAction(address target, bytes calldata data) external onlyGovernance returns (uint256 proposalId) {
-        if (target == address(0)) revert InvalidAddress(target, "Invalid target address");
+    function proposeGovernanceChange(address target, bytes calldata data) external onlyGovernance returns (uint256 proposalId) {
         proposalId = proposalCount++;
         governanceProposals[proposalId] = GovernanceProposal({
             target: target,
@@ -2008,34 +2124,156 @@ contract AMMPool is
         proposal.executed = true;
         (bool success,) = proposal.target.call(proposal.data);
         if (!success) revert GovernanceProposalFailed();
+
         emit GovernanceProposalExecuted(proposalId);
     }
 
-    function recoverFailedMessage(uint256 messageId, address recipient) external onlyGovernance {
-    FailedMessage storage message = failedMessages[messageId];
-    if (message.timestamp == 0) revert MessageNotFound(messageId);
-    if (recipient == address(0)) revert InvalidAddress(recipient, "Invalid recipient address");
+    function rebalanceReserves(uint16 chainId) external onlyGovernance {
+        if (trustedRemotePools[chainId].length == 0) revert InvalidChainId(chainId);
 
-    (
-        address provider,
-        uint256 amountA,
-        uint256 amountB,
-        uint64 nonce,
-        uint256 timelock,
-        bool isConcentrated,
+        uint256 reserveA = reserves.reserveA;
+        uint256 reserveB = reserves.reserveB;
+        uint256 currentRatio = (reserveA * 1e18) / reserveB;
+        if (currentRatio == targetReserveRatio) return;
+
+        uint256 amountA;
+        uint256 amountB;
+        if (currentRatio > targetReserveRatio) {
+            amountA = (reserveA - (reserveB * targetReserveRatio) / 1e18) / 2;
+            amountB = 0;
+        } else {
+            amountB = (reserveB - (reserveA * 1e18) / targetReserveRatio) / 2;
+            amountA = 0;
+        }
+
+        if (amountA > 0) {
+            _bridgeTokens(tokenA, amountA, address(this), chainId);
+            unchecked {
+                reserves.reserveA -= uint64(amountA);
+            }
+        } else if (amountB > 0) {
+            _bridgeTokens(tokenB, amountB, address(this), chainId);
+            unchecked {
+                reserves.reserveB -= uint64(amountB);
+            }
+        }
+
+        bytes memory payload = abi.encode(amountA, amountB, _getNonce(chainId, 0));
+        _sendCrossChainMessage(
+            chainId,
+            chainIdToAxelarChain[chainId],
+            trustedRemotePools[chainId],
+            payload,
+            "",
+            _getNonce(chainId, 0),
+            _getDynamicTimelock(chainId),
+            _getMessengerType()
+        );
+
+        emit ReservesRebalanced(chainId, amountA, amountB, _getMessengerType());
+    }
+
+    // --- View Functions ---
+
+    function getPosition(uint256 positionId) external view returns (
+        address owner,
         int24 tickLower,
         int24 tickUpper,
-        address receivedTokenA,
-        address receivedTokenB
-    ) = abi.decode(message.payload, (address, uint256, uint256, uint64, uint256, bool, int24, int24, address, address));
-
-    if (amountA > 0) IERC20Upgradeable(tokenA).safeTransfer(recipient, amountA);
-    if (amountB > 0) IERC20Upgradeable(tokenB).safeTransfer(recipient, amountB);
-
-    delete failedMessages[messageId];
-    unchecked {
-        failedMessageCount--;
+        uint256 liquidity,
+        uint256 tokensOwed0,
+        uint256 tokensOwed1
+    ) {
+        Position storage position = positions[positionId];
+        return (
+            position.owner,
+            position.tickLower,
+            position.tickUpper,
+            position.liquidity,
+            position.tokensOwed0,
+            position.tokensOwed1
+        );
     }
-    emit FailedMessageRecovered(messageId, recipient);
+
+    function getReserves() external view returns (uint64 reserveA, uint64 reserveB) {
+        return (reserves.reserveA, reserves.reserveB);
     }
+
+    function getCrossChainReserves() external view returns (uint128 reserveA, uint128 reserveB) {
+        return (reserves.crossChainReserveA, reserves.crossChainReserveB);
+    }
+
+    function getFallbackReserves() external view returns (uint256 reserveA, uint256 reserveB, uint256 fallbackTotalLiquidity) {
+        return (fallbackReserves.reserveA, fallbackReserves.reserveB, fallbackReserves.totalLiquidity);
+    }
+
+    function getVolatilityThreshold() external view override returns (uint256) {
+    return volatilityThreshold;
+    }
+
+    function getLiquidityBalance(address provider) external view returns (uint256) {
+        return liquidityBalance[provider];
+    }
+
+    function getFallbackLiquidityBalance(address provider) external view returns (uint256) {
+        return fallbackLiquidityBalance[provider];
+    }
+
+    function getLPFees(address provider, address token) external view returns (uint256) {
+        return lpFees[provider][token];
+    }
+
+    function isInFallbackPool(uint256 positionId) external view returns (bool) {
+        return inFallbackPool[positionId];
+    }
+
+    function getChainFeeConfig(uint16 chainId) external view returns (uint256 baseFee, uint256 maxFee, uint256 volatilityMultiplier) {
+        FeeConfig storage config = chainFees[chainId];
+        return (config.baseFee, config.maxFee, config.volatilityMultiplier);
+    }
+
+    function getFailedMessage(uint256 messageId) external view returns (
+        uint16 dstChainId,
+        string memory dstAxelarChain,
+        bytes memory payload,
+        bytes memory adapterParams,
+        uint256 retries,
+        uint256 timestamp,
+        uint8 messengerType,
+        uint256 nextRetryTimestamp
+    ) {
+        FailedMessage storage message = failedMessages[messageId];
+        return (
+            message.dstChainId,
+            message.dstAxelarChain,
+            message.payload,
+            message.adapterParams,
+            message.retries,
+            message.timestamp,
+            message.messengerType,
+            message.nextRetryTimestamp
+        );
+    }
+
+    function getGovernanceProposal(uint256 proposalId) external view returns (
+        address target,
+        bytes memory data,
+        uint256 proposedAt,
+        bool executed
+    ) {
+        GovernanceProposal storage proposal = governanceProposals[proposalId];
+        return (proposal.target, proposal.data, proposal.proposedAt, proposal.executed);
+    }
+
+    function getPriceHistory() external view returns (uint256[] memory) {
+        return priceHistory;
+    }
+
+    function getAmplificationFactor() external view returns (uint256) {
+        return amplificationFactor;
+    }
+
+    function getTickSpacing() external view returns (uint24) {
+        return TICK_SPACING;
+    }
+
 }

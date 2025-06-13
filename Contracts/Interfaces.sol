@@ -45,7 +45,7 @@ interface IAMMPool {
     function MAX_RETRIES() external view returns (uint256);
     function authorizeAdjuster(uint256 positionId, address adjuster) external;
     function collectFees(uint256 positionId) external;
-    function inFallbackPool(uint256 positionId) external view returns (bool);
+    function isInFallbackPool(uint256 positionId) external view returns (bool);
     function batchCrossChainMessages(uint16 dstChainId, bytes memory payload, bytes memory adapterParams) external payable;
     function exitFallbackPool(uint256 positionId) external;
     function trustedRemotePools(uint16 chainId) external view returns (bytes memory);
@@ -53,10 +53,21 @@ interface IAMMPool {
     function governance() external view returns (address);
     function emaVolatility() external view returns (uint256);
     function emaVol() external view returns (uint256);
-    function volatilityThreshold() external view returns (uint24);
     function getReserves() external view returns (uint64 reserveA, uint64 reserveB);
     function TICK_SPACING() external view returns (uint24);
     event PositionCreated(uint256 indexed positionId, address indexed owner, int24 tickLower, int24 tickUpper, uint256 liquidity);
+    event VolatilityThresholdUpdated(uint256 newThreshold);
+    function getVolatilityThreshold() external view returns (uint256);
+    function volatilityThreshold() external view returns (uint256);
+    function updateVolatilityThreshold(uint256 newThreshold) external;
+    function batchCrossChainMessages(
+        uint16[] calldata dstChainIds,
+        string[] calldata dstAxelarChains,
+        bytes[] calldata payloads,
+        bytes[] calldata adapterParams,
+        uint256[] calldata timelocks
+    ) external payable;
+    function getTickSpacing() external view returns (uint24);
 }
 
 interface IPositionManager {

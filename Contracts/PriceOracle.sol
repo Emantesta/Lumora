@@ -3,6 +3,7 @@ pragma solidity ^0.8.24;
 
 import {Initializable} from "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
 import {UUPSUpgradeable} from "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
+import {ConfirmedOwnerWithProposal} from "@chainlink/contracts/src/v0.8/shared/access/ConfirmedOwnerWithProposal.sol";
 import {OwnableUpgradeable} from "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
 import {ReentrancyGuardUpgradeable} from "@openzeppelin/contracts-upgradeable/security/ReentrancyGuardUpgradeable.sol";
 import {PausableUpgradeable} from "@openzeppelin/contracts-upgradeable/security/PausableUpgradeable.sol";
@@ -207,23 +208,36 @@ contract PriceOracle is
         emit VRFConfigUpdated(_vrfCoordinator, _subscriptionId, _keyHash);
     }
 
+        // Override _transferOwnership to use OwnableUpgradeable's implementation
     function _transferOwnership(address newOwner) internal override(OwnableUpgradeable, ConfirmedOwnerWithProposal) {
-    OwnableUpgradeable._transferOwnership(newOwner);
+        OwnableUpgradeable._transferOwnership(newOwner);
     }
 
+    // Override owner to return OwnableUpgradeable's owner
     function owner() public view override(OwnableUpgradeable, ConfirmedOwnerWithProposal) returns (address) {
-    return OwnableUpgradeable.owner();
+        return OwnableUpgradeable.owner();
     }
 
+    // Override transferOwnership to use OwnableUpgradeable's implementation
     function transferOwnership(address newOwner) public override(OwnableUpgradeable, ConfirmedOwnerWithProposal) onlyOwner {
-    OwnableUpgradeable.transferOwnership(newOwner);
+        OwnableUpgradeable.transferOwnership(newOwner);
     }
 
+    // Disable proposeOwner from ConfirmedOwnerWithProposal
+    function proposeOwner(address proposedOwner) public override(ConfirmedOwnerWithProposal) onlyOwner {
+        revert("Propose owner not supported; use transferOwnership instead");
+    }
+
+    // Disable acceptOwnership from ConfirmedOwnerWithProposal
+    function acceptOwnership() public override(ConfirmedOwnerWithProposal) {
+        revert("Accept ownership not supported; use transferOwnership instead");
+    }
+
+    // Override onlyOwner modifier to use OwnableUpgradeable's logic
     modifier onlyOwner() override(OwnableUpgradeable, ConfirmedOwnerWithProposal) {
-    OwnableUpgradeable.onlyOwner();
-    _;
+        OwnableUpgradeable.onlyOwner();
+        _;
     }
-
     /// @notice Updates VRF configuration
     function updateVRFConfig(
         address _vrfCoordinator,
