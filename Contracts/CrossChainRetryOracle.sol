@@ -3,7 +3,8 @@ pragma solidity ^0.8.24;
 
 import {CCIPReceiver} from "@chainlink/contracts-ccip/src/v0.8/ccip/applications/CCIPReceiver.sol";
 import {Client} from "@chainlink/contracts-ccip/src/v0.8/ccip/libraries/Client.sol";
-import {ChainlinkClient, Chainlink} from "@chainlink/contracts/src/v0.8/ChainlinkClient.sol";
+import {ChainlinkClient} from "@chainlink/contracts/src/v0.8/ChainlinkClient.sol";
+import {Chainlink} from "@chainlink/contracts/src/v0.8/Chainlink.sol";
 import {OwnableUpgradeable} from "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
 import {Initializable} from "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
 import {UUPSUpgradeable} from "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
@@ -14,7 +15,6 @@ import {VRFConsumerBaseV2} from "@chainlink/contracts/src/v0.8/vrf/VRFConsumerBa
 import {VRFCoordinatorV2Interface} from "@chainlink/contracts/src/v0.8/interfaces/VRFCoordinatorV2Interface.sol";
 import {AutomationCompatibleInterface} from "@chainlink/contracts/src/v0.8/interfaces/AutomationCompatibleInterface.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
-import {Strings} from "@openzeppelin/contracts/utils/Strings.sol";
 
 /// @title CrossChainRetryOracle - A secure, upgradeable oracle with Chainlink integrations
 /// @notice Manages cross-chain network status using CCIP, Chainlink Nodes, Price Feeds, VRF, and Automation.
@@ -31,7 +31,6 @@ contract CrossChainRetryOracle is
     AutomationCompatibleInterface
 {
     using Chainlink for Chainlink.Request;
-    using Strings for uint256;
 
     /// @notice Network status for a destination chain
     struct NetworkStatus {
@@ -41,7 +40,7 @@ contract CrossChainRetryOracle is
         bool bridgeOperational; // Bridge operational status
         uint32 recommendedRetryDelay; // Recommended retry delay in seconds
         bool retryRecommended; // Whether retry is recommended
-        uint64 lastUpdated; // Timestamp of last update
+        uint256 lastUpdated; // Timestamp of last update
         uint64 randomRetryDelay; // Randomized retry delay from VRF
         int256 lastGasPrice; // Last fetched gas price (normalized)
         int256 lastTokenPrice; // Last fetched token price (normalized)
@@ -73,18 +72,19 @@ contract CrossChainRetryOracle is
 
     /// @notice Chainlink request metadata
     struct RequestMetadata {
-        uint16 chainId;
-        uint64 requestTime;
+        uint64 chainId;
+        uint256 requestTime;
         bool isPriceFeedRequest; // True for price feed, false for status
     }
 
     // Storage
-    mapping(uint16 => NetworkStatus) public networkStatuses;
-    mapping(uint16 => ChainConfig) public chainConfigs;
+    mapping(uint64 => NetworkStatus) public networkStatuses;
+    mapping(uint64 => ChainConfig) public chainConfigs;
     mapping(bytes32 => RequestMetadata) private requestMetadata; // Chainlink Node requests
-    mapping(uint256 => uint16) private vrfRequestIdToChainId; // VRF requests
-    mapping(uint16 => uint256) public chainHeartbeats; // Max staleness per chain
-    uint16[] public activeChainIds; // List of active chain IDs
+    mapping(uint256 => uint64) private vrfRequestIdToChainId; // VRF requests
+    mapping(uint64 => uint256) public chainHeartbeats; // Max staleness per chain
+    mapping(uint64 => bool) private activeChainIdsMap; // Mapping for active chain IDs
+    uint64[] public activeChainIds; // List of active chain IDs
     address public chainlinkToken; // LINK token address
     address public chainlinkOracle; // Chainlink Node oracle address
     uint256 public maxRetryDelay; // Maximum retry delay (seconds)
@@ -129,21 +129,22 @@ contract CrossChainRetryOracle is
     uint256 private constant MIN_UPDATE_INTERVAL = 300; // 5 minutes
     uint256 private constant DEFAULT_REQUEST_TIMEOUT = 1 hours;
     uint8 private constant NORMALIZED_DECIMALS = 18; // Normalize prices to 18 decimals
+    bytes32 private constant DEFAULT_VRF_KEY_HASH = bytes32(uint256(keccak256(abi.encode("default_key_hash")))); // Default VRF key hash
 
     // Custom errors
-    error InvalidChainId(uint16 chainId);
+    error InvalidChainId(uint64 chainId);
     error InvalidSender(bytes sender);
     error InvalidGasPrice(uint64 gasPrice);
     error InvalidConfirmationTime(uint32 confirmationTime);
     error InvalidCongestionLevel(uint8 congestionLevel);
-    error StaleData(uint16 chainId, uint64 lastUpdated);
-    error ChainNotConfigured(uint16 chainId);
+    error StaleData(uint64 chainId, uint256 lastUpdated);
+    error ChainNotConfigured(uint64 chainId);
     error InvalidRequestId(bytes32 requestId);
     error InsufficientLink(uint256 balance, uint256 required);
     error InvalidHeartbeat(uint256 heartbeat);
     error InvalidConfig(address gasPriceFeed, address tokenPriceFeed, bytes trustedSender);
     error InvalidHeartbeatBounds(uint256 minHeartbeat, uint256 maxHeartbeat);
-    error PriceFeedFailed(uint16 chainId, bool isGasPrice);
+    error PriceFeedFailed(uint64 chainId, bool isGasPrice);
     error InvalidVrfConfig(address coordinator, uint64 subscriptionId);
     error InvalidRandomRetryDelayBounds(uint32 minDelay, uint32 maxDelay);
     error InvalidVrfRequestId(uint256 requestId);
@@ -153,17 +154,21 @@ contract CrossChainRetryOracle is
     error AutomationNotRegistered();
     error RequestTimedOut(bytes32 requestId);
     error InvalidPriceFeedDecimals(uint8 decimals);
-    error ChainAlreadyConfigured(uint16 chainId);
-    error ChainNotFound(uint16 chainId);
+    error ChainAlreadyConfigured(uint64 chainId);
+    error ChainNotFound(uint64 chainId);
+    error InvalidRetryDelay(uint32 retryDelay);
+    error InvalidRecipient(address recipient);
+    error InsufficientBalance(address token, uint256 balance, uint256 required);
+    error InsufficientLinkForRequests(uint256 balance, uint256 required);
 
     // Events
-    event NetworkStatusUpdated(uint16 indexed chainId, NetworkStatus status);
-    event StatusRequested(uint16 indexed chainId, bytes32 indexed requestId);
-    event StatusRequestFulfilled(uint16 indexed chainId, bytes32 indexed requestId);
-    event PriceFeedRequested(uint16 indexed chainId, bytes32 indexed requestId);
-    event PriceFeedRequestFulfilled(uint16 indexed chainId, bytes32 indexed requestId, int256 gasPrice, int256 tokenPrice);
+    event NetworkStatusUpdated(uint64 indexed chainId, NetworkStatus status);
+    event StatusRequested(uint64 indexed chainId, bytes32 indexed requestId);
+    event StatusRequestFulfilled(uint64 indexed chainId, bytes32 indexed requestId);
+    event PriceFeedRequested(uint64 indexed chainId, bytes32 indexed requestId);
+    event PriceFeedRequestFulfilled(uint64 indexed chainId, bytes32 indexed requestId, int256 gasPrice, int256 tokenPrice);
     event ChainConfigUpdated(
-        uint16 indexed chainId,
+        uint64 indexed chainId,
         address gasPriceFeed,
         uint8 gasPriceFeedDecimals,
         address tokenPriceFeed,
@@ -178,39 +183,47 @@ contract CrossChainRetryOracle is
         uint256 priceFeedUpdateInterval,
         uint256 automationFee
     );
-    event HeartbeatUpdated(uint16 indexed chainId, uint256 heartbeat);
+    event HeartbeatUpdated(uint64 indexed chainId, uint256 heartbeat);
     event ChainlinkConfigUpdated(address chainlinkToken, address chainlinkOracle);
     event FallbackPriceFeedsToggled(bool enabled);
     event MaxRetryDelayUpdated(uint256 maxRetryDelay);
     event GasPriceBoundsUpdated(uint256 minGasPrice, uint256 maxGasPrice);
     event HeartbeatBoundsUpdated(uint256 minHeartbeat, uint256 maxHeartbeat);
     event MaxFallbackRetriesUpdated(uint8 maxRetries);
-    event BatchNetworkStatusUpdated(uint16[] chainIds);
+    event BatchNetworkStatusUpdated(uint64[] chainIds);
     event VrfConfigUpdated(address coordinator, uint64 subscriptionId, bytes32 keyHash, uint32 callbackGasLimit, uint16 requestConfirmations);
-    event RandomRetryDelayRequested(uint16 indexed chainId, uint256 indexed requestId);
-    event RandomRetryDelayFulfilled(uint16 indexed chainId, uint256 indexed requestId, uint32 randomDelay);
+    event RandomRetryDelayRequested(uint64 indexed chainId, uint256 indexed requestId);
+    event RandomRetryDelayFulfilled(uint64 indexed chainId, uint256 indexed requestId, uint32 randomDelay);
     event RandomRetryDelayBoundsUpdated(uint32 minDelay, uint32 maxDelay);
     event DefaultPricesUpdated(int256 defaultGasPrice, int256 defaultTokenPrice);
     event AutomationConfigUpdated(address registrar, uint256 upkeepId, bytes32 statusJobId, bytes32 priceFeedJobId);
     event AutomationTasksPerformed(
-        uint16[] statusChainIds,
+        uint64[] statusChainIds,
         bytes32[] statusRequestIds,
-        uint16[] randomDelayChainIds,
+        uint64[] randomDelayChainIds,
         uint256[] vrfRequestIds,
-        uint16[] priceFeedChainIds,
+        uint64[] priceFeedChainIds,
         bytes32[] priceFeedRequestIds
     );
     event RequestCancelled(bytes32 indexed requestId);
-    event ActiveChainIdsUpdated(uint16[] chainIds);
+    event ActiveChainIdsUpdated(uint64[] chainIds);
     event RequestTimeoutUpdated(uint256 timeout);
+    event AssetsRecovered(address indexed token, uint256 amount, address indexed recipient);
 
-    /// @notice Constructor to disable initializers
+    /// @notice Constructor to disable initializers and set immutable VRF coordinator
+    /// @param router CCIP router address
+    /// @param vrfCoordinator VRF coordinator address
     constructor(address router, address vrfCoordinator) CCIPReceiver(router) VRFConsumerBaseV2(vrfCoordinator) {
         require(vrfCoordinator != address(0), "Invalid VRF coordinator");
         _disableInitializers();
     }
 
     /// @notice Initialize the contract
+    /// @param _router CCIP router address
+    /// @param _chainlinkToken LINK token address
+    /// @param _chainlinkOracle Chainlink Node oracle address
+    /// @param _vrfCoordinator VRF coordinator address
+    /// @param _vrfSubscriptionId VRF subscription ID
     function initialize(
         address _router,
         address _chainlinkToken,
@@ -240,7 +253,7 @@ contract CrossChainRetryOracle is
         maxHeartbeat = DEFAULT_MAX_HEARTBEAT;
         maxFallbackRetries = DEFAULT_MAX_FALLBACK_RETRIES;
         vrfSubscriptionId = _vrfSubscriptionId;
-        vrfKeyHash = bytes32(0);
+        vrfKeyHash = DEFAULT_VRF_KEY_HASH;
         vrfCallbackGasLimit = DEFAULT_VRF_CALLBACK_GAS_LIMIT;
         vrfRequestConfirmations = DEFAULT_VRF_REQUEST_CONFIRMATIONS;
         minRandomRetryDelay = DEFAULT_MIN_RANDOM_RETRY_DELAY;
@@ -262,15 +275,13 @@ contract CrossChainRetryOracle is
     }
 
     /// @notice Receive network status via CCIP, supporting batch updates
+    /// @param message The CCIP message containing network status data
     function _ccipReceive(Client.Any2EVMMessage memory message) internal override nonReentrant whenNotPaused {
-        uint16[] memory chainIds;
-        NetworkStatus[] memory statuses;
+        (uint64[] memory chainIds, NetworkStatus[] memory statuses) = _decodeBatchMessage(message.data);
 
-        try this._decodeBatchMessage(message.data) returns (uint16[] memory _chainIds, NetworkStatus[] memory _statuses) {
-            chainIds = _chainIds;
-            statuses = _statuses;
-        } catch {
-            uint16 chainId = message.destChainId;
+        if (chainIds.length == 0) {
+            // Single chain update
+            uint64 chainId = uint64(message.destChainSelector);
             ChainConfig storage config = chainConfigs[chainId];
             if (!config.active) revert ChainNotConfigured(chainId);
             if (keccak256(message.sender) != keccak256(config.trustedSender)) revert InvalidSender(message.sender);
@@ -286,76 +297,94 @@ contract CrossChainRetryOracle is
 
             _validateStatus(gasPrice, confirmationTime, congestionLevel, recommendedRetryDelay);
 
-            NetworkStatus memory status = NetworkStatus({
-                gasPrice: gasPrice,
-                confirmationTime: confirmationTime,
-                congestionLevel: congestionLevel,
-                bridgeOperational: bridgeOperational,
-                recommendedRetryDelay: recommendedRetryDelay,
-                retryRecommended: retryRecommended,
-                lastUpdated: uint64(block.timestamp),
-                randomRetryDelay: networkStatuses[chainId].randomRetryDelay == 0 ? minRandomRetryDelay : networkStatuses[chainId].randomRetryDelay,
-                lastGasPrice: networkStatuses[chainId].lastGasPrice,
-                lastTokenPrice: networkStatuses[chainId].lastTokenPrice
-            });
+            NetworkStatus storage status = networkStatuses[chainId];
+            status.gasPrice = gasPrice;
+            status.confirmationTime = confirmationTime;
+            status.congestionLevel = congestionLevel;
+            status.bridgeOperational = bridgeOperational;
+            status.recommendedRetryDelay = recommendedRetryDelay;
+            status.retryRecommended = retryRecommended;
+            status.lastUpdated = block.timestamp;
+            status.randomRetryDelay = status.randomRetryDelay == 0 ? minRandomRetryDelay : status.randomRetryDelay;
 
-            networkStatuses[chainId] = status;
             emit NetworkStatusUpdated(chainId, status);
             return;
         }
 
+        // Batch update
         for (uint256 i = 0; i < chainIds.length; i++) {
-            uint16 chainId = chainIds[i];
+            uint64 chainId = chainIds[i];
             ChainConfig storage config = chainConfigs[chainId];
             if (!config.active) revert ChainNotConfigured(chainId);
             if (keccak256(message.sender) != keccak256(config.trustedSender)) revert InvalidSender(message.sender);
 
-            NetworkStatus memory status = statuses[i];
-            _validateStatus(status.gasPrice, status.confirmationTime, status.congestionLevel, status.recommendedRetryDelay);
-            status.lastUpdated = uint64(block.timestamp);
-            status.randomRetryDelay = networkStatuses[chainId].randomRetryDelay == 0 ? minRandomRetryDelay : networkStatuses[chainId].randomRetryDelay;
-            status.lastGasPrice = networkStatuses[chainId].lastGasPrice;
-            status.lastTokenPrice = networkStatuses[chainId].lastTokenPrice;
-            networkStatuses[chainId] = status;
+            NetworkStatus memory newStatus = statuses[i];
+            _validateStatus(newStatus.gasPrice, newStatus.confirmationTime, newStatus.congestionLevel, newStatus.recommendedRetryDelay);
+            NetworkStatus storage status = networkStatuses[chainId];
+            status.gasPrice = newStatus.gasPrice;
+            status.confirmationTime = newStatus.confirmationTime;
+            status.congestionLevel = newStatus.congestionLevel;
+            status.bridgeOperational = newStatus.bridgeOperational;
+            status.recommendedRetryDelay = newStatus.recommendedRetryDelay;
+            status.retryRecommended = newStatus.retryRecommended;
+            status.lastUpdated = block.timestamp;
+            status.randomRetryDelay = status.randomRetryDelay == 0 ? minRandomRetryDelay : status.randomRetryDelay;
+
             emit NetworkStatusUpdated(chainId, status);
         }
         emit BatchNetworkStatusUpdated(chainIds);
     }
 
     /// @notice Decode batch message for multiple chain updates
-    function _decodeBatchMessage(bytes memory data) external pure returns (uint16[] memory chainIds, NetworkStatus[] memory statuses) {
-        (chainIds, statuses) = abi.decode(data, (uint16[], NetworkStatus[]));
+    /// @param data The encoded batch message data
+    /// @return chainIds Array of chain IDs
+    /// @return statuses Array of network statuses
+    function _decodeBatchMessage(bytes memory data) internal pure returns (uint64[] memory chainIds, NetworkStatus[] memory statuses) {
+        try abi.decode(data, (uint64[], NetworkStatus[])) returns (uint64[] memory _chainIds, NetworkStatus[] memory _statuses) {
+            return (_chainIds, _statuses);
+        } catch {
+            return (new uint64[](0), new NetworkStatus[](0));
+        }
     }
 
     /// @notice Request network status update via Chainlink Node
-    function requestNetworkStatusUpdate(uint16 chainId, bytes32 jobId, uint256 fee) public nonReentrant whenNotPaused returns (bytes32 requestId) {
+    /// @param chainId The target chain ID
+    /// @param jobId The Chainlink job ID
+    /// @param fee The LINK fee for the request
+    /// @return requestId The Chainlink request ID
+    function requestNetworkStatusUpdate(uint64 chainId, bytes32 jobId, uint256 fee) public nonReentrant whenNotPaused returns (bytes32 requestId) {
         if (!chainConfigs[chainId].active) revert ChainNotConfigured(chainId);
         uint256 linkBalance = IERC20(chainlinkToken).balanceOf(address(this));
         if (linkBalance < fee) revert InsufficientLink(linkBalance, fee);
 
         Chainlink.Request memory req = buildChainlinkRequest(jobId, address(this), this.fulfillNetworkStatus.selector);
-        req.add("chainId", chainId.toString());
+        req.add("chainId", _toString(chainId));
         requestId = sendChainlinkRequestTo(chainlinkOracle, req, fee);
-        requestMetadata[requestId] = RequestMetadata(chainId, uint64(block.timestamp), false);
+        requestMetadata[requestId] = RequestMetadata(chainId, block.timestamp, false);
 
         emit StatusRequested(chainId, requestId);
     }
 
     /// @notice Request price feed update via Chainlink Node
-    function requestPriceFeedUpdate(uint16 chainId, uint256 fee) public nonReentrant whenNotPaused returns (bytes32 requestId) {
+    /// @param chainId The target chain ID
+    /// @param fee The LINK fee for the request
+    /// @return requestId The Chainlink request ID
+    function requestPriceFeedUpdate(uint64 chainId, uint256 fee) public nonReentrant whenNotPaused returns (bytes32 requestId) {
         if (!chainConfigs[chainId].active) revert ChainNotConfigured(chainId);
         uint256 linkBalance = IERC20(chainlinkToken).balanceOf(address(this));
         if (linkBalance < fee) revert InsufficientLink(linkBalance, fee);
 
         Chainlink.Request memory req = buildChainlinkRequest(automationPriceFeedJobId, address(this), this.fulfillPriceFeedUpdate.selector);
-        req.add("chainId", chainId.toString());
+        req.add("chainId", _toString(chainId));
         requestId = sendChainlinkRequestTo(chainlinkOracle, req, fee);
-        requestMetadata[requestId] = RequestMetadata(chainId, uint64(block.timestamp), true);
+        requestMetadata[requestId] = RequestMetadata(chainId, block.timestamp, true);
 
         emit PriceFeedRequested(chainId, requestId);
     }
 
     /// @notice Fulfill Chainlink request with network status
+    /// @param requestId The Chainlink request ID
+    /// @param data The encoded network status data
     function fulfillNetworkStatus(bytes32 requestId, bytes memory data) external nonReentrant whenNotPaused {
         RequestMetadata memory meta = requestMetadata[requestId];
         if (meta.chainId == 0) revert InvalidRequestId(requestId);
@@ -373,27 +402,24 @@ contract CrossChainRetryOracle is
 
         _validateStatus(gasPrice, confirmationTime, congestionLevel, recommendedRetryDelay);
 
-        NetworkStatus memory status = NetworkStatus({
-            gasPrice: gasPrice,
-            confirmationTime: confirmationTime,
-            congestionLevel: congestionLevel,
-            bridgeOperational: bridgeOperational,
-            recommendedRetryDelay: recommendedRetryDelay,
-            retryRecommended: retryRecommended,
-            lastUpdated: uint64(block.timestamp),
-            randomRetryDelay: networkStatuses[meta.chainId].randomRetryDelay,
-            lastGasPrice: networkStatuses[meta.chainId].lastGasPrice,
-            lastTokenPrice: networkStatuses[meta.chainId].lastTokenPrice
-        });
+        NetworkStatus storage status = networkStatuses[meta.chainId];
+        status.gasPrice = gasPrice;
+        status.confirmationTime = confirmationTime;
+        status.congestionLevel = congestionLevel;
+        status.bridgeOperational = bridgeOperational;
+        status.recommendedRetryDelay = recommendedRetryDelay;
+        status.retryRecommended = retryRecommended;
+        status.lastUpdated = block.timestamp;
 
         _adjustHeartbeat(meta.chainId, congestionLevel);
-        networkStatuses[meta.chainId] = status;
         delete requestMetadata[requestId];
         emit StatusRequestFulfilled(meta.chainId, requestId);
         emit NetworkStatusUpdated(meta.chainId, status);
     }
 
     /// @notice Fulfill Chainlink request with price feed data
+    /// @param requestId The Chainlink request ID
+    /// @param data The encoded price feed data
     function fulfillPriceFeedUpdate(bytes32 requestId, bytes memory data) external nonReentrant whenNotPaused {
         RequestMetadata memory meta = requestMetadata[requestId];
         if (meta.chainId == 0) revert InvalidRequestId(requestId);
@@ -405,9 +431,10 @@ contract CrossChainRetryOracle is
         if (gasPrice <= 0 || tokenPrice <= 0) revert PriceFeedFailed(meta.chainId, true);
 
         NetworkStatus storage status = networkStatuses[meta.chainId];
-        status.lastGasPrice = _normalizePrice(gasPrice, chainConfigs[meta.chainId].gasPriceFeedDecimals);
-        status.lastTokenPrice = _normalizePrice(tokenPrice, chainConfigs[meta.chainId].tokenPriceFeedDecimals);
-        status.lastUpdated = uint64(block.timestamp);
+        ChainConfig storage config = chainConfigs[meta.chainId];
+        status.lastGasPrice = _normalizePrice(gasPrice, config.gasPriceFeedDecimals);
+        status.lastTokenPrice = _normalizePrice(tokenPrice, config.tokenPriceFeedDecimals);
+        status.lastUpdated = block.timestamp;
 
         _adjustHeartbeat(meta.chainId, status.congestionLevel);
         emit PriceFeedRequestFulfilled(meta.chainId, requestId, status.lastGasPrice, status.lastTokenPrice);
@@ -416,9 +443,11 @@ contract CrossChainRetryOracle is
     }
 
     /// @notice Request a random retry delay via Chainlink VRF
-    function requestRandomRetryDelay(uint16 chainId) public nonReentrant whenNotPaused returns (uint256 requestId) {
+    /// @param chainId The target chain ID
+    /// @return requestId The VRF request ID
+    function requestRandomRetryDelay(uint64 chainId) public nonReentrant whenNotPaused returns (uint256 requestId) {
         if (!chainConfigs[chainId].active) revert ChainNotConfigured(chainId);
-        if (vrfSubscriptionId == 0) revert InvalidVrfConfig(address(vrfCoordinator), vrfSubscriptionId);
+        if (vrfSubscriptionId == 0) revert InvalidVrfConfig(vrfCoordinator, vrfSubscriptionId);
 
         requestId = VRFCoordinatorV2Interface(vrfCoordinator).requestRandomWords(
             vrfKeyHash,
@@ -433,8 +462,10 @@ contract CrossChainRetryOracle is
     }
 
     /// @notice Fulfill VRF request with random words
+    /// @param requestId The VRF request ID
+    /// @param randomWords The random words provided by VRF
     function fulfillRandomWords(uint256 requestId, uint256[] memory randomWords) internal override nonReentrant whenNotPaused {
-        uint16 chainId = vrfRequestIdToChainId[requestId];
+        uint64 chainId = vrfRequestIdToChainId[requestId];
         if (chainId == 0) revert InvalidVrfRequestId(requestId);
         if (!chainConfigs[chainId].active) revert ChainNotConfigured(chainId);
 
@@ -442,8 +473,8 @@ contract CrossChainRetryOracle is
         uint32 randomDelay = minRandomRetryDelay + uint32(randomWords[0] % range);
 
         NetworkStatus storage status = networkStatuses[chainId];
-        status.randomRetryDelay = uint64(randomDelay);
-        status.lastUpdated = uint64(block.timestamp);
+        status.randomRetryDelay = randomDelay;
+        status.lastUpdated = block.timestamp;
 
         _adjustHeartbeat(chainId, status.congestionLevel);
         emit RandomRetryDelayFulfilled(chainId, requestId, randomDelay);
@@ -452,7 +483,9 @@ contract CrossChainRetryOracle is
     }
 
     /// @notice Get network status for a chain with price feed fallback
-    function getNetworkStatus(uint16 chainId) external view returns (NetworkStatus memory status) {
+    /// @param chainId The target chain ID
+    /// @return status The network status
+    function getNetworkStatus(uint64 chainId) external view returns (NetworkStatus memory status) {
         status = networkStatuses[chainId];
         if (status.lastUpdated == 0) revert ChainNotConfigured(chainId);
 
@@ -475,7 +508,10 @@ contract CrossChainRetryOracle is
     }
 
     /// @notice Get price feed data for a chain
-    function getPriceFeedData(uint16 chainId, bool isGasPrice) external view returns (PriceData memory priceData) {
+    /// @param chainId The target chain ID
+    /// @param isGasPrice True for gas price feed, false for token price feed
+    /// @return priceData The price feed data
+    function getPriceFeedData(uint64 chainId, bool isGasPrice) external view returns (PriceData memory priceData) {
         if (!chainConfigs[chainId].active) revert ChainNotConfigured(chainId);
         address priceFeed = isGasPrice ? chainConfigs[chainId].gasPriceFeed : chainConfigs[chainId].tokenPriceFeed;
         if (priceFeed == address(0)) revert InvalidPriceFeed(priceFeed);
@@ -485,7 +521,12 @@ contract CrossChainRetryOracle is
     }
 
     /// @notice Internal function to fetch price feed data with retry logic
-    function _getPriceFeedData(address priceFeed, bool isGasPrice, uint16 chainId, uint256 heartbeat)
+    /// @param priceFeed The price feed contract address
+    /// @param isGasPrice True for gas price feed, false for token price feed
+    /// @param chainId The target chain ID
+    /// @param heartbeat The maximum staleness for the price feed
+    /// @return priceData The price feed data
+    function _getPriceFeedData(address priceFeed, bool isGasPrice, uint64 chainId, uint256 heartbeat)
         private
         view
         returns (PriceData memory priceData)
@@ -512,32 +553,39 @@ contract CrossChainRetryOracle is
             updatedAt = block.timestamp;
             priceData = PriceData(price, updatedAt, false);
         } else {
-            priceData = PriceData(_normalizePrice(price, isGasPrice ? chainConfigs[chainId].gasPriceFeedDecimals : chainConfigs[chainId].tokenPriceFeedDecimals), updatedAt, true);
+            priceData = PriceData(
+                _normalizePrice(price, isGasPrice ? chainConfigs[chainId].gasPriceFeedDecimals : chainConfigs[chainId].tokenPriceFeedDecimals),
+                updatedAt,
+                true
+            );
         }
     }
 
     /// @notice Check if upkeep is needed for automated tasks
+    /// @param checkData Optional encoded chain ID to check a specific chain
+    /// @return upkeepNeeded True if upkeep is needed
+    /// @return performData Encoded data for performUpkeep
     function checkUpkeep(bytes calldata checkData) external view override returns (bool upkeepNeeded, bytes memory performData) {
-        uint16 chainId;
+        uint64 chainId;
         if (checkData.length > 0) {
-            chainId = abi.decode(checkData, (uint16));
+            chainId = abi.decode(checkData, (uint64));
         }
 
         uint256 linkBalance = IERC20(chainlinkToken).balanceOf(address(this));
-        uint16[] memory statusChainIds = new uint16[](activeChainIds.length);
-        uint16[] memory randomDelayChainIds = new uint16[](activeChainIds.length);
-        uint16[] memory priceFeedChainIds = new uint16[](activeChainIds.length);
+        uint64[] memory statusChainIds = new uint64[](activeChainIds.length);
+        uint64[] memory randomDelayChainIds = new uint64[](activeChainIds.length);
+        uint64[] memory priceFeedChainIds = new uint64[](activeChainIds.length);
         uint256 statusCount = 0;
         uint256 randomDelayCount = 0;
         uint256 priceFeedCount = 0;
 
-        uint16[] memory chainsToCheck = chainId == 0 ? activeChainIds : new uint16[](1);
+        uint64[] memory chainsToCheck = chainId == 0 ? activeChainIds : new uint64[](1);
         if (chainId != 0) {
             chainsToCheck[0] = chainId;
         }
 
         for (uint256 i = 0; i < chainsToCheck.length; i++) {
-            uint16 currentChainId = chainsToCheck[i];
+            uint64 currentChainId = chainsToCheck[i];
             if (!chainConfigs[currentChainId].active) continue;
 
             ChainConfig storage config = chainConfigs[currentChainId];
@@ -552,8 +600,7 @@ contract CrossChainRetryOracle is
                  block.timestamp >= status.lastUpdated + heartbeat ||
                  status.congestionLevel >= 8)
             ) {
-                statusChainIds[statusCount] = currentChainId;
-                statusCount++;
+                statusChainIds[statusCount++] = currentChainId;
             }
 
             // Check random delay updates
@@ -562,8 +609,7 @@ contract CrossChainRetryOracle is
                 block.timestamp >= status.lastUpdated + config.randomDelayUpdateInterval &&
                 vrfSubscriptionId != 0
             ) {
-                randomDelayChainIds[randomDelayCount] = currentChainId;
-                randomDelayCount++;
+                randomDelayChainIds[randomDelayCount++] = currentChainId;
             }
 
             // Check price feed updates
@@ -574,28 +620,29 @@ contract CrossChainRetryOracle is
                  status.lastGasPrice <= 0 ||
                  status.lastTokenPrice <= 0)
             ) {
-                priceFeedChainIds[priceFeedCount] = currentChainId;
-                priceFeedCount++;
+                priceFeedChainIds[priceFeedCount++] = currentChainId;
             }
         }
 
-        // Resize arrays to exact size
-        assembly {
-            mstore(statusChainIds, statusCount)
-            mstore(randomDelayChainIds, randomDelayCount)
-            mstore(priceFeedChainIds, priceFeedCount)
-        }
+        // Resize arrays
+        uint64[] memory finalStatusChainIds = new uint64[](statusCount);
+        uint64[] memory finalRandomDelayChainIds = new uint64[](randomDelayCount);
+        uint64[] memory finalPriceFeedChainIds = new uint64[](priceFeedCount);
+        for (uint256 i = 0; i < statusCount; i++) finalStatusChainIds[i] = statusChainIds[i];
+        for (uint256 i = 0; i < randomDelayCount; i++) finalRandomDelayChainIds[i] = randomDelayChainIds[i];
+        for (uint256 i = 0; i < priceFeedCount; i++) finalPriceFeedChainIds[i] = priceFeedChainIds[i];
 
         upkeepNeeded = statusCount > 0 || randomDelayCount > 0 || priceFeedCount > 0;
-        performData = abi.encode(statusChainIds, randomDelayChainIds, priceFeedChainIds);
+        performData = abi.encode(finalStatusChainIds, finalRandomDelayChainIds, finalPriceFeedChainIds);
     }
 
     /// @notice Perform upkeep tasks for automated updates
+    /// @param performData Encoded data from checkUpkeep
     function performUpkeep(bytes calldata performData) external override nonReentrant whenNotPaused {
         if (automationUpkeepId == 0) revert AutomationNotRegistered();
 
-        (uint16[] memory statusChainIds, uint16[] memory randomDelayChainIds, uint16[] memory priceFeedChainIds) = 
-            abi.decode(performData, (uint16[], uint16[], uint16[]));
+        (uint64[] memory statusChainIds, uint64[] memory randomDelayChainIds, uint64[] memory priceFeedChainIds) = 
+            abi.decode(performData, (uint64[], uint64[], uint64[]));
 
         bytes32[] memory statusRequestIds = new bytes32[](statusChainIds.length);
         uint256[] memory vrfRequestIds = new uint256[](randomDelayChainIds.length);
@@ -603,7 +650,7 @@ contract CrossChainRetryOracle is
 
         // Perform status updates
         for (uint256 i = 0; i < statusChainIds.length; i++) {
-            uint16 chainId = statusChainIds[i];
+            uint64 chainId = statusChainIds[i];
             ChainConfig storage config = chainConfigs[chainId];
             if (!config.active || !config.automateStatus) continue;
             statusRequestIds[i] = requestNetworkStatusUpdate(chainId, automationStatusJobId, config.automationFee);
@@ -611,7 +658,7 @@ contract CrossChainRetryOracle is
 
         // Perform random delay updates
         for (uint256 i = 0; i < randomDelayChainIds.length; i++) {
-            uint16 chainId = randomDelayChainIds[i];
+            uint64 chainId = randomDelayChainIds[i];
             ChainConfig storage config = chainConfigs[chainId];
             if (!config.active || !config.automateRandomDelay) continue;
             vrfRequestIds[i] = requestRandomRetryDelay(chainId);
@@ -619,7 +666,7 @@ contract CrossChainRetryOracle is
 
         // Perform price feed updates
         for (uint256 i = 0; i < priceFeedChainIds.length; i++) {
-            uint16 chainId = priceFeedChainIds[i];
+            uint64 chainId = priceFeedChainIds[i];
             ChainConfig storage config = chainConfigs[chainId];
             if (!config.active || !config.automatePriceFeeds) continue;
             priceFeedRequestIds[i] = requestPriceFeedUpdate(chainId, config.automationFee);
@@ -636,6 +683,7 @@ contract CrossChainRetryOracle is
     }
 
     /// @notice Cancel a timed-out Chainlink Node request
+    /// @param requestId The Chainlink request ID to cancel
     function cancelRequest(bytes32 requestId) external onlyOwner {
         RequestMetadata memory meta = requestMetadata[requestId];
         if (meta.chainId == 0) revert InvalidRequestId(requestId);
@@ -645,9 +693,53 @@ contract CrossChainRetryOracle is
         emit RequestCancelled(requestId);
     }
 
+    /// @notice Recover stuck ERC20 tokens or native tokens from the contract
+    /// @param token The token address (address(0) for native tokens)
+    /// @param amount The amount to recover
+    /// @param recipient The address to send the recovered assets to
+    function recoverAssets(address token, uint256 amount, address recipient) external onlyOwner nonReentrant {
+        if (recipient == address(0)) revert InvalidRecipient(recipient);
+        if (amount == 0) revert InsufficientBalance(token, 0, amount);
+
+        if (token == address(0)) {
+            // Recover native tokens (e.g., ETH)
+            uint256 balance = address(this).balance;
+            if (balance < amount) revert InsufficientBalance(token, balance, amount);
+            (bool success, ) = recipient.call{value: amount}("");
+            require(success, "Native token transfer failed");
+        } else {
+            // Recover ERC20 tokens
+            uint256 balance = IERC20(token).balanceOf(address(this));
+            if (balance < amount) revert InsufficientBalance(token, balance, amount);
+
+            // Ensure sufficient LINK remains for pending requests
+            if (token == chainlinkToken) {
+                uint256 requiredLink = _calculateRequiredLink();
+                if (balance - amount < requiredLink) revert InsufficientLinkForRequests(balance, requiredLink);
+            }
+
+            bool success = IERC20(token).transfer(recipient, amount);
+            require(success, "ERC20 token transfer failed");
+        }
+
+        emit AssetsRecovered(token, amount, recipient);
+    }
+
     /// @notice Update chain configuration
+    /// @param chainId The target chain ID
+    /// @param gasPriceFeed Chainlink gas price feed address
+    /// @param tokenPriceFeed Chainlink token price feed address
+    /// @param trustedSender Trusted CCIP sender address
+    /// @param active Whether the chain is active
+    /// @param automateStatus Enable automated status updates
+    /// @param automateRandomDelay Enable automated random delay updates
+    /// @param automatePriceFeeds Enable automated price feed updates
+    /// @param statusUpdateInterval Interval for status updates (seconds)
+    /// @param randomDelayUpdateInterval Interval for random delay updates (seconds)
+    /// @param priceFeedUpdateInterval Interval for price feed updates (seconds)
+    /// @param automationFee LINK fee for automated requests
     function updateChainConfig(
-        uint16 chainId,
+        uint64 chainId,
         address gasPriceFeed,
         address tokenPriceFeed,
         bytes calldata trustedSender,
@@ -660,8 +752,7 @@ contract CrossChainRetryOracle is
         uint256 priceFeedUpdateInterval,
         uint256 automationFee
     ) external onlyOwner {
-        if (active && (gasPriceFeed == address(0) && tokenPriceFeed == address(0) && trustedSender.length == 0))
-            revert InvalidConfig(gasPriceFeed, tokenPriceFeed, trustedSender);
+        if (active && trustedSender.length == 0) revert InvalidConfig(gasPriceFeed, tokenPriceFeed, trustedSender);
         if (statusUpdateInterval > 0 && statusUpdateInterval < MIN_UPDATE_INTERVAL) revert InvalidUpdateInterval(statusUpdateInterval);
         if (randomDelayUpdateInterval > 0 && randomDelayUpdateInterval < MIN_UPDATE_INTERVAL) revert InvalidUpdateInterval(randomDelayUpdateInterval);
         if (priceFeedUpdateInterval > 0 && priceFeedUpdateInterval < MIN_UPDATE_INTERVAL) revert InvalidUpdateInterval(priceFeedUpdateInterval);
@@ -689,12 +780,13 @@ contract CrossChainRetryOracle is
 
         // Update active chain IDs
         if (active && !wasActive) {
-            for (uint256 i = 0; i < activeChainIds.length; i++) {
-                if (activeChainIds[i] == chainId) revert ChainAlreadyConfigured(chainId);
-            }
+            if (activeChainIdsMap[chainId]) revert ChainAlreadyConfigured(chainId);
+            activeChainIdsMap[chainId] = true;
             activeChainIds.push(chainId);
             networkStatuses[chainId].randomRetryDelay = minRandomRetryDelay;
         } else if (!active && wasActive) {
+            if (!activeChainIdsMap[chainId]) revert ChainNotFound(chainId);
+            activeChainIdsMap[chainId] = false;
             for (uint256 i = 0; i < activeChainIds.length; i++) {
                 if (activeChainIds[i] == chainId) {
                     activeChainIds[i] = activeChainIds[activeChainIds.length - 1];
@@ -703,7 +795,6 @@ contract CrossChainRetryOracle is
                     break;
                 }
             }
-            if (chainConfigs[chainId].active) revert ChainNotFound(chainId); // Ensure removal
         }
 
         emit ChainConfigUpdated(
@@ -726,15 +817,18 @@ contract CrossChainRetryOracle is
     }
 
     /// @notice Update automation configuration
+    /// @param _registrar Chainlink Automation registrar address
+    /// @param _upkeepId Chainlink Automation upkeep ID
+    /// @param _statusJobId Job ID for automated status requests
+    /// @param _priceFeedJobId Job ID for automated price feed requests
     function updateAutomationConfig(
         address _registrar,
         uint256 _upkeepId,
         bytes32 _statusJobId,
         bytes32 _priceFeedJobId
     ) external onlyOwner {
-        require(_registrar != address(0), "Invalid registrar");
-        require(_statusJobId != bytes32(0), "Invalid status job ID");
-        require(_priceFeedJobId != bytes32(0), "Invalid price feed job ID");
+        if (_registrar == address(0)) revert InvalidAutomationConfig(_registrar, _statusJobId, _priceFeedJobId);
+        if (_statusJobId == bytes32(0) || _priceFeedJobId == bytes32(0)) revert InvalidAutomationConfig(_registrar, _statusJobId, _priceFeedJobId);
         if (automationUpkeepId != 0 && _upkeepId == 0) revert AutomationNotRegistered();
 
         automationRegistrar = _registrar;
@@ -745,21 +839,27 @@ contract CrossChainRetryOracle is
     }
 
     /// @notice Update default prices
+    /// @param _defaultGasPrice Default gas price if feed fails
+    /// @param _defaultTokenPrice Default token price if feed fails
     function updateDefaultPrices(int256 _defaultGasPrice, int256 _defaultTokenPrice) external onlyOwner {
-        require(_defaultGasPrice > 0 && _defaultTokenPrice > 0, "Invalid default prices");
+        if (_defaultGasPrice <= 0 || _defaultTokenPrice <= 0) revert PriceFeedFailed(0, false);
         defaultGasPrice = _defaultGasPrice;
         defaultTokenPrice = _defaultTokenPrice;
         emit DefaultPricesUpdated(_defaultGasPrice, _defaultTokenPrice);
     }
 
     /// @notice Update heartbeat for a chain
-    function updateHeartbeat(uint16 chainId, uint256 heartbeat) external onlyOwner {
+    /// @param chainId The target chain ID
+    /// @param heartbeat The new heartbeat value
+    function updateHeartbeat(uint64 chainId, uint256 heartbeat) external onlyOwner {
         if (heartbeat < minHeartbeat || heartbeat > maxHeartbeat) revert InvalidHeartbeat(heartbeat);
         chainHeartbeats[chainId] = heartbeat;
         emit HeartbeatUpdated(chainId, heartbeat);
     }
 
     /// @notice Update heartbeat bounds
+    /// @param _minHeartbeat Minimum heartbeat value
+    /// @param _maxHeartbeat Maximum heartbeat value
     function updateHeartbeatBounds(uint256 _minHeartbeat, uint256 _maxHeartbeat) external onlyOwner {
         if (_minHeartbeat == 0 || _maxHeartbeat < _minHeartbeat || _maxHeartbeat > 7 days) revert InvalidHeartbeatBounds(_minHeartbeat, _maxHeartbeat);
         minHeartbeat = _minHeartbeat;
@@ -768,16 +868,19 @@ contract CrossChainRetryOracle is
     }
 
     /// @notice Update maximum fallback retries
+    /// @param _maxRetries Maximum number of retries for price feeds
     function updateMaxFallbackRetries(uint8 _maxRetries) external onlyOwner {
-        require(_maxRetries >= 1 && _maxRetries <= 5, "Invalid max retries");
+        if (_maxRetries < 1 || _maxRetries > 5) revert InvalidPriceFeedDecimals(_maxRetries);
         maxFallbackRetries = _maxRetries;
         emit MaxFallbackRetriesUpdated(_maxRetries);
     }
 
     /// @notice Update Chainlink configuration
+    /// @param _chainlinkToken LINK token address
+    /// @param _chainlinkOracle Chainlink Node oracle address
     function updateChainlinkConfig(address _chainlinkToken, address _chainlinkOracle) external onlyOwner {
-        require(_chainlinkToken != address(0), "Invalid LINK token");
-        require(_chainlinkOracle != address(0), "Invalid Chainlink oracle");
+        if (_chainlinkToken == address(0)) revert InvalidConfig(_chainlinkToken, address(0), "");
+        if (_chainlinkOracle == address(0)) revert InvalidConfig(address(0), _chainlinkOracle, "");
         chainlinkToken = _chainlinkToken;
         chainlinkOracle = _chainlinkOracle;
         setChainlinkToken(_chainlinkToken);
@@ -785,27 +888,30 @@ contract CrossChainRetryOracle is
     }
 
     /// @notice Update VRF configuration
+    /// @param _subscriptionId VRF subscription ID
+    /// @param _keyHash VRF key hash for gas lane
+    /// @param _callbackGasLimit Gas limit for VRF callback
+    /// @param _requestConfirmations Minimum block confirmations for VRF
     function updateVrfConfig(
-        address _vrfCoordinator,
         uint64 _subscriptionId,
         bytes32 _keyHash,
         uint32 _callbackGasLimit,
         uint16 _requestConfirmations
     ) external onlyOwner {
-        require(_vrfCoordinator != address(0), "Invalid VRF coordinator");
-        require(_subscriptionId != 0, "Invalid VRF subscription ID");
-        require(_callbackGasLimit >= 20_000, "Invalid callback gas limit");
-        require(_requestConfirmations >= 3 && _requestConfirmations <= 200, "Invalid request confirmations");
+        if (_subscriptionId == 0) revert InvalidVrfConfig(vrfCoordinator, _subscriptionId);
+        if (_callbackGasLimit < 20_000) revert InvalidVrfConfig(vrfCoordinator, _subscriptionId);
+        if (_requestConfirmations < 3 || _requestConfirmations > 200) revert InvalidVrfConfig(vrfCoordinator, _subscriptionId);
 
-        vrfCoordinator = _vrfCoordinator;
         vrfSubscriptionId = _subscriptionId;
         vrfKeyHash = _keyHash;
         vrfCallbackGasLimit = _callbackGasLimit;
         vrfRequestConfirmations = _requestConfirmations;
-        emit VrfConfigUpdated(_vrfCoordinator, _subscriptionId, _keyHash, _callbackGasLimit, _requestConfirmations);
+        emit VrfConfigUpdated(vrfCoordinator, _subscriptionId, _keyHash, _callbackGasLimit, _requestConfirmations);
     }
 
     /// @notice Update random retry delay bounds
+    /// @param _minRandomRetryDelay Minimum random retry delay
+    /// @param _maxRandomRetryDelay Maximum random retry delay
     function updateRandomRetryDelayBounds(uint32 _minRandomRetryDelay, uint32 _maxRandomRetryDelay) external onlyOwner {
         if (_minRandomRetryDelay == 0 || _maxRandomRetryDelay < _minRandomRetryDelay || _maxRandomRetryDelay > maxRetryDelay)
             revert InvalidRandomRetryDelayBounds(_minRandomRetryDelay, _maxRandomRetryDelay);
@@ -815,28 +921,33 @@ contract CrossChainRetryOracle is
     }
 
     /// @notice Update request timeout
+    /// @param _timeout The new request timeout value
     function updateRequestTimeout(uint256 _timeout) external onlyOwner {
-        require(_timeout >= 10 minutes && _timeout <= 1 days, "Invalid timeout");
+        if (_timeout < 10 minutes || _timeout > 1 days) revert InvalidUpdateInterval(_timeout);
         requestTimeout = _timeout;
         emit RequestTimeoutUpdated(_timeout);
     }
 
     /// @notice Toggle fallback to Chainlink price feeds
+    /// @param enabled Whether to enable fallback price feeds
     function toggleFallbackPriceFeeds(bool enabled) external onlyOwner {
         useFallbackPriceFeeds = enabled;
         emit FallbackPriceFeedsToggled(enabled);
     }
 
     /// @notice Update maximum retry delay
+    /// @param _maxRetryDelay The new maximum retry delay
     function updateMaxRetryDelay(uint256 _maxRetryDelay) external onlyOwner {
-        require(_maxRetryDelay >= 1 hours && _maxRetryDelay <= 7 days, "Invalid max retry delay");
+        if (_maxRetryDelay < 1 hours || _maxRetryDelay > 7 days) revert InvalidRetryDelay(uint32(_maxRetryDelay));
         maxRetryDelay = _maxRetryDelay;
         emit MaxRetryDelayUpdated(_maxRetryDelay);
     }
 
     /// @notice Update gas price bounds
+    /// @param _minGasPrice Minimum gas price
+    /// @param _maxGasPrice Maximum gas price
     function updateGasPriceBounds(uint256 _minGasPrice, uint256 _maxGasPrice) external onlyOwner {
-        require(_minGasPrice > 0 && _maxGasPrice > _minGasPrice, "Invalid gas price bounds");
+        if (_minGasPrice == 0 || _maxGasPrice < _minGasPrice) revert InvalidGasPrice(uint64(_minGasPrice));
         minGasPrice = _minGasPrice;
         maxGasPrice = _maxGasPrice;
         emit GasPriceBoundsUpdated(_minGasPrice, _maxGasPrice);
@@ -852,19 +963,38 @@ contract CrossChainRetryOracle is
         _unpause();
     }
 
+    /// @notice Calculate required LINK for pending requests
+    /// @return requiredLink The total LINK required for active chains
+    function _calculateRequiredLink() private view returns (uint256 requiredLink) {
+        for (uint256 i = 0; i < activeChainIds.length; i++) {
+            uint64 chainId = activeChainIds[i];
+            ChainConfig storage config = chainConfigs[chainId];
+            if (config.automateStatus || config.automatePriceFeeds) {
+                requiredLink += config.automationFee;
+            }
+        }
+    }
+
     /// @notice Authorize contract upgrades
+    /// @param newImplementation The new implementation address
     function _authorizeUpgrade(address newImplementation) internal override onlyOwner {}
 
     /// @notice Validate network status fields
+    /// @param gasPrice The gas price to validate
+    /// @param confirmationTime The confirmation time to validate
+    /// @param congestionLevel The congestion level to validate
+    /// @param recommendedRetryDelay The recommended retry delay to validate
     function _validateStatus(uint64 gasPrice, uint32 confirmationTime, uint8 congestionLevel, uint32 recommendedRetryDelay) private view {
         if (gasPrice < minGasPrice || gasPrice > maxGasPrice) revert InvalidGasPrice(gasPrice);
         if (confirmationTime < MIN_CONFIRMATION_TIME || confirmationTime > MAX_CONFIRMATION_TIME) revert InvalidConfirmationTime(confirmationTime);
         if (congestionLevel > MAX_CONGESTION_LEVEL) revert InvalidCongestionLevel(congestionLevel);
-        if (recommendedRetryDelay > maxRetryDelay) revert InvalidConfirmationTime(recommendedRetryDelay);
+        if (recommendedRetryDelay > maxRetryDelay) revert InvalidRetryDelay(recommendedRetryDelay);
     }
 
     /// @notice Adjust heartbeat dynamically based on congestion level
-    function _adjustHeartbeat(uint16 chainId, uint8 congestionLevel) private {
+    /// @param chainId The target chain ID
+    /// @param congestionLevel The current congestion level
+    function _adjustHeartbeat(uint64 chainId, uint8 congestionLevel) private {
         uint256 currentHeartbeat = chainHeartbeats[chainId] == 0 ? DEFAULT_HEARTBEAT : chainHeartbeats[chainId];
         uint256 newHeartbeat;
 
@@ -885,6 +1015,9 @@ contract CrossChainRetryOracle is
     }
 
     /// @notice Normalize price to 18 decimals
+    /// @param price The price to normalize
+    /// @param decimals The original decimals of the price
+    /// @return The normalized price
     function _normalizePrice(int256 price, uint8 decimals) private pure returns (int256) {
         if (decimals == NORMALIZED_DECIMALS) return price;
         if (decimals > NORMALIZED_DECIMALS) {
@@ -893,4 +1026,27 @@ contract CrossChainRetryOracle is
             return price * int256(10 ** (NORMALIZED_DECIMALS - decimals));
         }
     }
+
+    /// @notice Convert uint64 to string
+    /// @param value The value to convert
+    /// @return The string representation
+    function _toString(uint64 value) private pure returns (string memory) {
+        if (value == 0) return "0";
+        uint256 temp = value;
+        uint256 digits;
+        while (temp != 0) {
+            digits++;
+            temp /= 10;
+        }
+        bytes memory buffer = new bytes(digits);
+        while (value != 0) {
+            digits--;
+            buffer[digits] = bytes1(uint8(48 + (value % 10)));
+            value /= 10;
+        }
+        return string(buffer);
+    }
+
+    // Allow contract to receive native tokens
+    receive() external payable {}
 }
