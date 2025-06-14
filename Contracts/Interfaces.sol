@@ -80,6 +80,7 @@ interface IPositionManager {
     /// @param owner The address of the position owner
     /// @return destination The address where fees should be sent
     function feeDestinations(address owner) external view returns (address);
+    function approve(address to, uint256 tokenId) external;
 
     /// @notice Collects and bridges fees for a position to a destination chain
     /// @param positionId The ID of the position

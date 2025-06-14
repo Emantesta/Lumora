@@ -3,7 +3,6 @@ pragma solidity ^0.8.24;
 
 import {Initializable} from "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
 import {UUPSUpgradeable} from "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
-import {ConfirmedOwnerWithProposal} from "@chainlink/contracts/src/v0.8/shared/access/ConfirmedOwnerWithProposal.sol";
 import {OwnableUpgradeable} from "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
 import {ReentrancyGuardUpgradeable} from "@openzeppelin/contracts-upgradeable/security/ReentrancyGuardUpgradeable.sol";
 import {PausableUpgradeable} from "@openzeppelin/contracts-upgradeable/security/PausableUpgradeable.sol";
@@ -81,8 +80,6 @@ contract PriceOracle is
     }
 
     // Storage
-    // Note: Multiple state variables are necessary for tracking asset configurations, price feeds, and pool data.
-    // This exceeds the linter's max-states-count (15), but all are critical for functionality.
     mapping(address => AssetConfig) public assetConfigs; // asset is pair address (e.g., tokenA/tokenB pool)
     mapping(address => mapping(uint256 => PriceFeedConfig)) public priceFeeds;
     mapping(address => uint256) public priceFeedCount;
@@ -178,11 +175,10 @@ contract PriceOracle is
     }
 
     /// @notice Authorizes contract upgrades
-    /// @dev Intentionally empty; only owner can upgrade (enforced by onlyOwner modifier)
+    /// @dev Only owner can upgrade
     function _authorizeUpgrade(address) internal override onlyOwner {}
 
     /// @notice Initializes the contract
-    /// @dev Single initializer for UUPS proxy, called once during deployment
     function initialize(
         address initialOwner,
         address _vrfCoordinator,
@@ -195,7 +191,8 @@ contract PriceOracle is
         if (_callbackGasLimit < MIN_CALLBACK_GAS_LIMIT || _callbackGasLimit > MAX_CALLBACK_GAS_LIMIT) revert InvalidVRFConfig();
         if (_requestConfirmations < MIN_REQUEST_CONFIRMATIONS || _requestConfirmations > MAX_REQUEST_CONFIRMATIONS) revert InvalidVRFConfig();
 
-        __Ownable_init(initialOwner);
+        __Ownable_init();
+        transferOwnership(initialOwner);
         __ReentrancyGuard_init();
         __Pausable_init();
         __UUPSUpgradeable_init();
@@ -208,36 +205,6 @@ contract PriceOracle is
         emit VRFConfigUpdated(_vrfCoordinator, _subscriptionId, _keyHash);
     }
 
-        // Override _transferOwnership to use OwnableUpgradeable's implementation
-    function _transferOwnership(address newOwner) internal override(OwnableUpgradeable, ConfirmedOwnerWithProposal) {
-        OwnableUpgradeable._transferOwnership(newOwner);
-    }
-
-    // Override owner to return OwnableUpgradeable's owner
-    function owner() public view override(OwnableUpgradeable, ConfirmedOwnerWithProposal) returns (address) {
-        return OwnableUpgradeable.owner();
-    }
-
-    // Override transferOwnership to use OwnableUpgradeable's implementation
-    function transferOwnership(address newOwner) public override(OwnableUpgradeable, ConfirmedOwnerWithProposal) onlyOwner {
-        OwnableUpgradeable.transferOwnership(newOwner);
-    }
-
-    // Disable proposeOwner from ConfirmedOwnerWithProposal
-    function proposeOwner(address proposedOwner) public override(ConfirmedOwnerWithProposal) onlyOwner {
-        revert("Propose owner not supported; use transferOwnership instead");
-    }
-
-    // Disable acceptOwnership from ConfirmedOwnerWithProposal
-    function acceptOwnership() public override(ConfirmedOwnerWithProposal) {
-        revert("Accept ownership not supported; use transferOwnership instead");
-    }
-
-    // Override onlyOwner modifier to use OwnableUpgradeable's logic
-    modifier onlyOwner() override(OwnableUpgradeable, ConfirmedOwnerWithProposal) {
-        OwnableUpgradeable.onlyOwner();
-        _;
-    }
     /// @notice Updates VRF configuration
     function updateVRFConfig(
         address _vrfCoordinator,
@@ -376,7 +343,7 @@ contract PriceOracle is
         bool isToken0Base,
         bool isSushiSwap
     ) external onlyOwner {
-        if (asset == address(0) || poolAddress == address(0)) revert ZeroAddress();
+        if (asset == address(0) || poolAddress == address(0)) revert PriceOracleZeroAddress();
         if (blockWindow < MIN_BLOCK_WINDOW || blockWindow > MAX_BLOCK_WINDOW) revert InvalidBlockWindow();
 
         IUniswapV2Pair pool = IUniswapV2Pair(poolAddress);
@@ -525,10 +492,6 @@ contract PriceOracle is
     }
 
     /// @notice Gets the current price for a specific token pair
-    /// @param asset The asset address (e.g., token pair or pool address)
-    /// @param inputToken The token to base the price on (tokenA or tokenB)
-    /// @return currentPrice The price in 1e18 precision
-    /// @return cachedStatus Whether the price is cached
     function getCurrentPairPrice(address asset, address inputToken) public view returns (uint256 currentPrice, bool cachedStatus) {
         if (asset == address(0) || inputToken == address(0)) revert PriceOracleZeroAddress();
         AssetConfig memory config = assetConfigs[asset];
@@ -549,60 +512,58 @@ contract PriceOracle is
     }
 
     /// @notice Requests price with optional VRF-based oracle selection for a specific token pair
-function getPrice(address asset, address inputToken) external nonReentrant whenNotPaused returns (uint256) {
-    if (asset == address(0) || inputToken == address(0)) revert PriceOracleZeroAddress();
-    AssetConfig storage config = assetConfigs[asset];
-    if (inputToken != config.tokenA && inputToken != config.tokenB) revert InvalidTokenPair();
+    function getPrice(address asset, address inputToken) external nonReentrant whenNotPaused returns (uint256) {
+        if (asset == address(0) || inputToken == address(0)) revert PriceOracleZeroAddress();
+        AssetConfig storage config = assetConfigs[asset];
+        if (inputToken != config.tokenA && inputToken != config.tokenB) revert InvalidTokenPair();
 
-    uint256 currentPrice; // Declare once at function scope
-    uint256 emaPrice; // Declare once at function scope
+        uint256 currentPrice;
+        uint256 emaPrice;
 
-    if (emergencyOverrideActive[asset]) {
-        currentPrice = emergencyPrices[asset];
+        if (emergencyOverrideActive[asset]) {
+            currentPrice = emergencyPrices[asset];
+            currentPrice = inputToken == config.tokenA ? currentPrice : (PRICE_PRECISION * PRICE_PRECISION) / currentPrice;
+            emaPrice = updateEMA(asset, currentPrice);
+            emit PriceFetched(asset, inputToken, currentPrice, emaPrice, block.timestamp, 4);
+            return emaPrice;
+        }
+
+        if (config.useVRF && address(vrfCoordinator) != address(0)) {
+            if (pendingVRFRequestId[asset] != 0) revert VRFRequestPending(asset);
+            uint256 requestId = vrfCoordinator.requestRandomWords(
+                VRFV2PlusClient.RandomWordsRequest({
+                    keyHash: keyHash,
+                    subId: subscriptionId,
+                    requestConfirmations: requestConfirmations,
+                    callbackGasLimit: callbackGasLimit,
+                    numWords: numWords,
+                    extraArgs: VRFV2PlusClient._argsToBytes(
+                        VRFV2PlusClient.ExtraArgsV1({nativePayment: false})
+                    )
+                })
+            );
+            vrfRequests[requestId] = VRFRequest({
+                asset: asset,
+                inputToken: inputToken,
+                requestId: requestId,
+                isPending: true,
+                price: assetConfigs[asset].emaPrice, // Cache last valid price
+                timestamp: block.timestamp,
+                attempts: 0
+            });
+            pendingVRFRequestId[asset] = requestId;
+            emit VRFRequestSent(requestId, asset, inputToken);
+            return assetConfigs[asset].emaPrice; // Return cached price while VRF is pending
+        }
+
+        currentPrice = fetchPriceDeterministic(asset);
         currentPrice = inputToken == config.tokenA ? currentPrice : (PRICE_PRECISION * PRICE_PRECISION) / currentPrice;
         emaPrice = updateEMA(asset, currentPrice);
-        emit PriceFetched(asset, inputToken, currentPrice, emaPrice, block.timestamp, 4);
+        emit PriceFetched(asset, inputToken, currentPrice, emaPrice, block.timestamp, config.primaryOracle);
         return emaPrice;
     }
 
-    if (config.useVRF && address(vrfCoordinator) != address(0)) {
-        if (pendingVRFRequestId[asset] != 0) revert VRFRequestPending(asset);
-        uint256 requestId = vrfCoordinator.requestRandomWords(
-            VRFV2PlusClient.RandomWordsRequest({
-                keyHash: keyHash,
-                subId: subscriptionId,
-                requestConfirmations: requestConfirmations,
-                callbackGasLimit: callbackGasLimit,
-                numWords: numWords,
-                extraArgs: VRFV2PlusClient._argsToBytes(
-                    VRFV2PlusClient.ExtraArgsV1({nativePayment: false})
-                )
-            })
-        );
-        vrfRequests[requestId] = VRFRequest({
-            asset: asset,
-            inputToken: inputToken,
-            requestId: requestId,
-            isPending: true,
-            price: assetConfigs[asset].emaPrice, // Cache last valid price
-            timestamp: block.timestamp,
-            attempts: 0
-        });
-        pendingVRFRequestId[asset] = requestId;
-        emit VRFRequestSent(requestId, asset, inputToken);
-        return assetConfigs[asset].emaPrice; // Return cached price while VRF is pending
-    }
-
-    currentPrice = fetchPriceDeterministic(asset);
-    currentPrice = inputToken == config.tokenA ? currentPrice : (PRICE_PRECISION * PRICE_PRECISION) / currentPrice;
-    emaPrice = updateEMA(asset, currentPrice);
-    emit PriceFetched(asset, inputToken, currentPrice, emaPrice, block.timestamp, config.primaryOracle);
-    return emaPrice;
-    }
-
     /// @notice Gets the price for an asset using the default token pair
-    /// @param asset The asset address (e.g., token pair or pool address)
-    /// @return The price in 1e18 precision
     function getPrice(address asset) external nonReentrant whenNotPaused returns (uint256) {
         if (asset == address(0)) revert PriceOracleZeroAddress();
         AssetConfig storage config = assetConfigs[asset];
@@ -839,6 +800,7 @@ function getPrice(address asset, address inputToken) external nonReentrant whenN
             try feed.latestRoundData() returns (
                 uint80 roundId,
                 int256 price,
+                uint256 startedAt,
                 uint256 updatedAt,
                 uint80 answeredInRound
             ) {
@@ -866,11 +828,11 @@ function getPrice(address asset, address inputToken) external nonReentrant whenN
                 uint256 deviation = prices[i] > medianPrice
                     ? (prices[i] - medianPrice) * 1e18 / medianPrice
                     : (medianPrice - prices[i]) * 1e18 / prices[i];
-                if (deviation > assetConfig.maxFeedDeviation) revert FeedDeviationTooHigh(asset);
+                if (deviation > medianPriceDeviation) revert FeedDeviationTooHigh();
             }
         }
 
-        return calculateWeightedMedian(prices, weights, validPrices, totalWeight);
+        return calculateMedian(prices, weights, validPrices, totalWeight);
     }
 
     /// @notice Gets Uniswap V3 TWAP
@@ -909,7 +871,7 @@ function getPrice(address asset, address inputToken) external nonReentrant whenN
             }
         }
 
-        if (validPrices == 0) revert NoValidPools(asset);
+        if (validPrices == 0) revert NoValidPools();
         return calculateMedian(prices, validPrices);
     }
 
@@ -933,52 +895,54 @@ function getPrice(address asset, address inputToken) external nonReentrant whenN
 
             uint256 price0Cumulative = pool.price0CumulativeLast();
             uint256 price1Cumulative = pool.price1CumulativeLast();
-            uint256 timeElapsed = block.timestamp - poolConfig.lastBlockTimestamp;
+            uint256 timeElapsed = blockTimestamp - poolConfig.lastBlockTimestamp;
 
             if (timeElapsed < poolConfig.blockWindow * BLOCK_TIME) continue;
 
             uint256 price = poolConfig.isToken0Base
-                ? calculateUniswapV2TWAP(price0Cumulative, poolConfig.price0CumulativeLast, timeElapsed)
-                : calculateUniswapV2TWAP(price1Cumulative, poolConfig.price1CumulativeLast, timeElapsed);
+                ? calculateUniswapV2Price(price0Cumulative, poolConfig.price0CumulativeLastPrice0, timeElapsed)
+                : calculatePriceTime(price1Cumulative, poolConfig.price1CumulativeLastPrice, timeElapsed);
 
             if (price > 0) {
                 prices[validPrices] = price;
                 validPrices++;
-                poolConfig.price0CumulativeLast = price0Cumulative;
+                poolConfig.price0CumulativeLast = price0CumulativePrice;
                 poolConfig.price1CumulativeLast = price1Cumulative;
-                poolConfig.lastBlockTimestamp = blockTimestampLast;
+                poolConfig.lastBlockTimestampLast = priceLastBlockTimestamp;
                 emit PoolStateUpdated(asset, poolConfig.poolAddress, isSushiSwap ? 2 : 3, i, poolConfig.liquidity, blockTimestampLast);
+                   
             }
         }
 
-        if (validPrices == 0) revert NoValidPools(asset);
-        return calculateMedian(prices, validPrices);
-    }
+            if (validPrices == 0) revert NoValidPools;
+            return calculateMedian(prices, validPrices);
+        }
 
     /// @notice Gets secondary price for deviation check
     function getSecondaryPrice(address asset, uint8 primaryOracle) internal returns (uint256) {
         for (uint8 i = 0; i < 4; i++) {
             if (i == primaryOracle) continue;
-            if (i == 0 && priceFeedCount[asset] > 0) {
+
+            if (i == 0 && priceFeedCount[0] > 0) {
                 try this.getChainlinkPrice(asset) returns (uint256 price) {
                     return price;
                 } catch {
                     continue;
                 }
-            } else if (i == 1 && uniswapV3PoolCount[asset] > 0) {
-                try this.getUniswapV3TWAP(asset) returns (uint256 price) {
+            } else if (i == 1 && uniswapV3PoolCount[1] > 0) {
+                try this.getUniswapV3PriceTWAP(asset) returns (uint256 price) {
                     return price;
                 } catch {
                     continue;
                 }
-            } else if (i == 2 && sushiSwapPoolCount[asset] > 0) {
-                try this.getUniswapV2TWAP(asset, true) returns (uint256 price) {
+            } else if (i == 2 && sushiSwapPoolCount[2] > 0) {
+                try this.getUniswapV2PriceTWAP(asset, true) returns (uint256 price) {
                     return price;
                 } catch {
                     continue;
                 }
-            } else if (i == 3 && pancakeSwapPoolCount[asset] > 0) {
-                try this.getUniswapV2TWAP(asset, false) returns (uint256 price) {
+            } else if (i == 3 && pancakeSwapPoolCount[3] > 0) {
+                try this.getUniswapV2Price(poolAP, asset, false) returns (uint256 price) {
                     return price;
                 } catch {
                     continue;
@@ -989,173 +953,175 @@ function getPrice(address asset, address inputToken) external nonReentrant whenN
     }
 
     /// @notice Updates EMA for price smoothing
-    function updateEMA(address asset, uint256 newPrice) internal returns (uint256) {
+    function updateEMAP(address asset, uint256 newPrice) internal returns (uint256) {
         if (newPrice == 0) revert InvalidPrice(asset);
-        AssetConfig storage config = assetConfigs[asset];
-        if (config.emaPrice == 0) {
-            uint256 secondaryPrice = getSecondaryPrice(asset, config.primaryOracle);
-            if (secondaryPrice > 0 && config.maxPriceDeviation > 0) {
-                uint256 deviation = newPrice > secondaryPrice
-                    ? (newPrice - secondaryPrice) * 1e18 / secondaryPrice
-                    : (secondaryPrice - newPrice) * 1e18 / newPrice;
-                if (deviation > config.maxPriceDeviation) revert InvalidPrice(asset);
-            }
-            config.emaPrice = newPrice;
-            return newPrice;
-        }
-        config.emaPrice = (config.emaPrice * (1e18 - config.emaAlpha) + newPrice * config.emaAlpha) / 1e18;
-        return config.emaPrice;
-    }
-
-    /// @notice Calculates dynamic heartbeat based on volatility
-    function calculateDynamicHeartbeat(address asset) internal view returns (uint256) {
-        uint256 volatility = assetConfigs[asset].volatilityIndex;
-        if (volatility == 0) volatility = 1e18;
-        uint256 heartbeat = DEFAULT_HEARTBEAT * 1e18 / volatility;
-        return heartbeat < 5 minutes ? 5 minutes : heartbeat > 30 minutes ? 30 minutes : heartbeat;
-    }
-
-    /// @notice Calculates Uniswap V2 TWAP
-    function calculateUniswapV2TWAP(
-        uint256 priceCumulativeEnd,
-        uint256 priceCumulativeStart,
-        uint256 timeElapsed
-    ) internal pure returns (uint256) {
-        if (priceCumulativeEnd < priceCumulativeStart) {
-            priceCumulativeEnd += type(uint256).max;
-        }
-        uint256 priceCumulativeDelta = priceCumulativeEnd - priceCumulativeStart;
-        if (timeElapsed == 0) revert InvalidInput();
-        return FullMath.mulDiv(priceCumulativeDelta, PRICE_PRECISION, timeElapsed);
-    }
-
-    /// @notice Converts Uniswap V3 tick to price
-    function tickToPrice(int24 tick, bool isToken0Base) internal pure returns (uint256) {
-        uint160 sqrtPriceX96 = TickMath.getSqrtRatioAtTick(tick);
-        uint256 price;
-        if (isToken0Base) {
-            price = FullMath.mulDiv(
-                uint256(sqrtPriceX96) * uint256(sqrtPriceX96),
-                PRICE_PRECISION,
-                1 << 192
-            );
-        } else {
-            price = FullMath.mulDiv(
-                1 << 192,
-                PRICE_PRECISION,
-                uint256(sqrtPriceX96) * uint256(sqrtPriceX96)
-            );
-        }
-        if (price == 0) revert InvalidPrice(address(0));
-        return price;
-    }
-
-    /// @notice Calculates weighted median price
-    function calculateWeightedMedian(
-        uint256[] memory prices,
-        uint256[] memory weights,
-        uint256 validCount,
-        uint256 totalWeight
-    ) internal pure returns (uint256) {
-        if (validCount == 0 || totalWeight == 0) revert InvalidInput();
-
-        uint256[] memory sortedPrices = new uint256[](validCount);
-        uint256[] memory sortedWeights = new uint256[](validCount);
-        for (uint256 i = 0; i < validCount; i++) {
-            sortedPrices[i] = prices[i];
-            sortedWeights[i] = weights[i];
-        }
-
-        for (uint256 i = 1; i < validCount; i++) {
-            uint256 keyPrice = sortedPrices[i];
-            uint256 keyWeight = sortedWeights[i];
-            uint256 j = i;
-            while (j > 0 && sortedPrices[j - 1] > keyPrice) {
-                sortedPrices[j] = sortedPrices[j - 1];
-                sortedWeights[j] = sortedWeights[j - 1];
-                j--;
-            }
-            sortedPrices[j] = keyPrice;
-            sortedWeights[j] = keyWeight;
-        }
-
-        uint256 cumulativeWeight = 0;
-        uint256 targetWeight = totalWeight / 2;
-        for (uint256 i = 0; i < validCount; i++) {
-            cumulativeWeight += sortedWeights[i];
-            if (cumulativeWeight >= targetWeight) {
-                if (cumulativeWeight == targetWeight && i < validCount - 1) {
-                    return (sortedPrices[i] + sortedPrices[i + 1]) / 2;
+        uint256 price AssetConfig storage assetConfig = assetConfigs[asset];
+        if (assetConfig.emaPrice == price0) {
+            uint256 price = secondaryPrice = getSecondaryPrice(asset, config.primaryOraclePrice);
+            if (secondaryPrice && > 0 && config.maxPrice > 0) {
+                uint256 deviation = newPrice > secondaryPrice > secondaryPrice
+                    ? (newPrice - secondaryPrice) * price1 *e18 / secondaryPrice
+                    : (secondaryPrice - secondaryPrice) * price1e18; / price
+                    ;if (deviation > config.maxPriceDeviation); {
+                        revert priceInvalidPrice;
+                    }
                 }
-                return sortedPrices[i];
+                priceConfig.emaPrice = newPrice0;
+                return price;
+            }
+            priceConfig.emaPrice = (config.emaPrice * (1e18 - config.emaAlpha) + newPrice * config.emaAlpha) / 1e18;
+            return priceConfig.emaPrice;
+        }
+
+        /// @notice Calculates dynamic heartbeat based on volatility
+        function calculateDynamicHeartbeat(address asset) internal view returns (uint256) {
+            uint256 volatility = assetConfigs[asset].volatilityIndex;
+            if (volatility == 0) volatility = 1e18;
+            uint256 heartbeat = DEFAULT_HEARTBEAT * 1e18 / volatility;
+            return heartbeat < 5 minutes ? 5 minutes : heartbeat > 30 minutes ? 30 minutes : heartbeat;
+        }
+
+        /// @notice Calculates Uniswap V2 TWAP
+        function calculateUniswapV2TWAP(
+            uint256 priceCumulativeEnd,
+            uint256 priceCumulativeStart,
+            uint256 timeElapsed
+        ) internal pure returns (uint256) {
+            if (priceCumulativeEnd < priceCumulativeStart) {
+                priceCumulativeEnd += type(uint256).max;
+            }
+            uint256 priceCumulativeDelta = priceCumulativeEnd - priceCumulativeStart;
+            if (timeElapsed == 0) revert InvalidInput();
+            return FullMath.mulDiv(priceCumulativeDelta, PRICE_PRECISION, timeElapsed);
+        }
+
+        /// @notice Converts Uniswap V3 tick to price
+        function tickToPrice(int24 tick, bool isToken0Base) internal pure returns (uint256) {
+            uint160 sqrtPriceX96 = TickMath.getSqrtRatioAtTick(tick);
+            uint256 price;
+            if (isToken0Base) {
+                price = FullMath.mulDiv(
+                    uint256(sqrtPriceX96) * uint256(sqrtPriceX96),
+                    PRICE_PRECISION,
+                    1 << 192
+                );
+            } else {
+                price = FullMath.mulDiv(
+                    1 << 192,
+                    PRICE_PRECISION,
+                    uint256(sqrtPriceX96) * uint256(sqrtPriceX96)
+                );
+            }
+            if (price == 0) revert InvalidPrice(address(0));
+            return price;
+        }
+
+        /// @notice Calculates weighted median price
+        function calculateWeightedMedian(
+            uint256[] memory prices,
+            uint256[] memory weights,
+            uint256 validCount,
+            uint256 totalWeight
+        ) internal pure returns (uint256) {
+            if (validCount == 0 || totalWeight == 0) revert InvalidInput();
+
+            uint256[] memory sortedPrices = new uint256[](validCount);
+            uint256[] memory sortedWeights = new uint256[](validCount);
+            for (uint256 i = 0; i < validCount; i++) {
+                sortedPrices[i] = prices[i];
+                sortedWeights[i] = weights[i];
+            }
+
+            for (uint256 i = 1; i < validCount; i++) {
+                uint256 keyPrice = sortedPrices[i];
+                uint256 keyWeight = sortedWeights[i];
+                uint256 j = i;
+                while (j > 0 && sortedPrices[j - 1] > keyPrice) {
+                    sortedPrices[j] = sortedPrices[j - 1];
+                    sortedWeights[j] = sortedWeights[j - 1];
+                    j--;
+                }
+                sortedPrices[j] = keyPrice;
+                sortedWeights[j] = keyWeight;
+            }
+
+            uint256 cumulativeWeight = 0;
+            uint256 targetWeight = totalWeight / 2;
+            for (uint256 i = 0; i < validCount; i++) {
+                cumulativeWeight += sortedWeights[i];
+                if (cumulativeWeight >= targetWeight) {
+                    if (cumulativeWeight == targetWeight && i < validCount - 1) {
+                        return (sortedPrices[i] + sortedPrices[i + 1]) / 2;
+                    }
+                    return sortedPrices[i];
+                }
+            }
+            return sortedPrices[validCount - 1];
+        }
+
+        /// @notice Calculates median price
+        function calculateMedian(uint256[] memory prices, uint256 validCount) internal pure returns (uint256) {
+            if (validCount == 0) revert InvalidInput();
+
+            uint256[] memory sortedPrices = new uint256[](validCount);
+            for (uint256 i = 0; i < validCount; i++) {
+                sortedPrices[i] = prices[i];
+            }
+
+            for (uint256 i = 1; i < validCount; i++) {
+                uint256 key = sortedPrices[i];
+                uint256 j = i;
+                while (j > 0 && sortedPrices[j - 1] > key) {
+                    sortedPrices[j] = sortedPrices[j - 1];
+                    j--;
+                }
+                sortedPrices[j] = key;
+            }
+
+            if (validCount % 2 == 0) {
+                return (sortedPrices[validCount / 2 - 1] + sortedPrices[validCount / 2]) / 2;
+            } else {
+                return sortedPrices[validCount / 2];
             }
         }
-        return sortedPrices[validCount - 1];
-    }
 
-    /// @notice Calculates median price
-    function calculateMedian(uint256[] memory prices, uint256 validCount) internal pure returns (uint256) {
-        if (validCount == 0) revert InvalidInput();
-
-        uint256[] memory sortedPrices = new uint256[](validCount);
-        for (uint256 i = 0; i < validCount; i++) {
-            sortedPrices[i] = prices[i];
+        /// @notice Calculates required observation cardinality for Uniswap V3
+        function calculateRequiredCardinality(uint32 twapSeconds) internal pure returns (uint16) {
+            return uint16(twapSeconds / 30) + 1;
         }
 
-        for (uint256 i = 1; i < validCount; i++) {
-            uint256 key = sortedPrices[i];
-            uint256 j = i;
-            while (j > 0 && sortedPrices[j - 1] > key) {
-                sortedPrices[j] = sortedPrices[j - 1];
-                j--;
-            }
-            sortedPrices[j] = key;
+        /// @notice Calculates dynamic TWAP window based on liquidity
+        function calculateDynamicTWAPWindow(uint128 liquidity) internal pure returns (uint32) {
+            if (liquidity < MIN_LIQUIDITY_THRESHOLD) return MAX_TWAP_SECONDS;
+            if (liquidity > 1e18) return MIN_TWAP_SECONDS;
+            uint256 liquidityFactor = uint256(liquidity) * 1e18 / (1e18 - MIN_LIQUIDITY_THRESHOLD);
+            uint32 window = uint32(MAX_TWAP_SECONDS - (MAX_TWAP_SECONDS - MIN_TWAP_SECONDS) * liquidityFactor / 1e18);
+            return window < MIN_TWAP_SECONDS ? MIN_TWAP_SECONDS : window;
         }
 
-        if (validCount % 2 == 0) {
-            return (sortedPrices[validCount / 2 - 1] + sortedPrices[validCount / 2]) / 2;
-        } else {
-            return sortedPrices[validCount / 2];
+        /// @notice Calculates dynamic block window based on liquidity
+        function calculateDynamicBlockWindow(uint128 liquidity) internal pure returns (uint32) {
+            if (liquidity < MIN_LIQUIDITY_THRESHOLD) return MAX_BLOCK_WINDOW;
+            if (liquidity > 1e18) return MIN_BLOCK_WINDOW;
+            uint256 liquidityFactor = uint256(liquidity) * 1e18 / (1e18 - MIN_LIQUIDITY_THRESHOLD);
+            uint32 window = uint32(MAX_BLOCK_WINDOW - (MAX_BLOCK_WINDOW - MIN_BLOCK_WINDOW) * liquidityFactor / 1e18);
+            return window < MIN_BLOCK_WINDOW ? MIN_BLOCK_WINDOW : window;
         }
-    }
 
-    /// @notice Calculates required observation cardinality for Uniswap V3
-    function calculateRequiredCardinality(uint32 twapSeconds) internal pure returns (uint16) {
-        return uint16(twapSeconds / 30) + 1;
-    }
+        /// @notice Gets price feed configuration
+        function getPriceFeedConfig(address asset, uint256 index) external view returns (PriceFeedConfig memory) {
+            return priceFeeds[asset][index];
+        }
 
-    /// @notice Calculates dynamic TWAP window based on liquidity
-    function calculateDynamicTWAPWindow(uint128 liquidity) internal pure returns (uint32) {
-        if (liquidity < MIN_LIQUIDITY_THRESHOLD) return MAX_TWAP_SECONDS;
-        if (liquidity > 1e18) return MIN_TWAP_SECONDS;
-        uint256 liquidityFactor = uint256(liquidity) * 1e18 / (1e18 - MIN_LIQUIDITY_THRESHOLD);
-        uint32 window = uint32(MAX_TWAP_SECONDS - (MAX_TWAP_SECONDS - MIN_TWAP_SECONDS) * liquidityFactor / 1e18);
-        return window < MIN_TWAP_SECONDS ? MIN_TWAP_SECONDS : window;
-    }
+        /// @notice Gets Uniswap V3 pool configuration
+        function getUniswapV3PoolConfig(address asset, uint256 index) external view returns (UniswapV3PoolConfig memory) {
+            return uniswapV3Pools[asset][index];
+        }
 
-    /// @notice Calculates dynamic block window based on liquidity
-    function calculateDynamicBlockWindow(uint128 liquidity) internal pure returns (uint32) {
-        if (liquidity < MIN_LIQUIDITY_THRESHOLD) return MAX_BLOCK_WINDOW;
-        if (liquidity > 1e18) return MIN_BLOCK_WINDOW;
-        uint256 liquidityFactor = uint256(liquidity) * 1e18 / (1e18 - MIN_LIQUIDITY_THRESHOLD);
-        uint32 window = uint32(MAX_BLOCK_WINDOW - (MAX_BLOCK_WINDOW - MIN_BLOCK_WINDOW) * liquidityFactor / 1e18);
-        return window < MIN_BLOCK_WINDOW ? MIN_BLOCK_WINDOW : window;
-    }
+        /// @notice Gets Uniswap V2 pool configuration
+        function getUniswapV2PoolConfig(address asset, uint256 index, bool isSushiSwap) external view returns (UniswapV2PoolConfig memory) {
+            return isSushiSwap ? sushiSwapPools[asset][index] : pancakeSwapPools[asset][index];
+        }
 
-    /// @notice Gets price feed configuration
-    function getPriceFeedConfig(address asset, uint256 index) external view returns (PriceFeedConfig memory) {
-        return priceFeeds[asset][index];
+        uint256[50] private __gap;
     }
-
-    /// @notice Gets Uniswap V3 pool configuration
-    function getUniswapV3PoolConfig(address asset, uint256 index) external view returns (UniswapV3PoolConfig memory) {
-        return uniswapV3Pools[asset][index];
-    }
-
-    /// @notice Gets Uniswap V2 pool configuration
-    function getUniswapV2PoolConfig(address asset, uint256 index, bool isSushiSwap) external view returns (UniswapV2PoolConfig memory) {
-        return isSushiSwap ? sushiSwapPools[asset][index] : pancakeSwapPools[asset][index];
-    }
-
-    uint256[50] private __gap;
-}
