@@ -10,7 +10,7 @@ import {UUPSUpgradeable} from "@openzeppelin/contracts-upgradeable/proxy/utils/U
 import {ReentrancyGuardUpgradeable} from "@openzeppelin/contracts-upgradeable/security/ReentrancyGuardUpgradeable.sol";
 import {IERC721ReceiverUpgradeable} from "@openzeppelin/contracts-upgradeable/token/ERC721/IERC721ReceiverUpgradeable.sol";
 import {AggregatorV3Interface} from "@chainlink/contracts/src/v0.8/shared/interfaces/AggregatorV3Interface.sol";
-import { IAMMPool, IPositionManager, IPriceOracle } from "./Interfaces.sol";
+import { IAMMPool, IPositionManager, IPriceOracle, ICommonStructs } from "./Interfaces.sol";
 import {UD60x18, ud} from "@prb/math/src/UD60x18.sol";
 import {TickMath} from "./external/uniswap/v3/TickMath.sol";
 
@@ -437,77 +437,72 @@ contract AMMPool is
         _disableInitializers();
     }
 
-    // Initialize
-    function initialize(
-        address _tokenA,
-        address _tokenB,
-        address _treasury,
-        address _layerZeroEndpoint,
-        address _axelarGateway,
-        address _axelarGasService,
-        address _wormholeCore,
-        address _tokenBridge,
-        address _primaryPriceOracle,
-        address[] memory _fallbackPriceOracles,
-        address _governance,
-        address _positionManager,
-        uint256 _defaultTimelock,
-        uint256 _targetReserveRatio
-    ) external initializer {
-        if (_tokenA >= _tokenB) revert InvalidAddress(_tokenA, "TokenA must be less than TokenB");
-        if (_tokenA == address(0) || _tokenB == address(0) || _treasury == address(0) ||
-            _layerZeroEndpoint == address(0) || _axelarGateway == address(0) ||
-            _axelarGasService == address(0) || _wormholeCore == address(0) ||
-            _tokenBridge == address(0) || _primaryPriceOracle == address(0) ||
-            _governance == address(0) || _positionManager == address(0))
-            revert InvalidAddress(address(0), "Zero address not allowed");
-        if (_defaultTimelock < MIN_TIMELOCK || _defaultTimelock > MAX_TIMELOCK)
-            revert InvalidTimelock(_defaultTimelock);
-        if (_targetReserveRatio == 0)
-            revert InvalidReserveRatio(_targetReserveRatio);
+function initialize(ICommonStructs.InitParams memory params) external initializer {
+    // Validate inputs
+    if (params.tokenA >= params.tokenB) revert InvalidAddress(params.tokenA, "TokenA must be less than TokenB");
+    if (
+        params.tokenA == address(0) ||
+        params.tokenB == address(0) ||
+        params.treasury == address(0) ||
+        params.layerZeroEndpoint == address(0) ||
+        params.axelarGateway == address(0) ||
+        params.axelarGasService == address(0) ||
+        params.wormholeCore == address(0) ||
+        params.tokenBridge == address(0) ||
+        params.primaryPriceOracle == address(0) ||
+        params.governance == address(0) ||
+        params.positionManager == address(0)
+    ) revert InvalidAddress(address(0), "Zero address not allowed");
+    if (params.defaultTimelock < MIN_TIMELOCK || params.defaultTimelock > MAX_TIMELOCK)
+        revert InvalidTimelock(params.defaultTimelock);
+    if (params.targetReserveRatio == 0)
+        revert InvalidReserveRatio(params.targetReserveRatio);
 
-        bool hasValidOracle;
-        for (uint256 i = 0; i < _fallbackPriceOracles.length; i++) {
-            if (_fallbackPriceOracles[i] != address(0)) {
-                hasValidOracle = true;
-                break;
-            }
+    // Validate fallback oracles
+    bool hasValidOracle;
+    for (uint256 i = 0; i < params.fallbackPriceOracles.length; i++) {
+        if (params.fallbackPriceOracles[i] != address(0)) {
+            hasValidOracle = true;
+            break;
         }
-        if (!hasValidOracle) revert InvalidAddress(address(0), "No valid fallback oracle");
-
-        __Ownable_init();
-        __UUPSUpgradeable_init();
-        __ReentrancyGuard_init();
-
-        tokenA = _tokenA;
-        tokenB = _tokenB;
-        treasury = _treasury;
-        crossChainMessengers[0] = _layerZeroEndpoint;
-        crossChainMessengers[1] = _axelarGateway;
-        crossChainMessengers[2] = _wormholeCore;
-        axelarGasService = _axelarGasService;
-        tokenBridge = _tokenBridge;
-        primaryPriceOracle = _primaryPriceOracle;
-        fallbackPriceOracles = _fallbackPriceOracles;
-        governance = _governance;
-        positionManager = _positionManager;
-        chainTimelocks[1] = _defaultTimelock;
-        targetReserveRatio = _targetReserveRatio;
-        chainFees[1] = FeeConfig({baseFee: 20, maxFee: 100, volatilityMultiplier: 2});
-        lpFeeShare = 8333;
-        treasuryFeeShare = 1667;
-        emaPeriod = 100;
-        volatilityThreshold = 1e16;
-        priceDeviationThreshold = 1e16;
-        tokenBridgeType[_tokenA] = 1;
-        tokenBridgeType[_tokenB] = 1;
-        amplificationFactor = 100;
-        currentTick = 0;
-
-        priceHistory = new uint256[](PRICE_HISTORY_SIZE);
-
-        emit PositionManagerUpdated(_positionManager);
     }
+    if (!hasValidOracle) revert InvalidAddress(address(0), "No valid fallback oracle");
+
+    // Initialize OpenZeppelin contracts
+    __Ownable_init();
+    __UUPSUpgradeable_init();
+    __ReentrancyGuard_init();
+
+    // Assign state variables
+    tokenA = params.tokenA;
+    tokenB = params.tokenB;
+    treasury = params.treasury;
+    crossChainMessengers[0] = params.layerZeroEndpoint;
+    crossChainMessengers[1] = params.axelarGateway;
+    crossChainMessengers[2] = params.wormholeCore;
+    axelarGasService = params.axelarGasService;
+    tokenBridge = params.tokenBridge;
+    primaryPriceOracle = params.primaryPriceOracle;
+    fallbackPriceOracles = params.fallbackPriceOracles;
+    governance = params.governance;
+    positionManager = params.positionManager;
+    chainTimelocks[1] = params.defaultTimelock;
+    targetReserveRatio = params.targetReserveRatio;
+    chainFees[1] = FeeConfig({baseFee: 20, maxFee: 100, volatilityMultiplier: 2});
+    lpFeeShare = 8333;
+    treasuryFeeShare = 1667;
+    emaPeriod = 100;
+    volatilityThreshold = 1e16;
+    priceDeviationThreshold = 1e16;
+    tokenBridgeType[params.tokenA] = 1;
+    tokenBridgeType[params.tokenB] = 1;
+    amplificationFactor = 100;
+    currentTick = 0;
+
+    priceHistory = new uint256[](PRICE_HISTORY_SIZE);
+
+    emit PositionManagerUpdated(params.positionManager);
+}
 
     // Authorize upgrades
     function _authorizeUpgrade(address newImplementation) internal override onlyOwner {}
@@ -932,36 +927,90 @@ contract AMMPool is
     }
 
     function addConcentratedLiquidityCrossChain(
-        uint256 amountA,
-        uint256 amountB,
-        int24 tickLower,
-        int24 tickUpper,
-        uint16 dstChainId,
-        bytes calldata adapterParams
-    ) external payable override whenNotPaused whenChainNotPaused(dstChainId) nonReentrant {
-        if (amountA == 0 && amountB == 0) revert InvalidAmount(amountA, amountB);
-        if (!_isValidTickRange(tickLower, tickUpper)) revert InvalidTickRange(tickLower, tickUpper);
-        if (trustedRemotePools[dstChainId].length == 0) revert InvalidChainId(dstChainId);
+    uint256 amountA,
+    uint256 amountB,
+    int24 tickLower,
+    int24 tickUpper,
+    uint16 dstChainId,
+    bytes calldata adapterParams
+) external payable override whenNotPaused whenChainNotPaused(dstChainId) nonReentrant {
+    // Validate inputs
+    if (amountA == 0 && amountB == 0) revert InvalidAmount(amountA, amountB);
+    if (!_isValidTickRange(tickLower, tickUpper)) revert InvalidTickRange(tickLower, tickUpper);
+    if (trustedRemotePools[dstChainId].length == 0) revert InvalidChainId(dstChainId);
 
-        IERC20Upgradeable(tokenA).safeTransferFrom(msg.sender, address(this), amountA);
-        IERC20Upgradeable(tokenB).safeTransferFrom(msg.sender, address(this), amountB);
+    // Transfer tokens
+    IERC20Upgradeable(tokenA).safeTransferFrom(msg.sender, address(this), amountA);
+    IERC20Upgradeable(tokenB).safeTransferFrom(msg.sender, address(this), amountB);
 
-        _bridgeTokens(tokenA, amountA, msg.sender, dstChainId);
-        _bridgeTokens(tokenB, amountB, msg.sender, dstChainId);
+    // Bridge tokens
+    _bridgeTokens(tokenA, amountA, msg.sender, dstChainId);
+    _bridgeTokens(tokenB, amountB, msg.sender, dstChainId);
 
-        string memory AxelarChain = chainIdToAxelarChain[dstChainId];
-        bytes memory destinationAddress = trustedRemotePools[dstChainId];
-        uint64 nonce = _getNonce(dstChainId, 0);
-        uint256 timelock = _getDynamicTimelock(dstChainId);
-        bytes memory payload = abi.encode(msg.sender, amountA, amountB, nonce, block.timestamp + timelock, true, tickLower, tickUpper, tokenA, tokenB);
+    // Prepare cross-chain message
+    _sendConcentratedLiquidityMessage(
+        amountA,
+        amountB,
+        tickLower,
+        tickUpper,
+        dstChainId,
+        adapterParams
+    );
+}
 
-        _sendCrossChainMessage(dstChainId, AxelarChain, destinationAddress, payload, adapterParams, nonce, timelock, 0);
-        emit CrossChainLiquiditySent(msg.sender, amountA, amountB, dstChainId, nonce, block.timestamp + timelock, 0);
-    }
+// Internal helper function to handle message sending
+function _sendConcentratedLiquidityMessage(
+    uint256 amountA,
+    uint256 amountB,
+    int24 tickLower,
+    int24 tickUpper,
+    uint16 dstChainId,
+    bytes calldata adapterParams
+) internal {
+    string memory axelarChain = chainIdToAxelarChain[dstChainId];
+    bytes memory destinationAddress = trustedRemotePools[dstChainId];
+    uint64 nonce = _getNonce(dstChainId, 0);
+    uint256 timelock = _getDynamicTimelock(dstChainId);
 
+    // Encode payload
+    bytes memory payload = abi.encode(
+        msg.sender,
+        amountA,
+        amountB,
+        nonce,
+        block.timestamp + timelock,
+        true,
+        tickLower,
+        tickUpper,
+        tokenA,
+        tokenB
+    );
+
+    // Send cross-chain message
+    _sendCrossChainMessage(
+        dstChainId,
+        axelarChain,
+        destinationAddress,
+        payload,
+        adapterParams,
+        nonce,
+        timelock,
+        0
+    );
+
+    emit CrossChainLiquiditySent(
+        msg.sender,
+        amountA,
+        amountB,
+        dstChainId,
+        nonce,
+        block.timestamp + timelock,
+        0
+    );
+}
     function receiveMessage(
         uint16 srcChainId,
-        string memory srcAxelarChain,
+        // string memory srcAxelarChain,
         bytes calldata srcAddress,
         bytes calldata payload,
         bytes calldata additionalParams
@@ -1184,11 +1233,14 @@ function _batchCrossChainMessages(
         }
 
         uint64 nonce = _getNonce(dstChainIds[i], messengerType);
+        // Modify the payload to include the nonce
+        bytes memory modifiedPayload = abi.encode(abi.decode(payloads[i], (bytes)), nonce);
+
         (uint256 nativeFee, ) = ICrossChainMessenger(messenger).estimateFees(
             dstChainIds[i],
             dstAxelarChains[i],
             address(this),
-            payloads[i],
+            modifiedPayload, // Use modified payload with nonce
             adapterParams[i]
         );
 
@@ -1197,7 +1249,7 @@ function _batchCrossChainMessages(
                 dstChainIds[i],
                 dstAxelarChains[i],
                 trustedRemotePools[dstChainIds[i]],
-                payloads[i],
+                modifiedPayload, // Use modified payload
                 adapterParams[i],
                 payable(msg.sender)
             )
@@ -1208,7 +1260,7 @@ function _batchCrossChainMessages(
             failedMessages[messageId] = FailedMessage({
                 dstChainId: dstChainIds[i],
                 dstAxelarChain: dstAxelarChains[i],
-                payload: payloads[i],
+                payload: modifiedPayload, // Store modified payload
                 adapterParams: adapterParams[i],
                 retries: 0,
                 timestamp: block.timestamp,
@@ -1224,7 +1276,6 @@ function _batchCrossChainMessages(
             );
         }
     }
-
     // Refund excess ETH
     if (refundAmount > 0) {
         (bool success, ) = payable(msg.sender).call{value: refundAmount}("");

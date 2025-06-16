@@ -8,6 +8,7 @@ import "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
 import "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
 import "@openzeppelin/contracts-upgradeable/security/ReentrancyGuardUpgradeable.sol";
 import "@openzeppelin/contracts-upgradeable/token/ERC20/IERC20Upgradeable.sol";
+import {ICommonStructs} from "./Interfaces.sol";
 
 /// @title PoolFactory - An upgradeable factory for deploying AMM pools with CREATE2
 /// @notice Creates and manages AMM pools with deterministic addresses, cross-chain support, and enhanced governance
@@ -506,7 +507,7 @@ function initialize(
     }
 
     /// @notice Checks oracle health and updates status
-    function checkOracleHealth(address oracle, uint16 chainId, address tokenA, address tokenB) public returns (bool) {
+    function checkOracleHealth(address oracle, address tokenA, address tokenB) public returns (bool) {
         if (oracle == address(0)) revert InvalidAddress(oracle, "Zero address");
         OracleHealth storage health = oracleHealth[oracle];
         if (block.timestamp < health.lastChecked + oracleHealthCheckInterval) return health.isHealthy;
@@ -604,19 +605,19 @@ function initialize(
     if (newImplementation == address(0)) revert InvalidAddress(newImplementation, "Invalid implementation address");
 
     // Ensure the upgrade has been proposed and approved by the committee
-    uint256 upgradeId = upgradeProposalCount;
+    uint256 upgradeId = upgradeProposalCount - 1; // Use latest proposal
     PendingUpgrade storage upgrade = pendingUpgrades[upgradeId];
     if (upgrade.newImplementation != newImplementation || upgrade.approvals < MIN_COMMITTEE_APPROVALS) {
         revert UpgradeNotApproved(upgradeId);
-    if (block.timestamp < upgrade.proposedAt + governanceTimelock)
-    revert ProposalNotReady(upgradeId, "Timelock not elapsed");    
+    }
+    if (block.timestamp < upgrade.proposedAt + governanceTimelock) {
+        revert ProposalNotReady(upgradeId, "Timelock not elapsed");    
     }
 
     // Clear the pending upgrade after authorization
     delete pendingUpgrades[upgradeId];
     emit UpgradeExecuted(upgradeId, newImplementation);
-    }
-    
+}
 
     /// @notice Sets the asset for a token pair
     function setPairAsset(address tokenA, address tokenB, address asset) external onlyOwner {
@@ -667,7 +668,6 @@ function initialize(
         ) revert InvalidAmount("Array length mismatch");
 
         pools = new address[](length);
-        uint256 gasLeft = gasleft();
         for (uint256 i = 0; i < length; i++) {
             if (gasleft() < minGasLimit) revert InvalidGasLimit(gasleft(), minGasLimit);
             if (!chainPaused[chainIds[i]]) {
@@ -780,7 +780,7 @@ function initialize(
     }
 
     /// @notice Recovers a failed cross-chain message after max retries
-    function recoverFailedMessage(uint256 messageId, address recipient) external onlyGovernance nonReentrant {
+    function recoverFailedMessage(uint256 messageId, address recipient) external payable onlyGovernance nonReentrant {
         FailedMessage storage message = failedMessages[messageId];
         if (message.dstChainId == 0) revert MessageNotExists(messageId);
         if (message.retries < maxRetries) revert ProposalNotReady(messageId, "Max retries not reached");
@@ -800,7 +800,7 @@ function initialize(
         uint16 chainId,
         bytes calldata adapterParams,
         uint64 nonce
-    ) external whenCircuitBreakerNotTriggered nonReentrant {
+    ) external payable whenCircuitBreakerNotTriggered nonReentrant {
         if (trustedRemoteFactories[chainId].length == 0) revert InvalidAddress(address(0), "No trusted factory");
         if (usedNonces[chainId][nonce]) revert InvalidNonce();
         _validateAdapterParams(adapterParams);
@@ -864,10 +864,8 @@ function initialize(
     /// @notice Receives cross-chain pool updates
     function receiveCrossChainPoolUpdate(
         uint16 srcChainId,
-        string calldata srcAxelarChain,
         bytes calldata srcAddress,
-        bytes calldata payload,
-        bytes calldata additionalParams
+        bytes calldata payload
     ) external whenCircuitBreakerNotTriggered nonReentrant {
         uint8 messengerType;
         if (msg.sender == crossChainMessengers[0]) {
@@ -885,7 +883,7 @@ function initialize(
             revert InvalidAddress(address(0), "Invalid source address");
 
         (bytes[] memory pools, uint256 timestamp, uint64 nonce) = abi.decode(payload, (bytes[], uint256, uint64));
-        if (usedNonces[srcChainId][nonce]) revert InvalidNonce();
+        if (timestamp + maxOracleStaleness < block.timestamp) revert StaleOracleData(timestamp, block.timestamp);
         if (pools.length == 0) revert InvalidPayload();
 
         usedNonces[srcChainId][nonce] = true;
@@ -1006,7 +1004,6 @@ function initialize(
         if (proposalIds.length != inFavor.length) revert InvalidAmount("Array length mismatch");
         address voter = _getVoter(msg.sender);
         uint256 power = IERC20Upgradeable(governanceToken).balanceOf(voter);
-        uint256 gasLeft = gasleft();
         if (power == 0) revert InsufficientVotingPower(power, 0);
 
         for (uint256 i = 0; i < proposalIds.length; i++) {
@@ -1359,7 +1356,7 @@ function initialize(
     address[] memory fallbackOracleArray = fallbackOracles[chainId]; // Use state variable directly
 
     // Check primary oracle health
-    if (checkOracleHealth(primaryPriceOracle, chainId, tokenA, tokenB)) {
+    if (checkOracleHealth(primaryPriceOracle, tokenA, tokenB)) {
         // Verify precision compatibility with fallback oracles
         uint8 primaryDecimals = _getOracleDecimals(primaryPriceOracle);
         for (uint256 i = 0; i < fallbackOracleArray.length; i++) {
@@ -1378,7 +1375,7 @@ function initialize(
 
     for (uint256 i = 0; i < fallbackOracleArray.length; i++) {
         if (fallbackOracleArray[i] == address(0)) continue;
-        if (checkOracleHealth(fallbackOracleArray[i], chainId, tokenA, tokenB)) {
+        if (checkOracleHealth(fallbackOracleArray[i], tokenA, tokenB)) {
             emit OracleFailover(primaryPriceOracle, fallbackOracleArray[i]);
             selectedOracle[chainId] = fallbackOracleArray[i];
             return fallbackOracleArray[i];
@@ -1406,7 +1403,7 @@ function initialize(
     }
 }
 
-    /// @notice Internal function to create a single pool
+/// @notice Internal function to create a single pool
 function _createSinglePool(
     address tokenA,
     address tokenB,
@@ -1419,7 +1416,6 @@ function _createSinglePool(
     bytes32 salt = customSalt == bytes32(0) ? keccak256(abi.encodePacked(token0, token1, chainId)) : customSalt;
     if (salt == bytes32(0)) revert InvalidSalt();
 
-    // Deploy AMMPool with constructor arguments from poolConfig
     pool = address(new AMMPool{salt: salt}(
         poolConfig.version,
         poolConfig.minTimelock,
@@ -1430,30 +1426,28 @@ function _createSinglePool(
         poolConfig.maxRetries
     ));
 
-    // Initialize AMMPool
-    AMMPool(pool).initialize(
-        token0,
-        token1,
-        treasury,
-        crossChainMessengers[0], // LayerZero
-        crossChainMessengers[1], // Axelar
-        axelarGasService,
-        crossChainMessengers[2], // Wormhole
-        tokenBridge,
-        primaryPriceOracle,
-        fallbackOracles[chainId],
-        address(this), // Governance
-        positionManager,
-        defaultTimelock,
-        defaultTargetReserveRatio
-    );
+    ICommonStructs.InitParams memory params = ICommonStructs.InitParams({
+        tokenA: token0,
+        tokenB: token1,
+        treasury: treasury,
+        layerZeroEndpoint: crossChainMessengers[0],
+        axelarGateway: crossChainMessengers[1],
+        axelarGasService: axelarGasService,
+        wormholeCore: crossChainMessengers[2],
+        tokenBridge: tokenBridge,
+        primaryPriceOracle: primaryPriceOracle,
+        fallbackPriceOracles: fallbackOracles[chainId],
+        governance: address(this),
+        positionManager: positionManager,
+        defaultTimelock: defaultTimelock,
+        targetReserveRatio: defaultTargetReserveRatio
+    });
+    AMMPool(pool).initialize(params);
 
-    // Rest of the function remains unchanged
     getPool[token0][token1] = pool;
     allPools.push(pool);
     emit PoolCreated(token0, token1, pool, primaryPriceOracle, fallbackOracles[chainId], chainId, salt);
 
-    // Cross-chain notification logic (unchanged)
     if (trustedRemoteFactories[chainId].length > 0 && adapterParams.length > 0) {
         bytes memory payload = abi.encode(token0, token1, pool);
         string memory dstAxelarChain = chainIdToAxelarChain[chainId];
@@ -1509,7 +1503,8 @@ function _createSinglePool(
             emit CrossChainSyncSent(chainId, payload, successfulMessengerType);
         }
     }
-}
+}    
+
 
     /// @notice Internal function to update pool storage
     function _updatePoolStorage(address token0, address token1, address pool) internal {

@@ -44,6 +44,7 @@
   "dependencies": {
     "@arbitrum/nitro-contracts": "^3.0.0",
     "@chainlink/contracts": "^1.4.0",
+    "@chainlink/contracts-ccip": "^1.5.0",
     "@openzeppelin/contracts-upgradeable": "^4.9.6",
     "@openzeppelin/truffle-upgrades": "^1.21.0",
     "@prb/math": "^3.0.0",

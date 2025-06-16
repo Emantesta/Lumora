@@ -3,18 +3,22 @@ pragma solidity ^0.8.24;
 
 import {CCIPReceiver} from "@chainlink/contracts-ccip/src/v0.8/ccip/applications/CCIPReceiver.sol";
 import {Client} from "@chainlink/contracts-ccip/src/v0.8/ccip/libraries/Client.sol";
-import {ChainlinkClient} from "@chainlink/contracts/src/v0.8/ChainlinkClient.sol";
-import {Chainlink} from "@chainlink/contracts/src/v0.8/Chainlink.sol";
+import {BufferChainlink} from "@chainlink/contracts/src/v0.8/vendor/BufferChainlink.sol";
+import {ChainlinkClient} from "@chainlink/contracts/src/v0.8/operatorforwarder/ChainlinkClient.sol";
+import {Chainlink} from "@chainlink/contracts/src/v0.8/operatorforwarder/Chainlink.sol";
 import {OwnableUpgradeable} from "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
 import {Initializable} from "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
 import {UUPSUpgradeable} from "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
 import {ReentrancyGuardUpgradeable} from "@openzeppelin/contracts-upgradeable/security/ReentrancyGuardUpgradeable.sol";
 import {PausableUpgradeable} from "@openzeppelin/contracts-upgradeable/security/PausableUpgradeable.sol";
-import {AggregatorV3Interface} from "@chainlink/contracts/src/v0.8/interfaces/AggregatorV3Interface.sol";
+import {AggregatorV3Interface} from "@chainlink/contracts/src/v0.8/shared/interfaces/AggregatorV3Interface.sol";
 import {VRFConsumerBaseV2} from "@chainlink/contracts/src/v0.8/vrf/VRFConsumerBaseV2.sol";
-import {VRFCoordinatorV2Interface} from "@chainlink/contracts/src/v0.8/interfaces/VRFCoordinatorV2Interface.sol";
-import {AutomationCompatibleInterface} from "@chainlink/contracts/src/v0.8/interfaces/AutomationCompatibleInterface.sol";
+import {VRFCoordinatorV2Interface} from "@chainlink/contracts/src/v0.8/vrf/interfaces/VRFCoordinatorV2Interface.sol";
+import {AutomationCompatibleInterface} from "@chainlink/contracts/src/v0.8/automation/interfaces/AutomationCompatibleInterface.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+
+// Add this using directive with other using directives
+using BufferChainlink for BufferChainlink.buffer;
 
 /// @title CrossChainRetryOracle - A secure, upgradeable oracle with Chainlink integrations
 /// @notice Manages cross-chain network status using CCIP, Chainlink Nodes, Price Feeds, VRF, and Automation.
@@ -161,6 +165,9 @@ contract CrossChainRetryOracle is
     error InsufficientBalance(address token, uint256 balance, uint256 required);
     error InsufficientLinkForRequests(uint256 balance, uint256 required);
 
+    // State variable for VRF coordinator
+    address public vrfCoordinator; // Store VRF coordinator address
+
     // Events
     event NetworkStatusUpdated(uint64 indexed chainId, NetworkStatus status);
     event StatusRequested(uint64 indexed chainId, bytes32 indexed requestId);
@@ -212,9 +219,10 @@ contract CrossChainRetryOracle is
 
     /// @notice Constructor to disable initializers and set immutable VRF coordinator
     /// @param router CCIP router address
-    /// @param vrfCoordinator VRF coordinator address
-    constructor(address router, address vrfCoordinator) CCIPReceiver(router) VRFConsumerBaseV2(vrfCoordinator) {
-        require(vrfCoordinator != address(0), "Invalid VRF coordinator");
+    /// @param _vrfCoordinator VRF coordinator address
+    constructor(address router, address _vrfCoordinator) CCIPReceiver(router) VRFConsumerBaseV2(_vrfCoordinator) {
+        require(_vrfCoordinator != address(0), "Invalid VRF coordinator");
+        vrfCoordinator = _vrfCoordinator; // Store VRF coordinator
         _disableInitializers();
     }
 
@@ -229,7 +237,8 @@ contract CrossChainRetryOracle is
         address _chainlinkToken,
         address _chainlinkOracle,
         address _vrfCoordinator,
-        uint64 _vrfSubscriptionId
+        uint64 _vrfSubscriptionId,
+        uint64 _destChainSelector // Parameter for destination chain selector
     ) external initializer {
         require(_router != address(0), "Invalid router");
         require(_chainlinkToken != address(0), "Invalid LINK token");
@@ -241,11 +250,10 @@ contract CrossChainRetryOracle is
         __UUPSUpgradeable_init();
         __ReentrancyGuard_init();
         __Pausable_init();
-        __CCIPReceiver_init(_router);
 
         chainlinkToken = _chainlinkToken;
         chainlinkOracle = _chainlinkOracle;
-        setChainlinkToken(_chainlinkToken);
+        _setChainlinkToken(_chainlinkToken);
         maxRetryDelay = DEFAULT_MAX_RETRY_DELAY;
         minGasPrice = DEFAULT_MIN_GAS_PRICE;
         maxGasPrice = DEFAULT_MAX_GAS_PRICE;
@@ -261,6 +269,7 @@ contract CrossChainRetryOracle is
         defaultGasPrice = DEFAULT_GAS_PRICE;
         defaultTokenPrice = DEFAULT_TOKEN_PRICE;
         requestTimeout = DEFAULT_REQUEST_TIMEOUT;
+        _destChainSelector = _destChainSelector; // Store destination chain selector
 
         emit ChainlinkConfigUpdated(_chainlinkToken, _chainlinkOracle);
         emit MaxRetryDelayUpdated(maxRetryDelay);
@@ -277,75 +286,73 @@ contract CrossChainRetryOracle is
     /// @notice Receive network status via CCIP, supporting batch updates
     /// @param message The CCIP message containing network status data
     function _ccipReceive(Client.Any2EVMMessage memory message) internal override nonReentrant whenNotPaused {
-        (uint64[] memory chainIds, NetworkStatus[] memory statuses) = _decodeBatchMessage(message.data);
+    (uint64[] memory chainIds, NetworkStatus[] memory statuses) = _decodeBatchMessage(message.data);
 
-        if (chainIds.length == 0) {
-            // Single chain update
-            uint64 chainId = uint64(message.destChainSelector);
-            ChainConfig storage config = chainConfigs[chainId];
-            if (!config.active) revert ChainNotConfigured(chainId);
-            if (keccak256(message.sender) != keccak256(config.trustedSender)) revert InvalidSender(message.sender);
+    if (chainIds.length == 0) {
+        // Single chain update
+        uint64 sourcechain = uint64(message.sourceChainSelector);
+        ChainConfig storage config = chainConfigs[sourcechain]; // Use sourcechain
+        if (!config.active) revert ChainNotConfigured(sourcechain); // Use sourcechain
+        if (keccak256(message.sender) != keccak256(config.trustedSender)) revert InvalidSender(message.sender);
 
-            (
-                uint64 gasPrice,
-                uint32 confirmationTime,
-                uint8 congestionLevel,
-                bool bridgeOperational,
-                uint32 recommendedRetryDelay,
-                bool retryRecommended
-            ) = abi.decode(message.data, (uint64, uint32, uint8, bool, uint32, bool));
+        (
+            uint64 gasPrice,
+            uint32 confirmationTime,
+            uint8 congestionLevel,
+            bool bridgeOperational,
+            uint32 recommendedRetryDelay,
+            bool retryRecommended
+        ) = abi.decode(message.data, (uint64, uint32, uint8, bool, uint32, bool));
 
-            _validateStatus(gasPrice, confirmationTime, congestionLevel, recommendedRetryDelay);
+        _validateStatus(gasPrice, confirmationTime, congestionLevel, recommendedRetryDelay);
 
-            NetworkStatus storage status = networkStatuses[chainId];
-            status.gasPrice = gasPrice;
-            status.confirmationTime = confirmationTime;
-            status.congestionLevel = congestionLevel;
-            status.bridgeOperational = bridgeOperational;
-            status.recommendedRetryDelay = recommendedRetryDelay;
-            status.retryRecommended = retryRecommended;
-            status.lastUpdated = block.timestamp;
-            status.randomRetryDelay = status.randomRetryDelay == 0 ? minRandomRetryDelay : status.randomRetryDelay;
+        NetworkStatus storage status = networkStatuses[sourcechain]; // Use sourcechain
+        status.gasPrice = gasPrice;
+        status.confirmationTime = confirmationTime;
+        status.congestionLevel = congestionLevel;
+        status.bridgeOperational = bridgeOperational;
+        status.recommendedRetryDelay = recommendedRetryDelay;
+        status.retryRecommended = retryRecommended;
+        status.lastUpdated = block.timestamp;
+        status.randomRetryDelay = status.randomRetryDelay == 0 ? minRandomRetryDelay : status.randomRetryDelay;
 
-            emit NetworkStatusUpdated(chainId, status);
-            return;
-        }
-
-        // Batch update
-        for (uint256 i = 0; i < chainIds.length; i++) {
-            uint64 chainId = chainIds[i];
-            ChainConfig storage config = chainConfigs[chainId];
-            if (!config.active) revert ChainNotConfigured(chainId);
-            if (keccak256(message.sender) != keccak256(config.trustedSender)) revert InvalidSender(message.sender);
-
-            NetworkStatus memory newStatus = statuses[i];
-            _validateStatus(newStatus.gasPrice, newStatus.confirmationTime, newStatus.congestionLevel, newStatus.recommendedRetryDelay);
-            NetworkStatus storage status = networkStatuses[chainId];
-            status.gasPrice = newStatus.gasPrice;
-            status.confirmationTime = newStatus.confirmationTime;
-            status.congestionLevel = newStatus.congestionLevel;
-            status.bridgeOperational = newStatus.bridgeOperational;
-            status.recommendedRetryDelay = newStatus.recommendedRetryDelay;
-            status.retryRecommended = newStatus.retryRecommended;
-            status.lastUpdated = block.timestamp;
-            status.randomRetryDelay = status.randomRetryDelay == 0 ? minRandomRetryDelay : status.randomRetryDelay;
-
-            emit NetworkStatusUpdated(chainId, status);
-        }
-        emit BatchNetworkStatusUpdated(chainIds);
+        emit NetworkStatusUpdated(sourcechain, status); // Use sourcechain
+        return;
     }
 
+    // Batch update (unchanged)
+    for (uint256 i = 0; i < chainIds.length; i++) {
+        uint64 chainId = chainIds[i];
+        ChainConfig storage config = chainConfigs[chainId];
+        if (!config.active) revert ChainNotConfigured(chainId);
+        if (keccak256(message.sender) != keccak256(config.trustedSender)) revert InvalidSender(message.sender);
+
+        NetworkStatus memory newStatus = statuses[i];
+        _validateStatus(newStatus.gasPrice, newStatus.confirmationTime, newStatus.congestionLevel, newStatus.recommendedRetryDelay);
+        NetworkStatus storage status = networkStatuses[chainId];
+        status.gasPrice = newStatus.gasPrice;
+        status.confirmationTime = newStatus.confirmationTime;
+        status.congestionLevel = newStatus.congestionLevel;
+        status.bridgeOperational = newStatus.bridgeOperational;
+        status.recommendedRetryDelay = newStatus.recommendedRetryDelay;
+        status.retryRecommended = newStatus.retryRecommended;
+        status.lastUpdated = block.timestamp;
+        status.randomRetryDelay = status.randomRetryDelay == 0 ? minRandomRetryDelay : status.randomRetryDelay;
+
+        emit NetworkStatusUpdated(chainId, status);
+    }
+    emit BatchNetworkStatusUpdated(chainIds);
+}
     /// @notice Decode batch message for multiple chain updates
     /// @param data The encoded batch message data
     /// @return chainIds Array of chain IDs
     /// @return statuses Array of network statuses
     function _decodeBatchMessage(bytes memory data) internal pure returns (uint64[] memory chainIds, NetworkStatus[] memory statuses) {
-        try abi.decode(data, (uint64[], NetworkStatus[])) returns (uint64[] memory _chainIds, NetworkStatus[] memory _statuses) {
-            return (_chainIds, _statuses);
-        } catch {
-            return (new uint64[](0), new NetworkStatus[](0));
-        }
+    if (data.length == 0) {
+        return (new uint64[](0), new NetworkStatus[](0));
     }
+    (chainIds, statuses) = abi.decode(data, (uint64[], NetworkStatus[]));
+}
 
     /// @notice Request network status update via Chainlink Node
     /// @param chainId The target chain ID
@@ -353,35 +360,41 @@ contract CrossChainRetryOracle is
     /// @param fee The LINK fee for the request
     /// @return requestId The Chainlink request ID
     function requestNetworkStatusUpdate(uint64 chainId, bytes32 jobId, uint256 fee) public nonReentrant whenNotPaused returns (bytes32 requestId) {
-        if (!chainConfigs[chainId].active) revert ChainNotConfigured(chainId);
-        uint256 linkBalance = IERC20(chainlinkToken).balanceOf(address(this));
-        if (linkBalance < fee) revert InsufficientLink(linkBalance, fee);
+    if (!chainConfigs[chainId].active) revert ChainNotConfigured(chainId);
+    uint256 linkBalance = IERC20(chainlinkToken).balanceOf(address(this));
+    if (linkBalance < fee) revert InsufficientLink(linkBalance, fee);
 
-        Chainlink.Request memory req = buildChainlinkRequest(jobId, address(this), this.fulfillNetworkStatus.selector);
-        req.add("chainId", _toString(chainId));
-        requestId = sendChainlinkRequestTo(chainlinkOracle, req, fee);
-        requestMetadata[requestId] = RequestMetadata(chainId, block.timestamp, false);
+    // Build the Chainlink request
+    Chainlink.Request memory req = _buildOperatorRequest(jobId, this.fulfillNetworkStatus.selector);
+    // Initialize the buffer with sufficient capacity (e.g., 32 bytes for uint64)
+    BufferChainlink.init(req.buf, 32);
+    // Append the encoded chainId to the buffer
+    BufferChainlink.append(req.buf, abi.encode(chainId));
+    requestId = _sendOperatorRequest(req, fee);
+    requestMetadata[requestId] = RequestMetadata(chainId, block.timestamp, false);
 
-        emit StatusRequested(chainId, requestId);
-    }
-
+    emit StatusRequested(chainId, requestId);
+}
     /// @notice Request price feed update via Chainlink Node
     /// @param chainId The target chain ID
     /// @param fee The LINK fee for the request
     /// @return requestId The Chainlink request ID
     function requestPriceFeedUpdate(uint64 chainId, uint256 fee) public nonReentrant whenNotPaused returns (bytes32 requestId) {
-        if (!chainConfigs[chainId].active) revert ChainNotConfigured(chainId);
-        uint256 linkBalance = IERC20(chainlinkToken).balanceOf(address(this));
-        if (linkBalance < fee) revert InsufficientLink(linkBalance, fee);
+    if (!chainConfigs[chainId].active) revert ChainNotConfigured(chainId);
+    uint256 linkBalance = IERC20(chainlinkToken).balanceOf(address(this));
+    if (linkBalance < fee) revert InsufficientLink(linkBalance, fee);
 
-        Chainlink.Request memory req = buildChainlinkRequest(automationPriceFeedJobId, address(this), this.fulfillPriceFeedUpdate.selector);
-        req.add("chainId", _toString(chainId));
-        requestId = sendChainlinkRequestTo(chainlinkOracle, req, fee);
-        requestMetadata[requestId] = RequestMetadata(chainId, block.timestamp, true);
+    // Build the Chainlink request
+    Chainlink.Request memory req = _buildOperatorRequest(automationPriceFeedJobId, this.fulfillPriceFeedUpdate.selector);
+    // Initialize the buffer with sufficient capacity (e.g., 32 bytes for uint64)
+    BufferChainlink.init(req.buf, 32);
+    // Append the encoded chainId to the buffer
+    BufferChainlink.append(req.buf, abi.encode(chainId));
+    requestId = _sendOperatorRequest(req, fee);
+    requestMetadata[requestId] = RequestMetadata(chainId, block.timestamp, true);
 
-        emit PriceFeedRequested(chainId, requestId);
-    }
-
+    emit PriceFeedRequested(chainId, requestId);
+}
     /// @notice Fulfill Chainlink request with network status
     /// @param requestId The Chainlink request ID
     /// @param data The encoded network status data
@@ -883,7 +896,7 @@ contract CrossChainRetryOracle is
         if (_chainlinkOracle == address(0)) revert InvalidConfig(address(0), _chainlinkOracle, "");
         chainlinkToken = _chainlinkToken;
         chainlinkOracle = _chainlinkOracle;
-        setChainlinkToken(_chainlinkToken);
+        _setChainlinkToken(_chainlinkToken);
         emit ChainlinkConfigUpdated(_chainlinkToken, _chainlinkOracle);
     }
 

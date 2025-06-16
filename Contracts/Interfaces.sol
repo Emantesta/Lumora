@@ -114,3 +114,24 @@ interface IPositionAdjuster {
     function exitFallbackPool(uint256 positionId) external;
     function adjust(uint256 positionId, int24 tickLower, int24 tickUpper, uint256 liquidity) external;
 }
+
+/// @title ICommonStructs - Shared structs for Lumora contracts
+/// @notice Defines common structs used across multiple contracts
+interface ICommonStructs {
+    struct InitParams {
+        address tokenA;
+        address tokenB;
+        address treasury;
+        address layerZeroEndpoint;
+        address axelarGateway;
+        address axelarGasService;
+        address wormholeCore;
+        address tokenBridge;
+        address primaryPriceOracle;
+        address[] fallbackPriceOracles;
+        address governance;
+        address positionManager;
+        uint256 defaultTimelock;
+        uint256 targetReserveRatio;
+    }
+}
