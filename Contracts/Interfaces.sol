@@ -134,4 +134,36 @@ interface ICommonStructs {
         uint256 defaultTimelock;
         uint256 targetReserveRatio;
     }
+
+    struct Position {
+    address owner;
+    int24 tickLower;
+    int24 tickUpper;
+    uint256 liquidity;
+    uint256 feeGrowthInside0LastX128;
+    uint256 feeGrowthInside1LastX128;
+    uint256 tokensOwed0;
+    uint256 tokensOwed1;
+    }
+}
+
+    interface IConcentratedLiquidity {
+    function addConcentratedLiquidity(address provider, int24 tickLower, int24 tickUpper, uint256 amountA, uint256 amountB)
+        external
+        returns (uint256 positionId);
+    function removeConcentratedLiquidity(uint256 positionId, uint256 liquidity) external;
+    function collectFees(uint256 positionId) external;
+    function collectFeesInternal(uint256 positionId) external external;
+    function adjust(uint256 positionId, int24 tickLower, int24 tickUpper, uint256 liquidity) external;
+    function swapConcentratedLiquidity(bool isTokenAInput, uint256 amountIn) external returns (uint256 amountOut);
+}
+
+    interface ICrossChainModule {
+    function addLiquidityCrossChain(address provider, uint256 amountA, uint256 amountB, uint16 dstChainId, bytes calldata adapterParams) external payable;
+    function addConcentratedLiquidityCrossChain(address provider, uint256 amountA, uint256 amountB, int24 tickLower, int24 tickUpper, uint16 dstChainId, bytes calldata adapterParams) external payable;
+    function swapCrossChain(address user, address inputToken, uint256 amountIn, uint256 minAmountOut, uint16 dstChainId, bytes calldata adapterParams) external payable returns (uint256);
+    function receiveMessage(uint16 srcChainId, bytes calldata srcAddress, bytes calldata payload, bytes calldata additionalParams) external;
+    function batchCrossChainMessages(uint16[] calldata dstChainIds, string[] calldata dstAxelarChains, bytes[] calldata payloads, bytes[] calldata adapterParams, uint256[] calldata timelocks) external payable;
+    function retryFailedMessage(uint256 messageId) external payable;
+    function retryFailedMessagesBatch(uint256[] calldata messageIds) external payable;
 }
