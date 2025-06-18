@@ -15,6 +15,7 @@ import {ConcentratedLiquidity} from "./ConcentratedLiquidity.sol";
 import {CrossChainModule} from "./CrossChainModule.sol";
 import {FallbackPool} from "./FallbackPool.sol";
 import {GovernanceModule} from "./GovernanceModule.sol";
+import {DynamicFeeLibrary} from "./DynamicFeeLibrary.sol";
 
 // Interfaces
 import {IAMMPool, IPositionManager, IPriceOracle, ICommonStructs} from "./Interfaces.sol";
@@ -64,7 +65,9 @@ contract AMMPool is
         uint256 maxFee;
         uint256 volatilityMultiplier;
     }
-    mapping(uint16 => FeeConfig) public chainFees;
+    
+    // DynamicFeeLibrary state
+    DynamicFeeLibrary.State public feeState;
 
     uint256 public lpFeeShare;
     uint256 public treasuryFeeShare;
@@ -81,15 +84,8 @@ contract AMMPool is
     mapping(uint16 => uint256) public chainTimelocks;
     mapping(address => uint8) public tokenBridgeType;
     uint256 public targetReserveRatio;
-    address public primaryPriceOracle;
-    address[] public fallbackPriceOracles;
     address public governance;
-    uint256 public emaVolatility;
-    uint256 public emaPeriod;
-    uint256 public volatilityThreshold;
-    uint256 public lastPrice;
-    bool public useConstantSum;
-    uint256 public priceDeviationThreshold;
+    
 
     // Cross-chain messengers
     mapping(uint8 => address) public crossChainMessengers;
@@ -146,8 +142,6 @@ contract AMMPool is
     uint256 public proposalCount;
 
     // Historical price data
-    uint256[] public priceHistory;
-    uint256 public priceHistoryIndex;
     uint256 public constant PRICE_HISTORY_SIZE = 20;
     uint256 public constant VOLATILITY_WINDOW = 10;
 
@@ -250,6 +244,7 @@ contract AMMPool is
     event FailedMessageRecovered(uint256 indexed messageId, address indexed recipient);
     event AllLPFeesClaimed(address indexed provider, uint256 amountA, uint256 amountB);
     event OracleFailover(address indexed failedOracle, address indexed newOracle);
+    event OracleFailover(address indexed primaryOracle, address indexed fallbackOracle);
     event FeesCollected(uint256 indexed positionId, uint256 amount0, uint256 amount1);
     event FallbackPoolEntered(uint256 indexed positionId, uint256 liquidity);
     event FallbackPoolExited(uint256 indexed positionId, uint256 liquidity);
@@ -351,6 +346,21 @@ contract AMMPool is
             revert InvalidTimelock(params.defaultTimelock);
         if (params.targetReserveRatio == 0)
             revert InvalidReserveRatio(params.targetReserveRatio);
+
+        // Initialize feeState
+        feeState.emaPeriod = 100;
+        feeState.volatilityThreshold = 1e16;
+        feeState.priceDeviationThreshold = 1e16;
+        feeState.primaryPriceOracle = params.primaryPriceOracle;
+        feeState.fallbackPriceOracles = params.fallbackPriceOracles;
+        feeState.chainFees[1] = DynamicFeeLibrary.FeeConfig({
+            baseFee: 20,
+            maxFee: 100,
+            volatilityMultiplier: 2
+        });
+        feeState.priceHistory = new uint256[](PRICE_HISTORY_SIZE);
+        feeState.useConstantSum = true;
+        
 
         // Validate fallback oracles
         bool hasValidOracle;
@@ -500,7 +510,7 @@ contract AMMPool is
             reserves.reserveB += uint64(amountB);
         }
 
-        governanceModule.updateVolatility();
+        DynamicFeeLibrary.updateVolatility(feeState, this, tokenA, tokenB);
         emit LiquidityAdded(msg.sender, amountA, amountB, liquidity);
     }
 
@@ -522,7 +532,7 @@ contract AMMPool is
         IERC20Upgradeable(tokenA).safeTransfer(msg.sender, amountA);
         IERC20Upgradeable(tokenB).safeTransfer(msg.sender, amountB);
 
-        governanceModule.updateVolatility();
+        DynamicFeeLibrary.updateVolatility(feeState, this, tokenA, tokenB);
         emit LiquidityRemoved(msg.sender, amountA, amountB, liquidity);
     }
 
@@ -536,7 +546,8 @@ contract AMMPool is
         if (amountIn == 0) revert InvalidAmount(amountIn, 0);
 
         bool isTokenAInput = inputToken == tokenA;
-        uint256 fee = governanceModule.getDynamicFee(1);
+        uint256 fee = DynamicFeeLibrary.getDynamicFee(feeState, 1);
+        uint256 amountInWithFee = (amountIn * (10000 - fee)) / 10000;
         uint256 amountInWithFee = (amountIn * (10000 - fee)) / 10000;
         uint256 lpFee = (amountIn * fee * lpFeeShare) / 10000;
         uint256 treasuryFee = (amountIn * fee * treasuryFeeShare) / 10000;
@@ -565,7 +576,7 @@ contract AMMPool is
             }
         }
 
-        governanceModule.validatePrice(inputToken, amountIn, amountOut);
+        DynamicFeeLibrary.validatePrice(feeState, inputToken, amountIn, amountOut, tokenA, tokenB);
 
         address outputToken = isTokenAInput ? tokenB : tokenA;
         IERC20Upgradeable(inputToken).safeTransferFrom(msg.sender, address(this), amountIn);
@@ -827,7 +838,7 @@ contract AMMPool is
     // --- View Functions ---
 
     function emaVol() external view returns (uint256) {
-        return emaVolatility;
+    return feeState.emaVolatility;
     }
 
     function getcurrentTick() external view returns (int24) {
@@ -877,6 +888,10 @@ contract AMMPool is
         return fallbackLiquidityBalance[provider];
     }
 
+    function getDynamicFee(uint16 chainId) external view returns (uint256) {
+    return DynamicFeeLibrary.getDynamicFee(feeState, chainId);
+    }
+
     function getLPFees(address provider, address token) external view returns (uint256) {
         return lpFees[provider][token];
     }
@@ -886,8 +901,8 @@ contract AMMPool is
     }
 
     function getChainFeeConfig(uint16 chainId) external view returns (uint256 baseFee, uint256 maxFee, uint256 volatilityMultiplier) {
-        FeeConfig storage config = chainFees[chainId];
-        return (config.baseFee, config.maxFee, config.volatilityMultiplier);
+    DynamicFeeLibrary.FeeConfig storage config = feeState.chainFees[chainId];
+    return (config.baseFee, config.maxFee, config.volatilityMultiplier);
     }
 
     function getFailedMessage(uint256 messageId) external view returns (
@@ -924,7 +939,7 @@ contract AMMPool is
     }
 
     function getPriceHistory() external view returns (uint256[] memory) {
-        return priceHistory;
+    return feeState.priceHistory;
     }
 
     function getAmplificationFactor() external view returns (uint256) {
@@ -952,6 +967,10 @@ contract AMMPool is
         return 10;
     }
 
+    function PRICE_HISTORY_SIZE() external pure returns (uint256) {
+    return 20;
+    }
+
     function setAmplificationFactor(uint256 newA) external onlyGovernanceModule {
     amplificationFactor = newA;
     }
@@ -973,6 +992,11 @@ contract AMMPool is
 
     function setVolatilityThreshold(uint256 newThreshold) external onlyGovernanceModule {
         volatilityThreshold = newThreshold;
+    }
+
+    function setVolatilityThreshold(uint256 newThreshold) external onlyGovernanceModule {
+    feeState.volatilityThreshold = newThreshold;
+    emit VolatilityThresholdUpdated(newThreshold);
     }
 
     function setTrustedRemotePool(uint16 chainId, bytes calldata poolAddress) external onlyGovernanceModule {
@@ -1028,7 +1052,7 @@ contract AMMPool is
         emaVolatility = newEmaVol;
     }
 
-    // NEW: View functions for concentrated liquidity
+    // View functions for concentrated liquidity
     function getFeeGrowthInside(int24 tickLower, int24 tickUpper, uint8 tokenId) external view returns (uint256) {
         if (tickLower >= tickUpper) revert InvalidTickRange(tickLower, tickUpper);
         Tick storage lower = ticks[tickLower];
@@ -1052,6 +1076,27 @@ contract AMMPool is
 
     // --- Internal Helper Functions ---
 
+    function getOraclePrice() internal returns (uint256 price) {
+        uint256 maxRetries = MAX_ORACLE_RETRIES; // Use AMMPool constant
+        for (uint256 i = 0; i <= maxRetries; i++) {
+            try IPriceOracle(feeState.primaryPriceOracle).getPrice(tokenA, tokenB) returns (int256 oraclePrice) {
+                if (oraclePrice <= 0) revert DynamicFeeLibrary.NegativeOraclePrice(oraclePrice);
+                return uint256(oraclePrice);
+            } catch {
+                if (i == maxRetries) break;
+            }
+        }
+        for (uint256 i = 0; i < feeState.fallbackPriceOracles.length; i++) {
+            if (feeState.fallbackPriceOracles[i] == address(0)) continue;
+            try IPriceOracle(feeState.fallbackPriceOracles[i]).getPrice(tokenA, tokenB) returns (int256 fallbackPrice) {
+                if (fallbackPrice <= 0) revert DynamicFeeLibrary.NegativeOraclePrice(fallbackPrice);
+                emit OracleFailover(feeState.primaryPriceOracle, feeState.fallbackPriceOracles[i]);
+                return uint256(fallbackPrice);
+            } catch {}
+        }
+        revert DynamicFeeLibrary.OracleFailure();
+    }
+    
     function _updateReserves(bool isTokenAInput, uint256 amountIn, uint256 amountOut) internal {
         if (isTokenAInput) {
             unchecked {
@@ -1085,6 +1130,17 @@ contract AMMPool is
 
     function setPosition(uint256 positionId, Position memory position) external onlyCrossChainModule {
         positions[positionId] = position;
+    }
+
+    function setChainFeeConfig(uint16 chainId, uint256 baseFee, uint256 maxFee, uint256 volatilityMultiplier) 
+        external 
+        onlyGovernanceModule 
+    {
+        feeState.chainFees[chainId] = DynamicFeeLibrary.FeeConfig({
+            baseFee: baseFee,
+            maxFee: maxFee,
+            volatilityMultiplier: volatilityMultiplier
+        });
     }
 
     function incrementPositionCounter() external onlyCrossChainModule {

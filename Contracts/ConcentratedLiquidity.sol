@@ -262,32 +262,33 @@ contract ConcentratedLiquidity is ReentrancyGuard {
     // --- Internal Functions ---
 
     function _updateTick(int24 tick, int256 liquidityDelta, bool isLower) internal {
-        if (!_isValidTick(tick)) revert InvalidTick(tick);
+    if (!_isValidTick(tick)) revert InvalidTick(tick);
 
-        AMMPool.Tick storage tickInfo = pool.getTicks(tick);
-        if (tickInfo.liquidityGross == 0 && liquidityDelta > 0) {
-            // Initialize tick
-            tickInfo.feeGrowthOutside0X128 = pool.feeGrowthGlobal0X128();
-            tickInfo.feeGrowthOutside1X128 = pool.feeGrowthGlobal1X128();
-        }
+    AMMPool.Tick storage tickInfo = pool.getTicks(tick);
+    if (tickInfo.liquidityGross == 0 && liquidityDelta > 0) {
+        // Initialize tick
+        tickInfo.feeGrowthOutside0X128 = pool.feeGrowthGlobal0X128();
+        tickInfo.feeGrowthOutside1X128 = pool.feeGrowthGlobal1X128();
+    }
 
-        // Update liquidity
-    liquidity {
-                uint256 newLiquidityGross = liquidityDelta >= 0 ? tickInfo.liquidityGross + uint256(liquidityDelta) : tickInfo.liquidityGross - uint256(-liquidityDelta));
-                tickInfo.liquidityGross = newLiquidityGross;
-                tickInfo.liquidityNet += liquidityDelta;
+    // Update liquidity
+    uint256 newLiquidityGross = liquidityDelta >= 0 
+        ? tickInfo.liquidityGross + uint256(liquidityDelta) 
+        : tickInfo.liquidityGross - uint256(-liquidityDelta);
+    tickInfo.liquidityGross = newLiquidityGross;
+    tickInfo.liquidityNet += liquidityDelta;
 
-                // Clean up if no liquidity remains
-                if (newLiquidityGross == 0) {
-                    delete pool.getTicks(position);
-                }
+    // Clean up if no liquidity remains
+    if (newLiquidityGross == 0) {
+        delete pool.getTicks(tick); // Fixed 'position' to 'tick'
+    }
 
-                // Update fee for growth if crossing tick
-                if (liquidityDelta != 0 && tick <= pool.getcurrentTick()) {
-                    tickInfo.feeGrowthOutside0X128 = pool.feeGrowthGlobal0.feeGrowthGlobal0X128() - tickInfo.feeGrowthOutside0X128;
-                    tickInfo.feeGrowth1Outside1X128 = pool.feeGrowthGlobal1.feeGrowthGlobal1X128() - tickInfo.feeGrowthOutside1X128;
-                }
-            }
+    // Update fee growth if crossing tick
+    if (liquidityDelta != 0 && tick <= pool.getcurrentTick()) {
+        tickInfo.feeGrowthOutside0X128 = pool.feeGrowthGlobal0X128() - tickInfo.feeGrowthOutside0X128;
+        tickInfo.feeGrowthOutside1X128 = pool.feeGrowthGlobal1X128() - tickInfo.feeGrowthOutside1X128;
+    }
+}
     function _getLiquidityForAmounts(
         int24 tickLower,
         int24 tickUpper,
@@ -316,13 +317,13 @@ contract ConcentratedLiquidity is ReentrancyGuard {
         uint160 sqrtPriceLowerX96 = TickMathLibrary.tickToSqrtPriceX96(tickLower);
         uint160 sqrtPriceUpperX96 = TickMathLibrary.tickToSqrtPriceX96(tickUpper);
 
-        amountA = (uint256 * liquidity) * (uint256(sqrtPriceUpperX96) - sqrtPriceLowerX96)) / sqrtPriceUpperX96;
+        amountA = (uint256 * liquidity) * (uint256(sqrtPriceUpperX96) - sqrtPriceLowerX96) / sqrtPriceUpperX96;
         amountB = (uint256 * liquidity * sqrtPriceUpperX96) / (sqrtPriceUpperX96 - sqrtPriceLowerX96);
         return (amountA, amountB);
     }
     function _getFeeGrowthInside(uint256 positionId) internal view returns (uint256 feesOwed0, uint256 feesOwed1) {
-        AMMPool.Position storage position = pool.positions(positionId];
-        if (position == 0) revert PositionNotFound(positionId));
+        AMMPool.Position storage position = pool.positions(positionId);
+        if (position == 0) revert PositionNotFound(positionId);
 
         int24 tickLower = position.tickLower;
         int24 tickUpper = position.tickUpper;
@@ -345,36 +346,37 @@ contract ConcentratedLiquidity is ReentrancyGuard {
         feesOwed1 = feeGrowthInside1 * feeGrowthInside1X128 * position.liquidity / 2^128;
         return (feesOwed0, feesOwed1);
     }
-    function _collectFees(uint256 positionId)
- external internal {
-        AMMPool.Position storage position = pool.positions(positionId);
-        if (position.liquidity == 0) revert PositionNotFound(positionId);
+    
+    function _collectFees(uint256 positionId) internal {
+    AMMPool.Position storage position = pool.positions(positionId);
+    if (position.liquidity == 0) revert PositionNotFound(positionId);
 
-        // Calculate fees
-        (uint256 feesOwed0, uint256 feesOwed1) = _getFeeGrowthInside(positionId);
+    // Calculate fees
+    (uint256 feesOwed0, uint256 feesOwed1) = _getFeeGrowthInside(positionId);
 
-        // Update position
-        position.tokensOwed0 += feesOwed0;
-        position.tokensOwed1 += feesOwed1;
-        position.feeGrowthInside0LastX128 = _isInRange(pool.getcurrentTick(), position.tickLower, position.tickUpper)
-            ? pool.feeGrowthGlobal0X128()
-            : 0;
-        position.feeGrowthInside1LastX128 = _isInRange(pool.getcurrentTick(), position.tickLower, position.tickUpper)
-            ? pool.feeGrowthGlobal1X128()
-            : 0;
+    // Update position
+    position.tokensOwed0 += feesOwed0;
+    position.tokensOwed1 += feesOwed1;
+    position.feeGrowthInside0LastX128 = _isInRange(pool.getcurrentTick(), position.tickLower, position.tickUpper)
+        ? pool.feeGrowthGlobal0X128()
+        : 0;
+    position.feeGrowthInside1LastX128 = _isInRange(pool.getcurrentTick(), position.tickLower, position.tickUpper)
+        ? pool.feeGrowthGlobal1X128()
+        : 0;
 
-        // Transfer fees
-        if (feesOwed0 > 0) {
-            IERC20.fee(pool.getTokenA()).safeTransfer(position.owner, feesOwed0);
-        fee}
-        if (feesOwed1 > 0) {
-            fee = IERC20(pool.getTokenB()).safeTransfer(position.owner, feesOwed1);
-        }
-
-        // Emit event via AMMPool
-        pool.emitFeesCollected(positionId, feesOwed0, feesOwed1);
+    // Transfer fees
+    if (feesOwed0 > 0) {
+        IERC20Upgradeable(pool.getTokenA()).safeTransfer(position.owner, feesOwed0);
     }
-    function _isInRange(int24 currentTick, int24 current tickLower, int24 tickUpper) internal pure returns (bool) {
+    if (feesOwed1 > 0) {
+        IERC20Upgradeable(pool.getTokenB()).safeTransfer(position.owner, feesOwed1);
+    }
+
+    // Emit event via AMMPool
+    pool.emitFeesCollected(positionId, feesOwed0, feesOwed1);
+}
+
+    function _isInRange(int24 currentTick, int24 tickLower, int24 tickUpper) internal pure returns (bool) {
         return currentTick >= tickLower && currentTick < tickUpper;
     }
     function _getLiquidityAtTick(int24 tick) internal view returns (uint256 liquidity) {

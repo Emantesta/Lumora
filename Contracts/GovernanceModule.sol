@@ -348,19 +348,6 @@ contract GovernanceModule is ReentrancyGuard {
         emit GovernanceUpdated(newGovernance);
     }
 
-    /// @notice Calculates dynamic fee based on volatility
-    /// @param chainId The chain ID
-    /// @return fee The calculated fee
-    function getDynamicFee(uint16 chainId) 
-        external 
-        view 
-        returns (uint256 fee) 
-    {
-        (uint256 baseFee, uint256 maxFee, uint256 volatilityMultiplier) = pool.getChainFeeConfig(chainId);
-        uint256 volatility = pool.emaVol();
-        fee = baseFee + ((volatility * volatilityMultiplier) / 1e18);
-        return fee > maxFee ? maxFee : fee;
-    }
 
     /// @notice Executes a constant-sum swap calculation
     /// @param amountIn The input amount
@@ -377,44 +364,5 @@ contract GovernanceModule is ReentrancyGuard {
         amountOut = amountIn * reserveOut / (reserveIn + amountIn);
         if (amountOut > reserveOut) revert InsufficientReserve(amountOut, reserveOut);
         return amountOut;
-    }
-
-    /// @notice Validates swap price against oracle
-    /// @param inputToken The input token
-    /// @param amountIn The input amount
-    /// @param amountOut The output amount
-    function validatePrice(address inputToken, uint256 amountIn, uint256 amountOut) 
-        external 
-        onlyPool 
-    {
-        if (inputToken != pool.tokenA() && inputToken != pool.tokenB()) revert InvalidToken(inputToken);
-        uint256 expectedPrice = pool.lastPrice(); // Simplified; use oracle in production
-        uint256 actualPrice = (amountOut * 1e18) / amountIn;
-        if (actualPrice > expectedPrice + pool.priceDeviationThreshold() || 
-            actualPrice < expectedPrice - pool.priceDeviationThreshold()) 
-            revert InvalidPrice(expectedPrice, actualPrice);
-    }
-
-    /// @notice Updates volatility based on EMA
-    function updateVolatility() 
-        external 
-        onlyPool 
-    {
-        uint256[] memory priceHistory = pool.getPriceHistory();
-        uint256 newPrice = pool.lastPrice(); // Simplified; use oracle in production
-        uint256 volatility;
-        if (priceHistory.length > 1) {
-            uint256 sum;
-            for (uint256 i = 1; i < priceHistory.length && i <= pool.VOLATILITY_WINDOW(); i++) {
-                sum += priceHistory[i] > priceHistory[i-1] 
-                    ? priceHistory[i] - priceHistory[i-1] 
-                    : priceHistory[i-1] - priceHistory[i];
-            }
-            volatility = sum / (priceHistory.length - 1);
-        }
-        uint256 emaVol = pool.emaVol();
-        uint256 emaPeriod = pool.emaPeriod();
-        uint256 newEmaVol = ((volatility * 2) / (emaPeriod + 1)) + (emaVol * (emaPeriod - 1) / (emaPeriod + 1));
-        pool.setEmaVol(newEmaVol);
     }
 }

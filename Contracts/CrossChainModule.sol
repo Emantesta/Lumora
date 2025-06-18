@@ -5,7 +5,7 @@ import {ReentrancyGuard} from "@openzeppelin/contracts/security/ReentrancyGuard.
 import {IERC20Upgradeable} from "@openzeppelin/contracts-upgradeable/token/ERC20/IERC20Upgradeable.sol";
 import {SafeERC20Upgradeable} from "@openzeppelin/contracts-upgradeable/token/ERC20/utils/SafeERC20Upgradeable.sol";
 import {AMMPool} from "./AMMPool.sol";
-import {Interfaces} from "./Interfaces.sol";
+import {ICrossChainModule} from "./Interfaces.sol";
 
 /// @title CrossChainModule - Handles cross-chain messaging and token bridging for AMM pool
 /// @notice Manages cross-chain liquidity addition, token bridging, message validation, and retry mechanisms

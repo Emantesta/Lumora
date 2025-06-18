@@ -3,6 +3,7 @@ pragma solidity ^0.8.24;
 
 interface IPriceOracle {
     function getPrice(address asset) external returns (uint256);
+    function getPrice(address tokenA, address tokenB) external view returns (int256);
     function getCurrentPrice(address asset) external view returns (uint256);
     function getCurrentPairPrice(address baseToken, address quoteToken) external view returns (uint256, bool);
     function assetConfigs(address pool) external view returns (
@@ -153,7 +154,7 @@ interface ICommonStructs {
         returns (uint256 positionId);
     function removeConcentratedLiquidity(uint256 positionId, uint256 liquidity) external;
     function collectFees(uint256 positionId) external;
-    function collectFeesInternal(uint256 positionId) external external;
+    function collectFeesInternal(uint256 positionId) external;
     function adjust(uint256 positionId, int24 tickLower, int24 tickUpper, uint256 liquidity) external;
     function swapConcentratedLiquidity(bool isTokenAInput, uint256 amountIn) external returns (uint256 amountOut);
 }
