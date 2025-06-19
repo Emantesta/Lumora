@@ -16,6 +16,7 @@ import {CrossChainModule} from "./CrossChainModule.sol";
 import {FallbackPool} from "./FallbackPool.sol";
 import {GovernanceModule} from "./GovernanceModule.sol";
 import {DynamicFeeLibrary} from "./DynamicFeeLibrary.sol";
+import {TickMathLibrary} from "./TickMathLibrary.sol";
 
 // Interfaces
 import {IAMMPool, IPositionManager, IPriceOracle, ICommonStructs} from "./Interfaces.sol";
@@ -548,7 +549,6 @@ contract AMMPool is
         bool isTokenAInput = inputToken == tokenA;
         uint256 fee = DynamicFeeLibrary.getDynamicFee(feeState, 1);
         uint256 amountInWithFee = (amountIn * (10000 - fee)) / 10000;
-        uint256 amountInWithFee = (amountIn * (10000 - fee)) / 10000;
         uint256 lpFee = (amountIn * fee * lpFeeShare) / 10000;
         uint256 treasuryFee = (amountIn * fee * treasuryFeeShare) / 10000;
 
@@ -951,25 +951,6 @@ contract AMMPool is
     }
 
     // New constant getter functions
-    function MIN_AMPLIFICATION() external pure returns (uint256) {
-        return 1;
-    }
-
-    function MAX_AMPLIFICATION() external pure returns (uint256) {
-        return 1000;
-    }
-
-    function GOVERNANCE_TIMELOCK() external pure returns (uint256) {
-        return 86400; // 1 day
-    }
-
-    function VOLATILITY_WINDOW() external pure returns (uint256) {
-        return 10;
-    }
-
-    function PRICE_HISTORY_SIZE() external pure returns (uint256) {
-    return 20;
-    }
 
     function setAmplificationFactor(uint256 newA) external onlyGovernanceModule {
     amplificationFactor = newA;
@@ -979,19 +960,8 @@ contract AMMPool is
         positionAdjuster = newAdjuster;
     }
 
-    function setChainFeeConfig(uint16 chainId, uint256 baseFee, uint256 maxFee, uint256 volatilityMultiplier) 
-        external 
-        onlyGovernanceModule 
-    {
-        chainFees[chainId] = FeeConfig(baseFee, maxFee, volatilityMultiplier);
-    }
-
     function setPositionManager(address newPositionManager) external onlyGovernanceModule {
         positionManager = newPositionManager;
-    }
-
-    function setVolatilityThreshold(uint256 newThreshold) external onlyGovernanceModule {
-        volatilityThreshold = newThreshold;
     }
 
     function setVolatilityThreshold(uint256 newThreshold) external onlyGovernanceModule {
