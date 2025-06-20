@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-License-Identifier: MIT
 pragma solidity ^0.8.24;
 
 interface IPriceOracle {
@@ -72,35 +72,15 @@ interface IAMMPool {
 }
 
 interface IPositionManager {
-    /// @notice Mints a new position for a recipient
-    /// @param positionId The ID of the position to mint
-    /// @param recipient The address to receive the position
     function mintPosition(uint256 positionId, address recipient) external;
-
-    /// @notice Returns the fee destination address for a given owner
-    /// @param owner The address of the position owner
-    /// @return destination The address where fees should be sent
     function feeDestinations(address owner) external view returns (address);
     function approve(address to, uint256 tokenId) external;
-
-    /// @notice Collects and bridges fees for a position to a destination chain
-    /// @param positionId The ID of the position
-    /// @param dstChainId The destination chain ID
-    /// @param bridgeType The type of bridge to use
-    /// @param adapterParams Additional parameters for the bridge
     function collectAndBridgeFees(
         uint256 positionId,
         uint16 dstChainId,
         uint8 bridgeType,
         bytes calldata adapterParams
     ) external payable;
-
-    /// @notice Bridges fees for multiple positions in a batch
-    /// @param positionIds Array of position IDs
-    /// @param total0 Total fees in token0
-    /// @param total1 Total fees in token1
-    /// @param bridgeType The type of bridge to use
-    /// @param adapterParams Additional parameters for the bridge
     function batchBridgeFees(
         uint256[] calldata positionIds,
         uint256 total0,
@@ -116,8 +96,6 @@ interface IPositionAdjuster {
     function adjust(uint256 positionId, int24 tickLower, int24 tickUpper, uint256 liquidity) external;
 }
 
-/// @title ICommonStructs - Shared structs for Lumora contracts
-/// @notice Defines common structs used across multiple contracts
 interface ICommonStructs {
     struct InitParams {
         address tokenA;
@@ -137,18 +115,18 @@ interface ICommonStructs {
     }
 
     struct Position {
-    address owner;
-    int24 tickLower;
-    int24 tickUpper;
-    uint256 liquidity;
-    uint256 feeGrowthInside0LastX128;
-    uint256 feeGrowthInside1LastX128;
-    uint256 tokensOwed0;
-    uint256 tokensOwed1;
+        address owner;
+        int24 tickLower;
+        int24 tickUpper;
+        uint256 liquidity;
+        uint256 feeGrowthInside0LastX128;
+        uint256 feeGrowthInside1LastX128;
+        uint256 tokensOwed0;
+        uint256 tokensOwed1;
     }
 }
 
-    interface IConcentratedLiquidity {
+interface IConcentratedLiquidity {
     function addConcentratedLiquidity(address provider, int24 tickLower, int24 tickUpper, uint256 amountA, uint256 amountB)
         external
         returns (uint256 positionId);
@@ -159,7 +137,7 @@ interface ICommonStructs {
     function swapConcentratedLiquidity(bool isTokenAInput, uint256 amountIn) external returns (uint256 amountOut);
 }
 
-    interface ICrossChainModule {
+interface ICrossChainModule {
     function addLiquidityCrossChain(address provider, uint256 amountA, uint256 amountB, uint16 dstChainId, bytes calldata adapterParams) external payable;
     function addConcentratedLiquidityCrossChain(address provider, uint256 amountA, uint256 amountB, int24 tickLower, int24 tickUpper, uint16 dstChainId, bytes calldata adapterParams) external payable;
     function swapCrossChain(address user, address inputToken, uint256 amountIn, uint256 minAmountOut, uint16 dstChainId, bytes calldata adapterParams) external payable returns (uint256);
@@ -167,4 +145,81 @@ interface ICommonStructs {
     function batchCrossChainMessages(uint16[] calldata dstChainIds, string[] calldata dstAxelarChains, bytes[] calldata payloads, bytes[] calldata adapterParams, uint256[] calldata timelocks) external payable;
     function retryFailedMessage(uint256 messageId) external payable;
     function retryFailedMessagesBatch(uint256[] calldata messageIds) external payable;
+}
+
+interface ILayerZeroEndpoint {
+    function send(
+        uint16 _dstChainId,
+        bytes calldata _destination,
+        bytes calldata _payload,
+        address payable _refundAddress,
+        address _zroPaymentAddress,
+        bytes calldata _adapterParams
+    ) external payable;
+    function estimateFees(
+        uint16 _dstChainId,
+        address _destination,
+        bytes calldata _payload,
+        bool _payInZRO,
+        bytes calldata _adapterParams
+    ) external view returns (uint256 nativeFee, uint256 zroFee);
+    function getInboundNonce(uint16 _srcChainId, bytes calldata _srcAddress) external view returns (uint64);
+}
+
+interface IAxelarGateway {
+    function callContract(
+        string calldata destinationChain,
+        string calldata destinationAddress,
+        bytes calldata payload
+    ) external;
+    function validateContractCall(
+        bytes32 commandId,
+        string calldata sourceChain,
+        string calldata sourceAddress,
+        bytes32 payloadHash
+    ) external view returns (bool valid);
+}
+
+interface IAxelarGasService {
+    function payNativeGasForContractCall(
+        bytes32 txHash,
+        uint256 logIndex,
+        address gasPayer
+    ) external payable;
+}
+
+interface IWormhole {
+    function publishMessage(
+        bytes calldata payload,
+        uint32 nonce,
+        uint8 consistencyLevel
+    ) external payable returns (uint64 sequence);
+    function parseAndVerifyVM(
+        bytes calldata vaa
+    ) external view returns (uint16 emitterChainId, bytes32 emitterAddress, uint64 sequence, bytes memory payload);
+}
+
+interface ICrossChainMessenger {
+    function sendMessage(
+        uint16 dstChainId,
+        string calldata dstAxelarChain,
+        bytes calldata dstAddress,
+        bytes calldata payload,
+        bytes calldata adapterParams,
+        address payable refundAddress
+    ) external payable;
+    function estimateFees(
+        uint16 dstChainId,
+        string calldata dstAxelarChain,
+        address user,
+        bytes calldata payload,
+        bytes calldata adapterParams
+    ) external view returns (uint256 nativeFee, uint256 zroFee);
+}
+
+interface ITokenBridge {
+    function burn(address token, uint256 amount, address recipient, uint16 dstChainId) external;
+    function lock(address token, uint256 amount, address recipient, uint16 dstChainId) external;
+    function mint(address token, uint256 amount, address recipient) external;
+    function release(address token, uint256 amount, address recipient) external;
 }
