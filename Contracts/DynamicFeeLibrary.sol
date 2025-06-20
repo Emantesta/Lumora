@@ -29,6 +29,7 @@ library DynamicFeeLibrary {
         uint256 priceDeviationThreshold;
         address primaryPriceOracle;
         address[] fallbackPriceOracles;
+        int24 currentTick; // Required for TickMathLibrary
     }
 
     // Custom errors

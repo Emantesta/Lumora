@@ -5,6 +5,8 @@ import {ReentrancyGuard} from "@openzeppelin/contracts/security/ReentrancyGuard.
 import {IERC20Upgradeable} from "@openzeppelin/contracts-upgradeable/token/ERC20/IERC20Upgradeable.sol";
 import {SafeERC20Upgradeable} from "@openzeppelin/contracts-upgradeable/token/ERC20/utils/SafeERC20Upgradeable.sol";
 import {AMMPool} from "./AMMPool.sol";
+import {TickMath} from "./TickMath.sol";
+import {TickMathLibrary} from "./TickMathLibrary.sol";
 
 /// @title FallbackPool - Manages the fallback pool for out-of-range positions
 /// @notice Handles liquidity for positions outside the current tick range, swaps, and fee compounding
@@ -68,6 +70,7 @@ contract FallbackPool is ReentrancyGuard {
         
         (address owner, int24 tickLower, int24 tickUpper, uint256 liquidity,,) = pool.getPosition(positionId);
         if (liquidity == 0) revert InsufficientLiquidity(liquidity);
+        if (liquidity > type(uint128).max) revert InsufficientLiquidity(liquidity);
         
         int24 currentTick = pool.getcurrentTick();
         if (currentTick < tickLower || currentTick >= tickUpper) {
@@ -159,15 +162,28 @@ contract FallbackPool is ReentrancyGuard {
     /// @param amountIn The input amount
     /// @return amountOut The output amount
     function swapFallbackPool(bool isTokenAInput, uint256 amountIn) external onlyPool returns (uint256 amountOut) {
+        // Determine input token
+        address inputToken = isTokenAInput ? pool.tokenA() : pool.tokenB();
+        
+        // Get current tick and convert to sqrtPriceX96
+        int24 currentTick = pool.getcurrentTick();
+        uint160 sqrtPriceX96 = TickMath.getSqrtRatioAtTick(currentTick);
+        
+        // Calculate output amount using TickMathLibrary
+        amountOut = TickMathLibrary.calculateAmountOut(
+            pool,
+            sqrtPriceX96,
+            inputToken,
+            amountIn
+        );
+        
+        // Additional reserve check for safety
         (uint256 reserveIn, uint256 reserveOut) = isTokenAInput
             ? (fallbackReserves.reserveA, fallbackReserves.reserveB)
             : (fallbackReserves.reserveB, fallbackReserves.reserveA);
-        
-        // Simplified constant-product formula
-        amountOut = (reserveOut * amountIn) / (reserveIn + amountIn);
-        
         if (amountOut > reserveOut) revert InsufficientReserve(amountOut, reserveOut);
         
+        // Update reserves
         updateFallbackReserves(isTokenAInput, amountIn, amountOut);
         
         return amountOut;
@@ -194,5 +210,17 @@ contract FallbackPool is ReentrancyGuard {
     function transferToken(address token, address recipient, uint256 amount) external onlyPositionAdjuster {
         if (token != pool.tokenA() && token != pool.tokenB()) revert InvalidToken(token);
         IERC20Upgradeable(token).safeTransfer(recipient, amount);
+    }
+
+    function getFallbackReserves() 
+        external 
+        view 
+        returns (uint256 reserveA, uint256 reserveB, uint256 totalLiquidity) 
+    {
+        return (
+            fallbackReserves.reserveA,
+            fallbackReserves.reserveB,
+            fallbackReserves.totalLiquidity
+        );
     }
 }

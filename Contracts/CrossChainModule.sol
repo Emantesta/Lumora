@@ -288,6 +288,7 @@ function swapCrossChain(
         if (isConcentrated) {
             if (!_isValidTickRange(tickLower, tickUpper)) revert InvalidTickRange(tickLower, tickUpper);
             liquidity = pool.getLiquidityForAmounts(tickLower, tickUpper, amountA, amountB);
+            if (liquidity > type(uint128).max) revert InvalidAmount(liquidity, type(uint128).max);
             positionId = pool.positionCounter();
             AMMPool.Position memory position = AMMPool.Position({
                 owner: provider,

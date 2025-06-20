@@ -313,6 +313,10 @@ contract GovernanceModule is ReentrancyGuard {
         emit AxelarGasServiceUpdated(newGasService);
     }
 
+    function updateVolatility() external onlyGovernance {
+        pool.updateVolatility();
+    }
+
     /// @notice Updates the chain ID to Axelar chain mapping
     /// @param chainId The chain ID
     /// @param axelarChain The Axelar chain name

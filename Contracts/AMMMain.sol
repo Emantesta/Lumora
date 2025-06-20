@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.24;
 
-// OpenZeppelin imports for upgradeable contracts
 import {IERC20Upgradeable} from "@openzeppelin/contracts-upgradeable/token/ERC20/IERC20Upgradeable.sol";
 import {SafeERC20Upgradeable} from "@openzeppelin/contracts-upgradeable/token/ERC20/utils/SafeERC20Upgradeable.sol";
 import {OwnableUpgradeable} from "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
@@ -9,19 +8,15 @@ import {Initializable} from "@openzeppelin/contracts-upgradeable/proxy/utils/Ini
 import {UUPSUpgradeable} from "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
 import {ReentrancyGuardUpgradeable} from "@openzeppelin/contracts-upgradeable/security/ReentrancyGuardUpgradeable.sol";
 import {IERC721ReceiverUpgradeable} from "@openzeppelin/contracts-upgradeable/token/ERC721/IERC721ReceiverUpgradeable.sol";
-
-// Module contracts
+import {FullMath} from "@uniswap/v3-core/contracts/libraries/FullMath.sol";
+import {TickMath} from "@uniswap/v3-core/contracts/libraries/TickMath.sol";
 import {ConcentratedLiquidity} from "./ConcentratedLiquidity.sol";
 import {CrossChainModule} from "./CrossChainModule.sol";
 import {FallbackPool} from "./FallbackPool.sol";
 import {GovernanceModule} from "./GovernanceModule.sol";
 import {DynamicFeeLibrary} from "./DynamicFeeLibrary.sol";
 import {TickMathLibrary} from "./TickMathLibrary.sol";
-
-// Interfaces
 import {IAMMPool, IPositionManager, IPriceOracle, ICommonStructs} from "./Interfaces.sol";
-
-// PRB Math for UD60x18
 import {UD60x18, ud} from "@prb/math/src/UD60x18.sol";
 
 /// @title AMMPool - Main upgradeable AMM pool contract with modularized functionality
@@ -37,7 +32,7 @@ contract AMMPool is
 {
     using SafeERC20Upgradeable for IERC20Upgradeable;
 
-    // Immutable constants (unchanged)
+    // Immutable constants
     bytes32 public immutable VERSION;
     uint256 public immutable MIN_TIMELOCK;
     uint256 public immutable MAX_TIMELOCK;
@@ -47,12 +42,39 @@ contract AMMPool is
     uint256 public immutable MAX_RETRIES;
     uint256 public immutable MAX_ORACLE_RETRIES;
     uint24 public immutable TICK_SPACING;
-    uint256 public immutable MAX_LIQUIDITY_PER_TICK;
+    uint128 public immutable MAX_LIQUIDITY_PER_TICK;
     uint256 public immutable RETRY_DELAY;
 
-    // Storage variables (unchanged)
+    // Storage variables
     address public override tokenA;
     address public override tokenB;
+    address public treasury;
+    address public tokenBridge;
+    address public positionManager;
+    address public positionAdjuster;
+    address public governance;
+    address public primaryPriceOracle;
+    address[] public fallbackPriceOracles;
+    uint256 public lpFeeShare;
+    uint256 public treasuryFeeShare;
+    uint256 public totalLiquidity;
+    uint256 public amplificationFactor;
+    uint256 public targetReserveRatio;
+    uint256 public emaPeriod;
+    uint256 public volatilityThreshold;
+    uint256 public priceDeviationThreshold;
+    bool public paused;
+    uint256 public lastPrice;
+    int24 public currentTick;
+    uint256 public feeGrowthGlobal0X128;
+    uint256 public feeGrowthGlobal1X128;
+    uint256 public positionCounter;
+    uint256 public failedMessageCount;
+    uint256 public proposalCount;
+
+    // DynamicFeeLibrary state
+    DynamicFeeLibrary.State public feeState;
+
     struct Reserves {
         uint64 reserveA;
         uint64 reserveB;
@@ -61,63 +83,30 @@ contract AMMPool is
     }
     Reserves public reserves;
 
-    struct FeeConfig {
-        uint256 baseFee;
-        uint256 maxFee;
-        uint256 volatilityMultiplier;
-    }
-    
-    // DynamicFeeLibrary state
-    DynamicFeeLibrary.State public feeState;
-
-    uint256 public lpFeeShare;
-    uint256 public treasuryFeeShare;
-    address public treasury;
-    uint256 public totalLiquidity;
-    mapping(address => uint256) public liquidityBalance;
-    mapping(address => mapping(address => uint256)) public lpFees;
-    bool public paused;
-    mapping(uint16 => bool) public chainPaused;
-    address public tokenBridge;
-    address public positionManager;
-    mapping(uint16 => bytes) public trustedRemotePools;
-    mapping(uint16 => mapping(uint64 => bool)) public usedNonces;
-    mapping(uint16 => uint256) public chainTimelocks;
-    mapping(address => uint8) public tokenBridgeType;
-    uint256 public targetReserveRatio;
-    address public governance;
-    
-
-    // Cross-chain messengers
-    mapping(uint8 => address) public crossChainMessengers;
-    address public axelarGasService;
-    mapping(uint16 => string) public chainIdToAxelarChain;
-    mapping(string => uint16) public axelarChainToChainId;
-    mapping(uint16 => bytes32) public wormholeTrustedSenders;
-
-    // Concentrated liquidity state
-    mapping(uint256 => Position) public override positions;
-    uint256 public override positionCounter;
-    mapping(int24 => Tick) public ticks;
-    int24 public currentTick;
-    uint256 public feeGrowthGlobal0X128;
-    uint256 public feeGrowthGlobal1X128;
-
-    // Dynamic curves
-    uint256 public amplificationFactor;
-    uint256 public constant MAX_AMPLIFICATION = 1000;
-    uint256 public constant MIN_AMPLIFICATION = 1;
-
-    // Fallback pool state
     struct FallbackReserves {
         uint256 reserveA;
         uint256 reserveB;
         uint256 totalLiquidity;
     }
     FallbackReserves public fallbackReserves;
-    mapping(address => uint256) public fallbackLiquidityBalance;
-    mapping(uint256 => bool) public inFallbackPool;
-    address public positionAdjuster;
+
+    struct Tick {
+        uint128 liquidityGross;
+        int128 liquidityNet;
+        uint256 feeGrowthOutside0X128;
+        uint256 feeGrowthOutside1X128;
+    }
+
+    struct Position {
+        address owner;
+        int24 tickLower;
+        int24 tickUpper;
+        uint128 liquidity;
+        uint256 feeGrowthInside0LastX128;
+        uint256 feeGrowthInside1LastX128;
+        uint128 tokensOwed0;
+        uint128 tokensOwed1;
+    }
 
     struct FailedMessage {
         uint16 dstChainId;
@@ -129,8 +118,6 @@ contract AMMPool is
         uint8 messengerType;
         uint256 nextRetryTimestamp;
     }
-    mapping(uint256 => FailedMessage) public failedMessages;
-    uint256 public failedMessageCount;
 
     struct GovernanceProposal {
         address target;
@@ -138,16 +125,27 @@ contract AMMPool is
         uint256 proposedAt;
         bool executed;
     }
+
+    // Mappings
+    mapping(address => uint256) public liquidityBalance;
+    mapping(address => mapping(address => uint256)) public lpFees;
+    mapping(uint16 => bool) public chainPaused;
+    mapping(uint16 => bytes) public trustedRemotePools;
+    mapping(uint16 => mapping(uint64 => bool)) public usedNonces;
+    mapping(uint16 => uint256) public chainTimelocks;
+    mapping(address => uint8) public tokenBridgeType;
+    mapping(uint8 => address) public crossChainMessengers;
+    mapping(uint16 => string) public chainIdToAxelarChain;
+    mapping(string => uint16) public axelarChainToChainId;
+    mapping(uint16 => bytes32) public wormholeTrustedSenders;
+    mapping(address => uint256) public fallbackLiquidityBalance;
+    mapping(uint256 => bool) public inFallbackPool;
     mapping(uint256 => address) public authorizedAdjusters;
+    mapping(uint256 => FailedMessage) public failedMessages;
     mapping(uint256 => GovernanceProposal) public governanceProposals;
-    uint256 public proposalCount;
-
-    // Historical price data
-    uint256 public constant PRICE_HISTORY_SIZE = 20;
-    uint256 public constant VOLATILITY_WINDOW = 10;
-
-    // Cross-chain validation cache
     mapping(bytes32 => bool) public validatedMessages;
+    mapping(int24 => Tick) public ticks;
+    mapping(uint256 => Position) public override positions;
 
     // Module contracts
     ConcentratedLiquidity public concentratedLiquidity;
@@ -155,10 +153,16 @@ contract AMMPool is
     FallbackPool public fallbackPool;
     GovernanceModule public governanceModule;
 
-    // NEW: CrossChainModule address for access control
+    // CrossChainModule address
     address public crossChainModuleAddress;
 
-    // Custom errors (unchanged)
+    // Constants
+    uint256 public constant PRICE_HISTORY_SIZE = 20;
+    uint256 public constant VOLATILITY_WINDOW = 10;
+    uint256 public constant MAX_AMPLIFICATION = 1000;
+    uint256 public constant MIN_AMPLIFICATION = 1;
+
+    // Custom errors
     error InvalidAmount(uint256 amountA, uint256 amountB);
     error InvalidToken(address token);
     error InsufficientOutputAmount(uint256 amountOut, uint256 minAmountOut);
@@ -182,6 +186,7 @@ contract AMMPool is
     error InvalidPrice(uint256 expected, uint256 actual);
     error Unauthorized();
     error InvalidAdapterParams();
+    error PoolPaused();
     error ProposalNotFound(uint256 proposalId);
     error ProposalNotReady(uint256 proposalId);
     error ProposalAlreadyExecuted(uint256 proposalId);
@@ -198,7 +203,7 @@ contract AMMPool is
     error InvalidTickRange(int24 tickLower, int24 tickUpper);
     error PositionNotFound(uint256 positionId);
     error NotPositionOwner(uint256 positionId);
-    error InsufficientLiquidity(uint256 liquidity);
+    error InsufficientLiquidity(uint128 liquidity);
     error InvalidAmplificationFactor(uint256 A);
     error TickNotInitialized(int24 tick);
     error PriceOutOfRange();
@@ -210,10 +215,10 @@ contract AMMPool is
     error InvalidMessage();
     error MessageNotFound(uint256 messageId);
 
-    // Events (unchanged)
+    // Events
     event LiquidityAdded(address indexed provider, uint256 amountA, uint256 amountB, uint256 liquidity);
     event LiquidityRemoved(address indexed provider, uint256 amountA, uint256 amountB, uint256 liquidity);
-    event Swap(address indexed user, address indexed inputToken, uint256 amountIn, uint256 amountOut);
+    event Swap(address indexed user, address indexed inputToken, uint256 amountIn, uint256 amountOut, uint256 fee);
     event FeesUpdated(uint16 indexed chainId, uint256 baseFee, uint256 maxFee, uint256 lpFeeShare, uint256 treasuryFeeShare);
     event Paused(address indexed caller);
     event Unpaused(address indexed caller);
@@ -245,20 +250,20 @@ contract AMMPool is
     event FailedMessageRecovered(uint256 indexed messageId, address indexed recipient);
     event AllLPFeesClaimed(address indexed provider, uint256 amountA, uint256 amountB);
     event OracleFailover(address indexed failedOracle, address indexed newOracle);
-    event OracleFailover(address indexed primaryOracle, address indexed fallbackOracle);
-    event FeesCollected(uint256 indexed positionId, uint256 amount0, uint256 amount1);
+    event FeesCollected(uint256 indexed positionId, uint256 feesOwed0, uint256 feesOwed1);
     event FallbackPoolEntered(uint256 indexed positionId, uint256 liquidity);
     event FallbackPoolExited(uint256 indexed positionId, uint256 liquidity);
     event AmplificationFactorUpdated(uint256 newA);
     event TokenTransferred(address indexed token, address indexed from, address indexed to, uint256 amount);
-    event PositionUpdated(uint256 indexed positionId, int24 tickLower, int24 tickUpper, uint256 liquidity);
+    event PositionCreated(uint256 indexed positionId, address indexed owner, int24 tickLower, int24 tickUpper, uint128 liquidity);
+    event PositionUpdated(uint256 indexed positionId, int24 tickLower, int24 tickUpper, uint128 liquidity);
     event PositionAdjusterUpdated(address indexed newAdjuster);
     event FailedMessageRetryScheduled(uint256 indexed messageId, uint256 nextRetryTimestamp);
     event BatchRetryProcessed(uint256[] messageIds, uint256 successfulRetries, uint256 failedRetries);
     event PositionManagerUpdated(address indexed newPositionManager);
     event VolatilityThresholdUpdated(uint256 newThreshold);
 
-    // Modifiers (unchanged)
+    // Modifiers
     modifier whenNotPaused() {
         if (paused) revert ContractPaused();
         _;
@@ -291,18 +296,27 @@ contract AMMPool is
         _;
     }
 
+    modifier onlyConcentratedLiquidity() {
+        if (msg.sender != address(concentratedLiquidity)) revert Unauthorized();
+        _;
+    }
+
     modifier onlyPositionManager() {
         if (msg.sender != positionManager) revert Unauthorized();
         _;
     }
 
-    // NEW: Modifier for CrossChainModule access
     modifier onlyCrossChainModule() {
         if (msg.sender != crossChainModuleAddress) revert Unauthorized();
         _;
     }
 
-    // Constructor (unchanged)
+    modifier onlyGovernanceModule() {
+        if (msg.sender != address(governanceModule)) revert Unauthorized();
+        _;
+    }
+
+    // Constructor
     constructor(
         string memory _version,
         uint256 _minTimelock,
@@ -326,9 +340,8 @@ contract AMMPool is
         _disableInitializers();
     }
 
-    // Initializer (updated to set crossChainModuleAddress)
+    // Initializer
     function initialize(ICommonStructs.InitParams memory params) external initializer {
-        // Validate inputs
         if (params.tokenA >= params.tokenB) revert InvalidAddress(params.tokenA, "TokenA must be less than TokenB");
         if (
             params.tokenA == address(0) ||
@@ -361,7 +374,7 @@ contract AMMPool is
         });
         feeState.priceHistory = new uint256[](PRICE_HISTORY_SIZE);
         feeState.useConstantSum = true;
-        
+        feeState.currentTick = 0;
 
         // Validate fallback oracles
         bool hasValidOracle;
@@ -393,7 +406,6 @@ contract AMMPool is
         positionManager = params.positionManager;
         chainTimelocks[1] = params.defaultTimelock;
         targetReserveRatio = params.targetReserveRatio;
-        chainFees[1] = FeeConfig({baseFee: 20, maxFee: 100, volatilityMultiplier: 2});
         lpFeeShare = 8333;
         treasuryFeeShare = 1667;
         emaPeriod = 100;
@@ -404,21 +416,17 @@ contract AMMPool is
         amplificationFactor = 100;
         currentTick = 0;
 
-        priceHistory = new uint256[](PRICE_HISTORY_SIZE);
-
-        // Deploy and initialize modules
+        // Deploy modules
         concentratedLiquidity = new ConcentratedLiquidity(address(this));
         crossChainModule = new CrossChainModule(address(this));
         fallbackPool = new FallbackPool(address(this));
         governanceModule = new GovernanceModule(address(this));
-
-        // Set crossChainModuleAddress
         crossChainModuleAddress = address(crossChainModule);
 
         emit PositionManagerUpdated(params.positionManager);
     }
 
-    // Authorize upgrades (unchanged)
+    // Authorize upgrades
     function _authorizeUpgrade(address newImplementation) internal override onlyOwner {}
 
     // --- Concentrated Liquidity Functions ---
@@ -432,7 +440,7 @@ contract AMMPool is
         return concentratedLiquidity.addConcentratedLiquidity(msg.sender, tickLower, tickUpper, amountA, amountB);
     }
 
-    function removeConcentratedLiquidity(uint256 positionId, uint256 liquidity)
+    function removeConcentratedLiquidity(uint256 positionId, uint128 liquidity)
         external
         whenNotPaused
         nonReentrant
@@ -459,7 +467,7 @@ contract AMMPool is
         uint256 positionId,
         int24 tickLower,
         int24 tickUpper,
-        uint256 liquidity
+        uint128 liquidity
     ) external override whenNotPaused nonReentrant onlyAuthorizedAdjusters(positionId) {
         concentratedLiquidity.adjust(positionId, tickLower, tickUpper, liquidity);
     }
@@ -491,16 +499,16 @@ contract AMMPool is
         IERC20Upgradeable(tokenB).safeTransferFrom(msg.sender, address(this), amountB);
 
         uint256 liquidity;
-        if (useConstantSum && emaVolatility < volatilityThreshold) {
-            liquidity = (amountA + amountB) / 2;
+        if (feeState.useConstantSum && feeState.emaVolatility < feeState.volatilityThreshold) {
+            liquidity = FullMath.mulDiv(amountA + amountB, 1e18, 2 * 1e18);
         } else {
             if (totalLiquidity == 0) {
-                UD60x18 sqrtResult = sqrt(ud(amountA * amountB));
+                UD60x18 sqrtResult = ud(amountA * amountB).sqrt();
                 liquidity = sqrtResult.unwrap();
             } else {
-                liquidity = (amountA * totalLiquidity) / reserves.reserveA;
-                uint256 liquidityB = (amountB * totalLiquidity) / reserves.reserveB;
-                liquidity = liquidity < liquidityB ? liquidity : liquidityB;
+                uint256 liquidityA = FullMath.mulDiv(amountA, totalLiquidity, reserves.reserveA);
+                uint256 liquidityB = FullMath.mulDiv(amountB, totalLiquidity, reserves.reserveB);
+                liquidity = liquidityA < liquidityB ? liquidityA : liquidityB;
             }
         }
 
@@ -520,8 +528,8 @@ contract AMMPool is
             revert InvalidAmount(liquidity, liquidityBalance[msg.sender]);
         if (totalLiquidity == 0) revert InvalidAmount(0, 0);
 
-        uint256 amountA = (liquidity * reserves.reserveA) / totalLiquidity;
-        uint256 amountB = (liquidity * reserves.reserveB) / totalLiquidity;
+        uint256 amountA = FullMath.mulDiv(liquidity, reserves.reserveA, totalLiquidity);
+        uint256 amountB = FullMath.mulDiv(liquidity, reserves.reserveB, totalLiquidity);
 
         unchecked {
             liquidityBalance[msg.sender] -= liquidity;
@@ -537,32 +545,37 @@ contract AMMPool is
         emit LiquidityRemoved(msg.sender, amountA, amountB, liquidity);
     }
 
-    function swap(address inputToken, uint256 amountIn, uint256 minAmountOut)
+    function swap(address inputToken, uint256 amountIn, uint256 minAmountOut, address recipient)
         external
         whenNotPaused
         nonReentrant
         returns (uint256 amountOut)
     {
         if (inputToken != tokenA && inputToken != tokenB) revert InvalidToken(inputToken);
-        if (amountIn == 0) revert InvalidAmount(amountIn, 0);
+        if (amountIn == 0) revert TickMathLibrary.ZeroAmount();
+        if (recipient == address(0)) revert InvalidAddress(recipient, "Invalid recipient");
+        if (paused || chainPaused[1]) revert PoolPaused();
 
         bool isTokenAInput = inputToken == tokenA;
         uint256 fee = DynamicFeeLibrary.getDynamicFee(feeState, 1);
-        uint256 amountInWithFee = (amountIn * (10000 - fee)) / 10000;
-        uint256 lpFee = (amountIn * fee * lpFeeShare) / 10000;
-        uint256 treasuryFee = (amountIn * fee * treasuryFeeShare) / 10000;
+        uint256 amountInWithFee = FullMath.mulDiv(amountIn, 10000 - fee, 10000);
+        uint256 lpFee = FullMath.mulDiv(amountIn, fee * lpFeeShare, 10000 * 1e18);
+        uint256 treasuryFee = FullMath.mulDiv(amountIn, fee * treasuryFeeShare, 10000 * 1e18);
 
+        // Attempt concentrated liquidity swap
+        bool usedConcentratedLiquidity = false;
         amountOut = concentratedLiquidity.swapConcentratedLiquidity(isTokenAInput, amountInWithFee);
-        if (amountOut == 0) {
+        if (amountOut > 0) {
+            usedConcentratedLiquidity = true;
+            _updateReserves(isTokenAInput, amountIn, amountOut);
+        } else {
+            // Use TickMathLibrary for non-concentrated swap
+            uint160 sqrtPriceX96 = TickMath.getSqrtRatioAtTick(currentTick);
+            amountOut = TickMathLibrary.calculateAmountOut(this, sqrtPriceX96, inputToken, amountInWithFee);
+
             (uint256 reserveIn, uint256 reserveOut) = isTokenAInput
                 ? (uint256(reserves.reserveA), uint256(reserves.reserveB))
                 : (uint256(reserves.reserveB), uint256(reserves.reserveA));
-
-            if (useConstantSum && emaVolatility < volatilityThreshold) {
-                amountOut = governanceModule.swapConstantSum(amountInWithFee, reserveIn, reserveOut);
-            } else {
-                amountOut = (reserveOut * amountInWithFee) / (reserveIn + amountInWithFee);
-            }
 
             if (amountOut >= minAmountOut && amountOut <= reserveOut) {
                 _updateReserves(isTokenAInput, amountIn, amountOut);
@@ -576,16 +589,31 @@ contract AMMPool is
             }
         }
 
-        DynamicFeeLibrary.validatePrice(feeState, inputToken, amountIn, amountOut, tokenA, tokenB);
+        // Update tick and price for non-concentrated swaps
+        if (!usedConcentratedLiquidity) {
+            uint160 sqrtPriceX96 = TickMath.getSqrtRatioAtTick(currentTick);
+            uint160 nextSqrtPriceX96 = TickMathLibrary.calculateNextPrice(this, sqrtPriceX96, isTokenAInput, amountInWithFee);
+            currentTick = TickMath.getTickAtSqrtRatio(nextSqrtPriceX96);
+            feeState.currentTick = currentTick;
+        }
 
+        // Validate price
+        DynamicFeeLibrary.validatePrice(feeState, isTokenAInput ? tokenA : tokenB, amountIn, amountOut, tokenA, tokenB);
+
+        // Transfer tokens
         address outputToken = isTokenAInput ? tokenB : tokenA;
         IERC20Upgradeable(inputToken).safeTransferFrom(msg.sender, address(this), amountIn);
-        IERC20Upgradeable(outputToken).safeTransfer(msg.sender, amountOut);
-        IERC20Upgradeable(inputToken).safeTransfer(treasury, treasuryFee);
-        lpFees[msg.sender][inputToken] += lpFee;
+        IERC20Upgradeable(outputToken).safeTransfer(recipient, amountOut);
+        if (treasuryFee > 0) {
+            IERC20Upgradeable(inputToken).safeTransfer(treasury, treasuryFee);
+        }
+        lpFees[recipient][inputToken] += lpFee;
 
-        governanceModule.updateVolatility();
-        emit Swap(msg.sender, inputToken, amountIn, amountOut);
+        // Update volatility
+        DynamicFeeLibrary.updateVolatility(feeState, this, tokenA, tokenB);
+
+        emit Swap(msg.sender, inputToken, amountIn, amountOut, fee);
+        return amountOut;
     }
 
     // --- Cross-Chain Functions ---
@@ -791,8 +819,7 @@ contract AMMPool is
         bytes calldata payload,
         bytes calldata adapterParams
     ) public view returns (uint256 nativeFee, uint256 zroFee) {
-        // Note: CrossChainModule should implement this if needed
-        return (0, 0); // Placeholder
+        return crossChainModule.getEstimatedCrossChainFee(dstChainId, payload, adapterParams);
     }
 
     function emergencyWithdraw() external nonReentrant {
@@ -800,8 +827,8 @@ contract AMMPool is
         uint256 liquidity = liquidityBalance[msg.sender];
         if (liquidity == 0) revert InvalidAmount(0, 0);
 
-        uint256 amountA = (liquidity * reserves.reserveA) / totalLiquidity;
-        uint256 amountB = (liquidity * reserves.reserveB) / totalLiquidity;
+        uint256 amountA = FullMath.mulDiv(liquidity, reserves.reserveA, totalLiquidity);
+        uint256 amountB = FullMath.mulDiv(liquidity, reserves.reserveB, totalLiquidity);
 
         unchecked {
             liquidityBalance[msg.sender] -= liquidity;
@@ -838,7 +865,7 @@ contract AMMPool is
     // --- View Functions ---
 
     function emaVol() external view returns (uint256) {
-    return feeState.emaVolatility;
+        return feeState.emaVolatility;
     }
 
     function getcurrentTick() external view returns (int24) {
@@ -849,7 +876,7 @@ contract AMMPool is
         address owner,
         int24 tickLower,
         int24 tickUpper,
-        uint256 liquidity,
+        uint128 liquidity,
         uint256 tokensOwed0,
         uint256 tokensOwed1
     ) {
@@ -877,7 +904,11 @@ contract AMMPool is
     }
 
     function getVolatilityThreshold() external view override returns (uint256) {
-        return volatilityThreshold;
+        return feeState.volatilityThreshold;
+    }
+
+    function getLiquidity() external view returns (uint256) {
+        return totalLiquidity;
     }
 
     function getLiquidityBalance(address provider) external view returns (uint256) {
@@ -889,11 +920,19 @@ contract AMMPool is
     }
 
     function getDynamicFee(uint16 chainId) external view returns (uint256) {
-    return DynamicFeeLibrary.getDynamicFee(feeState, chainId);
+        return DynamicFeeLibrary.getDynamicFee(feeState, chainId);
     }
 
     function getLPFees(address provider, address token) external view returns (uint256) {
         return lpFees[provider][token];
+    }
+
+    function feeGrowthGlobal0X128() external view returns (uint256) {
+        return feeGrowthGlobal0X128;
+    }
+
+    function feeGrowthGlobal1X128() external view returns (uint256) {
+        return feeGrowthGlobal1X128;
     }
 
     function isInFallbackPool(uint256 positionId) external view returns (bool) {
@@ -901,8 +940,8 @@ contract AMMPool is
     }
 
     function getChainFeeConfig(uint16 chainId) external view returns (uint256 baseFee, uint256 maxFee, uint256 volatilityMultiplier) {
-    DynamicFeeLibrary.FeeConfig storage config = feeState.chainFees[chainId];
-    return (config.baseFee, config.maxFee, config.volatilityMultiplier);
+        DynamicFeeLibrary.FeeConfig storage config = feeState.chainFees[chainId];
+        return (config.baseFee, config.maxFee, config.volatilityMultiplier);
     }
 
     function getFailedMessage(uint256 messageId) external view returns (
@@ -939,141 +978,154 @@ contract AMMPool is
     }
 
     function getPriceHistory() external view returns (uint256[] memory) {
-    return feeState.priceHistory;
+        return feeState.priceHistory;
     }
 
     function getAmplificationFactor() external view returns (uint256) {
         return amplificationFactor;
     }
 
+    function getTicks(int24 tick) external view returns (Tick memory) {
+        return ticks[tick];
+    }
+
     function getTickSpacing() external view returns (uint24) {
         return TICK_SPACING;
     }
 
-    // New constant getter functions
+    // --- Setter Functions ---
 
     function setAmplificationFactor(uint256 newA) external onlyGovernanceModule {
-    amplificationFactor = newA;
+        if (newA < MIN_AMPLIFICATION || newA > MAX_AMPLIFICATION) revert InvalidAmplificationFactor(newA);
+        amplificationFactor = newA;
+        emit AmplificationFactorUpdated(newA);
     }
 
     function setPositionAdjuster(address newAdjuster) external onlyGovernanceModule {
         positionAdjuster = newAdjuster;
+        emit PositionAdjusterUpdated(newAdjuster);
     }
 
     function setPositionManager(address newPositionManager) external onlyGovernanceModule {
         positionManager = newPositionManager;
+        emit PositionManagerUpdated(newPositionManager);
     }
 
     function setVolatilityThreshold(uint256 newThreshold) external onlyGovernanceModule {
-    feeState.volatilityThreshold = newThreshold;
-    emit VolatilityThresholdUpdated(newThreshold);
+        feeState.volatilityThreshold = newThreshold;
+        emit VolatilityThresholdUpdated(newThreshold);
+    }
+
+    function setFeeGrowthGlobal0X128(uint256 feeGrowth) external onlyConcentratedLiquidity {
+        feeGrowthGlobal0X128 = feeGrowth;
+    }
+
+    function setFeeGrowthGlobal1X128(uint256 feeGrowth) external onlyConcentratedLiquidity {
+        feeGrowthGlobal1X128 = feeGrowth;
     }
 
     function setTrustedRemotePool(uint16 chainId, bytes calldata poolAddress) external onlyGovernanceModule {
         trustedRemotePools[chainId] = poolAddress;
+        emit TrustedRemotePoolAdded(chainId, poolAddress);
     }
 
     function setTokenBridge(address newTokenBridge) external onlyGovernanceModule {
         tokenBridge = newTokenBridge;
+        emit TokenBridgeUpdated(newTokenBridge);
     }
 
     function setTokenBridgeType(address token, uint8 bridgeType) external onlyGovernanceModule {
         tokenBridgeType[token] = bridgeType;
+        emit TokenBridgeTypeUpdated(token, bridgeType);
     }
 
     function setTargetReserveRatio(uint256 newRatio) external onlyGovernanceModule {
+        if (newRatio == 0) revert InvalidReserveRatio(newRatio);
         targetReserveRatio = newRatio;
+        emit TargetReserveRatioUpdated(newRatio);
     }
 
-    function setPriceOracle(address newPrimaryOracle, address[] calldata newFallbackOracles) 
-        external 
-        onlyGovernanceModule 
-    {
+    function setPriceOracle(address newPrimaryOracle, address[] calldata newFallbackOracles) external onlyGovernanceModule {
         primaryPriceOracle = newPrimaryOracle;
         fallbackPriceOracles = newFallbackOracles;
+        emit PriceOracleUpdated(newPrimaryOracle, newFallbackOracles);
     }
 
     function setEmaPeriod(uint256 newPeriod) external onlyGovernanceModule {
         emaPeriod = newPeriod;
+        emit EmaPeriodUpdated(newPeriod);
     }
 
     function setCrossChainMessenger(uint8 messengerType, address newMessenger) external onlyGovernanceModule {
         crossChainMessengers[messengerType] = newMessenger;
+        emit CrossChainMessengerUpdated(messengerType, newMessenger);
     }
 
     function setAxelarGasService(address newGasService) external onlyGovernanceModule {
         axelarGasService = newGasService;
+        emit AxelarGasServiceUpdated(newGasService);
     }
 
     function setChainIdMapping(uint16 chainId, string calldata axelarChain) external onlyGovernanceModule {
         chainIdToAxelarChain[chainId] = axelarChain;
         axelarChainToChainId[axelarChain] = chainId;
+        emit ChainIdMappingUpdated(chainId, axelarChain);
     }
 
     function setWormholeTrustedSender(uint16 chainId, bytes32 senderAddress) external onlyGovernanceModule {
         wormholeTrustedSenders[chainId] = senderAddress;
+        emit WormholeTrustedSenderUpdated(chainId, senderAddress);
     }
 
     function setGovernance(address newGovernance) external onlyGovernanceModule {
         governance = newGovernance;
+        emit GovernanceUpdated(newGovernance);
     }
 
     function setEmaVol(uint256 newEmaVol) external onlyGovernanceModule {
-        emaVolatility = newEmaVol;
+        feeState.emaVolatility = newEmaVol;
     }
 
-    // View functions for concentrated liquidity
-    function getFeeGrowthInside(int24 tickLower, int24 tickUpper, uint8 tokenId) external view returns (uint256) {
-        if (tickLower >= tickUpper) revert InvalidTickRange(tickLower, tickUpper);
-        Tick storage lower = ticks[tickLower];
-        Tick storage upper = ticks[tickUpper];
-        uint256 feeGrowthInside = tokenId == 0 ? feeGrowthGlobal0X128 : feeGrowthGlobal1X128;
-        if (currentTick >= tickLower && currentTick < tickUpper) {
-            return feeGrowthInside;
-        } else if (currentTick < tickLower) {
-            return lower.feeGrowthOutside0X128;
-        } else {
-            return upper.feeGrowthOutside0X128;
-        }
+    function setCurrentTick(int24 tick) external onlyConcentratedLiquidity {
+        currentTick = tick;
+        feeState.currentTick = tick;
     }
 
-    function getLiquidityForAmounts(int24 tickLower, int24 tickUpper, uint256 amountA, uint256 amountB) external view returns (uint256 liquidity) {
-        if (tickLower >= tickUpper) revert InvalidTickRange(tickLower, tickUpper);
-        uint256 price = lastPrice; // Simplified; use oracle price in production
-        if (price == 0) return amountA < amountB ? amountA : amountB;
-        return (amountA * price) / 1e18 < amountB ? (amountA * price) / 1e18 : amountB;
+    function positionCounter(uint256 newCounter) external onlyConcentratedLiquidity {
+        positionCounter = newCounter;
     }
 
     // --- Internal Helper Functions ---
 
     function getOraclePrice() internal returns (uint256 price) {
-        uint256 maxRetries = MAX_ORACLE_RETRIES; // Use AMMPool constant
-        for (uint256 i = 0; i <= maxRetries; i++) {
-            try IPriceOracle(feeState.primaryPriceOracle).getPrice(tokenA, tokenB) returns (int256 oraclePrice) {
-                if (oraclePrice <= 0) revert DynamicFeeLibrary.NegativeOraclePrice(oraclePrice);
+        for (uint256 i = 0; i <= MAX_ORACLE_RETRIES; i++) {
+            try IPriceOracle(primaryPriceOracle).getPrice(tokenA, tokenB) returns (int256 oraclePrice) {
+                if (oraclePrice <= 0) revert NegativeOraclePrice(oraclePrice);
                 return uint256(oraclePrice);
             } catch {
-                if (i == maxRetries) break;
+                if (i == MAX_ORACLE_RETRIES) break;
             }
         }
-        for (uint256 i = 0; i < feeState.fallbackPriceOracles.length; i++) {
-            if (feeState.fallbackPriceOracles[i] == address(0)) continue;
-            try IPriceOracle(feeState.fallbackPriceOracles[i]).getPrice(tokenA, tokenB) returns (int256 fallbackPrice) {
-                if (fallbackPrice <= 0) revert DynamicFeeLibrary.NegativeOraclePrice(fallbackPrice);
-                emit OracleFailover(feeState.primaryPriceOracle, feeState.fallbackPriceOracles[i]);
+        for (uint256 i = 0; i < fallbackPriceOracles.length; i++) {
+            if (fallbackPriceOracles[i] == address(0)) continue;
+            try IPriceOracle(fallbackPriceOracles[i]).getPrice(tokenA, tokenB) returns (int256 fallbackPrice) {
+                if (fallbackPrice <= 0) revert NegativeOraclePrice(fallbackPrice);
+                emit OracleFailover(primaryPriceOracle, fallbackPriceOracles[i]);
                 return uint256(fallbackPrice);
             } catch {}
         }
-        revert DynamicFeeLibrary.OracleFailure();
+        revert OracleFailure();
     }
-    
+
     function _updateReserves(bool isTokenAInput, uint256 amountIn, uint256 amountOut) internal {
         if (isTokenAInput) {
+            if (reserves.reserveB < amountOut) revert InsufficientReserve(amountOut, reserves.reserveB);
             unchecked {
                 reserves.reserveA += uint64(amountIn);
                 reserves.reserveB -= uint64(amountOut);
             }
         } else {
+            if (reserves.reserveA < amountOut) revert InsufficientReserve(amountOut, reserves.reserveA);
             unchecked {
                 reserves.reserveB += uint64(amountIn);
                 reserves.reserveA -= uint64(amountOut);
@@ -1085,32 +1137,19 @@ contract AMMPool is
         return x.sqrt();
     }
 
-    // --- ERC721 Receiver ---
-
-    function onERC721Received(
-        address,
-        address,
-        uint256,
-        bytes calldata
-    ) external pure override returns (bytes4) {
-        return IERC721ReceiverUpgradeable.onERC721Received.selector;
-    }
-
     // --- CrossChainModule Helper Functions ---
 
     function setPosition(uint256 positionId, Position memory position) external onlyCrossChainModule {
         positions[positionId] = position;
     }
 
-    function setChainFeeConfig(uint16 chainId, uint256 baseFee, uint256 maxFee, uint256 volatilityMultiplier) 
-        external 
-        onlyGovernanceModule 
-    {
+    function setChainFeeConfig(uint16 chainId, uint256 baseFee, uint256 maxFee, uint256 volatilityMultiplier) external onlyGovernanceModule {
         feeState.chainFees[chainId] = DynamicFeeLibrary.FeeConfig({
             baseFee: baseFee,
             maxFee: maxFee,
             volatilityMultiplier: volatilityMultiplier
         });
+        emit FeesUpdated(chainId, baseFee, maxFee, lpFeeShare, treasuryFeeShare);
     }
 
     function incrementPositionCounter() external onlyCrossChainModule {
@@ -1119,19 +1158,21 @@ contract AMMPool is
 
     function updateTick(int24 tick, uint256 liquidityDelta, bool upper) external onlyCrossChainModule {
         Tick storage tickInfo = ticks[tick];
+        uint128 delta = uint128(liquidityDelta);
         if (tickInfo.liquidityGross == 0 && liquidityDelta > 0) {
-            tickInfo.initialized = true;
+            tickInfo.feeGrowthOutside0X128 = feeGrowthGlobal0X128;
+            tickInfo.feeGrowthOutside1X128 = feeGrowthGlobal1X128;
         }
         tickInfo.liquidityGross = upper
-            ? tickInfo.liquidityGross - uint128(liquidityDelta)
-            : tickInfo.liquidityGross + uint128(liquidityDelta);
+            ? tickInfo.liquidityGross - delta
+            : tickInfo.liquidityGross + delta;
         tickInfo.liquidityNet = upper
-            ? tickInfo.liquidityNet - int128(int256(liquidityDelta))
-            : tickInfo.liquidityNet + int128(int256(liquidityDelta));
+            ? tickInfo.liquidityNet - int128(delta)
+            : tickInfo.liquidityNet + int128(delta);
     }
 
     function checkAndMoveToFallback(uint256 positionId) external onlyCrossChainModule {
-    fallbackPool.checkAndMoveToFallback(positionId);
+        fallbackPool.checkAndMoveToFallback(positionId);
     }
 
     function updateLiquidityBalance(address provider, uint256 liquidity, bool add) external onlyCrossChainModule {
@@ -1245,7 +1286,37 @@ contract AMMPool is
         emit BatchRetryProcessed(messageIds, successfulRetries, failedRetries);
     }
 
-    function emitPositionCreated(uint256 positionId, address owner, int24 tickLower, int24 tickUpper, uint256 liquidity) external onlyCrossChainModule {
+    function emitPositionCreated(uint256 positionId, address owner, int24 tickLower, int24 tickUpper, uint128 liquidity) external onlyConcentratedLiquidity {
+        emit PositionCreated(positionId, owner, tickLower, tickUpper, liquidity);
+    }
+
+    function emitPositionUpdated(uint256 positionId, int24 tickLower, int24 tickUpper, uint128 liquidity) external onlyConcentratedLiquidity {
         emit PositionUpdated(positionId, tickLower, tickUpper, liquidity);
+    }
+
+    function emitFeesCollected(uint256 positionId, uint256 feesOwed0, uint256 feesOwed1) external onlyConcentratedLiquidity {
+        emit FeesCollected(positionId, feesOwed0, feesOwed1);
+    }
+
+    // --- Mock Functions for Testing ---
+
+    function setMockReserves(uint64 reserveA, uint64 reserveB) external {
+        reserves.reserveA = reserveA;
+        reserves.reserveB = reserveB;
+    }
+
+    function setMockLiquidity(uint256 liquidity) external {
+        totalLiquidity = liquidity;
+    }
+
+    // --- ERC721 Receiver ---
+
+    function onERC721Received(
+        address,
+        address,
+        uint256,
+        bytes calldata
+    ) external pure override returns (bytes4) {
+        return IERC721ReceiverUpgradeable.onERC721Received.selector;
     }
 }
