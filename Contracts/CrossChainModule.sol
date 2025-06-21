@@ -6,20 +6,66 @@ import {IERC20Upgradeable} from "@openzeppelin/contracts-upgradeable/token/ERC20
 import {SafeERC20Upgradeable} from "@openzeppelin/contracts-upgradeable/token/ERC20/utils/SafeERC20Upgradeable.sol";
 import {AMMPool} from "./AMMPool.sol";
 import {ICrossChainModule} from "./Interfaces.sol";
+import {TickMath} from "@uniswap/v3-core/contracts/libraries/TickMath.sol";
+import {IPositionManager} from "./Interfaces.sol";
+import {ILayerZeroEndpoint} from "./Interfaces.sol";
+import {IAxelarGateway} from "./Interfaces.sol";
+import {IWormhole} from "./Interfaces.sol";
+import {ICrossChainMessenger} from "./Interfaces.sol";
+import {ITokenBridge} from "./Interfaces.sol";
+
+// Interface for CrossChainRetryOracle
+interface ICrossChainRetryOracle {
+    struct NetworkStatus {
+        uint64 gasPrice;
+        uint32 confirmationTime;
+        uint8 congestionLevel;
+        bool bridgeOperational;
+        uint32 recommendedRetryDelay;
+        bool retryRecommended;
+        uint256 lastUpdated;
+        uint64 randomRetryDelay;
+        int256 lastGasPrice;
+        int256 lastTokenPrice;
+    }
+
+    function getNetworkStatus(uint64 chainId) external view returns (NetworkStatus memory);
+    function requestNetworkStatusUpdate(uint64 chainId, bytes32 jobId, uint256 fee) external returns (bytes32);
+}
 
 /// @title CrossChainModule - Handles cross-chain messaging and token bridging for AMM pool
-/// @notice Manages cross-chain liquidity addition, token bridging, message validation, and retry mechanisms
-/// @dev Interacts with AMMPool for state access and token bridging, secured with access control
+/// @notice Manages cross-chain liquidity addition, token bridging, message validation, and retry mechanisms with oracle integration
+/// @dev Interacts with AMMPool for state access and token bridging, secured with access control, uses CrossChainRetryOracle for retry decisions
 contract CrossChainModule is ReentrancyGuard {
     using SafeERC20Upgradeable for IERC20Upgradeable;
 
     // Reference to main AMMPool contract
     AMMPool public immutable pool;
 
-    // Constructor: Initializes pool reference
-    constructor(address _pool) {
+    // Reference to CrossChainRetryOracle contract
+    ICrossChainRetryOracle public immutable retryOracle;
+
+    // Chainlink job ID for network status updates
+    bytes32 public immutable oracleJobId;
+
+    // LINK token address for oracle requests
+    address public immutable linkToken;
+
+    // Constructor: Initializes pool and oracle references
+    constructor(
+        address _pool,
+        address _retryOracle,
+        bytes32 _oracleJobId,
+        address _linkToken
+    ) {
         if (_pool == address(0)) revert InvalidAddress(_pool, "Invalid pool address");
+        if (_retryOracle == address(0)) revert InvalidAddress(_retryOracle, "Invalid oracle address");
+        if (_oracleJobId == bytes32(0)) revert InvalidAddress(address(0), "Invalid job ID");
+        if (_linkToken == address(0)) revert InvalidAddress(_linkToken, "Invalid LINK token address");
         pool = AMMPool(_pool);
+        retryOracle = ICrossChainRetryOracle(_retryOracle);
+        oracleJobId = _oracleJobId;
+        linkToken = _linkToken;
     }
 
     // --- Errors (cross-chain related) ---
@@ -46,6 +92,10 @@ contract CrossChainModule is ReentrancyGuard {
     error InvalidBridgeType(uint8 bridgeType);
     error InvalidMessage();
     error InvalidTickRange(int24 tickLower, int24 tickUpper);
+    error OracleNotConfigured(uint64 chainId);
+    error RetryNotRecommended(uint64 chainId);
+    error InsufficientLinkBalance(uint256 balance, uint256 required);
+    error OracleRequestFailed(bytes32 requestId);
 
     // --- Events (cross-chain related, emitted via AMMPool) ---
     // Note: Events are emitted through AMMPool to maintain compatibility
@@ -190,62 +240,62 @@ contract CrossChainModule is ReentrancyGuard {
     }
 
     /// @notice Executes a cross-chain swap
-/// @param user The user initiating the swap
-/// @param inputToken The input token address
-/// @param amountIn The input amount
-/// @param minAmountOut The minimum output amount
-/// @param dstChainId The destination chain ID
-/// @param adapterParams Adapter parameters
-/// @return amountOut The estimated output amount
-function swapCrossChain(
-    address user,
-    address inputToken,
-    uint256 amountIn,
-    uint256 minAmountOut,
-    uint16 dstChainId,
-    bytes calldata adapterParams
-) external payable nonReentrant onlyPool whenNotPaused whenChainNotPaused(dstChainId) returns (uint256 amountOut) {
-    if (inputToken != pool.tokenA() && inputToken != pool.tokenB()) revert InvalidToken(inputToken);
-    if (amountIn == 0) revert InvalidAmount(amountIn, 0);
-    if (pool.trustedRemotePools(dstChainId).length == 0) revert InvalidChainId(dstChainId);
+    /// @param user The user initiating the swap
+    /// @param inputToken The input token address
+    /// @param amountIn The input amount
+    /// @param minAmountOut The minimum output amount
+    /// @param dstChainId The destination chain ID
+    /// @param adapterParams Adapter parameters
+    /// @return amountOut The estimated output amount
+    function swapCrossChain(
+        address user,
+        address inputToken,
+        uint256 amountIn,
+        uint256 minAmountOut,
+        uint16 dstChainId,
+        bytes calldata adapterParams
+    ) external payable nonReentrant onlyPool whenNotPaused whenChainNotPaused(dstChainId) returns (uint256 amountOut) {
+        if (inputToken != pool.tokenA() && inputToken != pool.tokenB()) revert InvalidToken(inputToken);
+        if (amountIn == 0) revert InvalidAmount(amountIn, 0);
+        if (pool.trustedRemotePools(dstChainId).length == 0) revert InvalidChainId(dstChainId);
 
-    // Transfer input tokens to AMMPool
-    IERC20Upgradeable(inputToken).safeTransferFrom(user, address(pool), amountIn);
+        // Transfer input tokens to AMMPool
+        IERC20Upgradeable(inputToken).safeTransferFrom(user, address(pool), amountIn);
 
-    // Bridge tokens
-    _bridgeTokens(inputToken, amountIn, user, dstChainId);
+        // Bridge tokens
+        _bridgeTokens(inputToken, amountIn, user, dstChainId);
 
-    // Prepare and send cross-chain message
-    string memory axelarChain = pool.chainIdToAxelarChain(dstChainId);
-    bytes memory destinationAddress = pool.trustedRemotePools(dstChainId);
-    uint64 nonce = _getNonce(dstChainId, 0);
-    uint256 timelock = _getDynamicTimelock(dstChainId);
-    bytes memory payload = abi.encode(
-        user,
-        inputToken,
-        amountIn,
-        minAmountOut,
-        nonce,
-        block.timestamp + timelock
-    );
+        // Prepare and send cross-chain message
+        string memory axelarChain = pool.chainIdToAxelarChain(dstChainId);
+        bytes memory destinationAddress = pool.trustedRemotePools(dstChainId);
+        uint64 nonce = _getNonce(dstChainId, 0);
+        uint256 timelock = _getDynamicTimelock(dstChainId);
+        bytes memory payload = abi.encode(
+            user,
+            inputToken,
+            amountIn,
+            minAmountOut,
+            nonce,
+            block.timestamp + timelock
+        );
 
-    // Estimate output amount (simplified; use oracle in production)
-    amountOut = amountIn * pool.lastPrice() / 1e18;
+        // Estimate output amount (simplified; use oracle in production)
+        amountOut = amountIn * pool.lastPrice() / 1e18;
 
-    _sendCrossChainMessage(dstChainId, axelarChain, destinationAddress, payload, adapterParams, nonce, timelock, 0);
-    pool.emitCrossChainSwap(
-        user,
-        inputToken,
-        amountIn,
-        amountOut,
-        dstChainId,
-        nonce,
-        block.timestamp + timelock,
-        _getMessengerType()
-    );
+        _sendCrossChainMessage(dstChainId, axelarChain, destinationAddress, payload, adapterParams, nonce, timelock, 0);
+        pool.emitCrossChainSwap(
+            user,
+            inputToken,
+            amountIn,
+            amountOut,
+            dstChainId,
+            nonce,
+            block.timestamp + timelock,
+            _getMessengerType()
+        );
 
-    return amountOut;
-}
+        return amountOut;
+    }
 
     /// @notice Receives and processes a cross-chain message
     /// @param srcChainId The source chain ID
@@ -348,6 +398,10 @@ function swapCrossChain(
         if (message.timestamp == 0) revert MessageNotFailed(messageId);
         if (block.timestamp < message.nextRetryTimestamp) revert RetryNotReady(messageId, message.nextRetryTimestamp);
 
+        // Consult oracle for retry recommendation
+        ICrossChainRetryOracle.NetworkStatus memory status = _getOracleNetworkStatus(message.dstChainId);
+        if (!status.retryRecommended || !status.bridgeOperational) revert RetryNotRecommended(message.dstChainId);
+
         address messenger = pool.crossChainMessengers(message.messengerType);
         if (messenger == address(0)) revert MessengerNotSet(message.messengerType);
 
@@ -375,7 +429,9 @@ function swapCrossChain(
             success = true;
             pool.emitFailedMessageRetried(messageId, message.dstChainId, message.retries + 1, message.messengerType);
         } catch {
-            pool.emitFailedMessageRetryScheduled(messageId, block.timestamp + (pool.RETRY_DELAY() * (2 ** (message.retries + 1))));
+            // Use oracle-recommended retry delay
+            uint256 nextRetryTimestamp = block.timestamp + (status.randomRetryDelay > 0 ? status.randomRetryDelay : status.recommendedRetryDelay);
+            pool.emitFailedMessageRetryScheduled(messageId, nextRetryTimestamp);
         }
 
         if (success) {
@@ -384,7 +440,7 @@ function swapCrossChain(
             pool.updateFailedMessage(
                 messageId,
                 message.retries + 1,
-                block.timestamp + (pool.RETRY_DELAY() * (2 ** (message.retries + 1)))
+                block.timestamp + (status.randomRetryDelay > 0 ? status.randomRetryDelay : status.recommendedRetryDelay)
             );
         }
     }
@@ -399,10 +455,14 @@ function swapCrossChain(
         uint256 failedRetries;
         uint256[] memory processedIds = new uint256[](messageIds.length);
 
-        // Estimate total fees
+        // Estimate total fees and check oracle status
         for (uint256 i = 0; i < messageIds.length; i++) {
             AMMPool.FailedMessage memory message = pool.getFailedMessage(messageIds[i]);
             if (message.retries >= pool.MAX_RETRIES() || message.timestamp == 0 || block.timestamp < message.nextRetryTimestamp) continue;
+
+            // Consult oracle for retry recommendation
+            ICrossChainRetryOracle.NetworkStatus memory status = _getOracleNetworkStatus(message.dstChainId);
+            if (!status.retryRecommended || !status.bridgeOperational) continue;
 
             address messenger = pool.crossChainMessengers(message.messengerType);
             if (messenger == address(0)) continue;
@@ -428,6 +488,13 @@ function swapCrossChain(
 
             AMMPool.FailedMessage memory message = pool.getFailedMessage(messageIds[i]);
             if (message.retries >= pool.MAX_RETRIES() || message.timestamp == 0 || block.timestamp < message.nextRetryTimestamp) {
+                failedRetries++;
+                continue;
+            }
+
+            // Consult oracle for retry recommendation
+            ICrossChainRetryOracle.NetworkStatus memory status = _getOracleNetworkStatus(message.dstChainId);
+            if (!status.retryRecommended || !status.bridgeOperational) {
                 failedRetries++;
                 continue;
             }
@@ -462,10 +529,8 @@ function swapCrossChain(
                 pool.emitFailedMessageRetried(messageIds[i], message.dstChainId, message.retries + 1, message.messengerType);
             } catch {
                 failedRetries++;
-                pool.emitFailedMessageRetryScheduled(
-                    messageIds[i],
-                    block.timestamp + (pool.RETRY_DELAY() * (2 ** (message.retries + 1)))
-                );
+                uint256 nextRetryTimestamp = block.timestamp + (status.randomRetryDelay > 0 ? status.randomRetryDelay : status.recommendedRetryDelay);
+                pool.emitFailedMessageRetryScheduled(messageIds[i], nextRetryTimestamp);
             }
 
             if (success) {
@@ -474,7 +539,7 @@ function swapCrossChain(
                 pool.updateFailedMessage(
                     messageIds[i],
                     message.retries + 1,
-                    block.timestamp + (pool.RETRY_DELAY() * (2 ** (message.retries + 1)))
+                    block.timestamp + (status.randomRetryDelay > 0 ? status.randomRetryDelay : status.recommendedRetryDelay)
                 );
             }
         }
@@ -484,6 +549,21 @@ function swapCrossChain(
         }
 
         pool.emitBatchRetryProcessed(processedIds, successfulRetries, failedRetries);
+    }
+
+    /// @notice Requests a network status update from the oracle
+    /// @param chainId The target chain ID
+    /// @param fee The LINK fee for the request
+    /// @return requestId The Chainlink request ID
+    function requestOracleNetworkStatusUpdate(uint64 chainId, uint256 fee) external onlyPool returns (bytes32 requestId) {
+        uint256 linkBalance = IERC20Upgradeable(linkToken).balanceOf(address(this));
+        if (linkBalance < fee) revert InsufficientLinkBalance(linkBalance, fee);
+
+        try retryOracle.requestNetworkStatusUpdate(chainId, oracleJobId, fee) returns (bytes32 _requestId) {
+            requestId = _requestId;
+        } catch {
+            revert OracleRequestFailed(bytes32(0));
+        }
     }
 
     // --- Internal Functions ---
@@ -569,6 +649,9 @@ function swapCrossChain(
                 payable(msg.sender).transfer(msg.value - nativeFee);
             }
         } catch {
+            // Consult oracle for retry delay
+            ICrossChainRetryOracle.NetworkStatus memory status = _getOracleNetworkStatus(dstChainId);
+            uint256 retryDelay = status.randomRetryDelay > 0 ? status.randomRetryDelay : status.recommendedRetryDelay;
             uint256 messageId = pool.failedMessageCount();
             pool.setFailedMessage(
                 messageId,
@@ -580,7 +663,7 @@ function swapCrossChain(
                     retries: 0,
                     timestamp: block.timestamp,
                     messengerType: messengerType,
-                    nextRetryTimestamp: block.timestamp + pool.RETRY_DELAY()
+                    nextRetryTimestamp: block.timestamp + retryDelay
                 })
             );
             pool.incrementFailedMessageCount();
@@ -713,6 +796,9 @@ function swapCrossChain(
             ) {
                 refundAmount -= nativeFee;
             } catch {
+                // Consult oracle for retry delay
+                ICrossChainRetryOracle.NetworkStatus memory status = _getOracleNetworkStatus(dstChainIds[i]);
+                uint256 retryDelay = status.randomRetryDelay > 0 ? status.randomRetryDelay : status.recommendedRetryDelay;
                 uint256 messageId = pool.failedMessageCount();
                 pool.setFailedMessage(
                     messageId,
@@ -724,7 +810,7 @@ function swapCrossChain(
                         retries: 0,
                         timestamp: block.timestamp,
                         messengerType: messengerType,
-                        nextRetryTimestamp: block.timestamp + pool.RETRY_DELAY()
+                        nextRetryTimestamp: block.timestamp + retryDelay
                     })
                 );
                 pool.incrementFailedMessageCount();
@@ -774,6 +860,16 @@ function swapCrossChain(
             timelock += timelock / 2;
             if (timelock > pool.MAX_TIMELOCK()) timelock = pool.MAX_TIMELOCK();
         }
+
+        // Adjust timelock based on oracle network status
+        try retryOracle.getNetworkStatus(uint64(chainId)) returns (ICrossChainRetryOracle.NetworkStatus memory status) {
+            if (status.congestionLevel >= 8) {
+                timelock += timelock / 4; // Increase timelock by 25% for high congestion
+                if (timelock > pool.MAX_TIMELOCK()) timelock = pool.MAX_TIMELOCK();
+            }
+        } catch {
+            // Fallback to default timelock if oracle query fails
+        }
     }
 
     /// @notice Gets the default messenger type
@@ -796,5 +892,16 @@ function swapCrossChain(
             tickUpper % int24(pool.getTickSpacing()) == 0 &&
             tickLower >= TickMath.MIN_TICK &&
             tickUpper <= TickMath.MAX_TICK;
+    }
+
+    /// @notice Retrieves network status from the oracle
+    /// @param chainId The target chain ID
+    /// @return status The network status
+    function _getOracleNetworkStatus(uint64 chainId) internal view returns (ICrossChainRetryOracle.NetworkStatus memory status) {
+        try retryOracle.getNetworkStatus(chainId) returns (ICrossChainRetryOracle.NetworkStatus memory _status) {
+            status = _status;
+        } catch {
+            revert OracleNotConfigured(chainId);
+        }
     }
 }

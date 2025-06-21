@@ -69,7 +69,71 @@ interface IAMMPool {
         uint256[] calldata timelocks
     ) external payable;
     function getTickSpacing() external view returns (uint24);
-}
+
+    function crossChainMessengers(uint8 messengerType) external view returns (address);
+    function tokenBridge() external view returns (address);
+    function tokenBridgeType(address token) external view returns (uint8);
+    function failedMessageCount() external view returns (uint256);
+    function setFailedMessage(uint256 messageId, AMMPool.FailedMessage memory message) external;
+    function getFailedMessage(uint256 messageId) external view returns (AMMPool.FailedMessage memory);
+    function deleteFailedMessage(uint256 messageId) external;
+    function updateFailedMessage(uint256 messageId, uint256 retries, uint256 nextRetryTimestamp) external;
+    function incrementFailedMessageCount() external;
+    function chainTimelocks(uint16 chainId) external view returns (uint256);
+    function MIN_TIMELOCK() external view returns (uint256);
+    function MAX_TIMELOCK() external view returns (uint256);
+    function RETRY_DELAY() external view returns (uint256);
+    function paused() external view returns (bool);
+    function chainPaused(uint16 chainId) external view returns (bool);
+    function usedNonces(uint16 chainId, uint64 nonce) external view returns (bool);
+    function setUsedNonces(uint16 chainId, uint64 nonce, bool used) external;
+    function validatedMessages(bytes32 messageHash) external view returns (bool);
+    function setValidatedMessages(bytes32 messageHash, bool validated) external;
+    function wormholeTrustedSenders(uint16 chainId) external view returns (bytes32);
+    function emitCrossChainLiquiditySent(
+        address provider,
+        uint256 amountA,
+        uint256 amountB,
+        uint16 dstChainId,
+        uint64 nonce,
+        uint256 timelock,
+        uint256 positionId
+    ) external;
+    function emitCrossChainSwap(
+        address user,
+        address inputToken,
+        uint256 amountIn,
+        uint256 amountOut,
+        uint16 dstChainId,
+        uint64 nonce,
+        uint256 timelock,
+        uint8 messengerType
+    ) external;
+    function emitCrossChainLiquidityReceived(
+        address provider,
+        uint256 amountA,
+        uint256 amountB,
+        uint16 srcChainId,
+        uint64 nonce,
+        uint8 messengerType
+    ) external;
+    function emitFailedMessageStored(
+        uint256 messageId,
+        uint16 dstChainId,
+        bytes memory sender,
+        uint256 timestamp,
+        uint8 messengerType
+    ) external;
+    function emitFailedMessageRetried(
+        uint256 messageId,
+        uint16 dstChainId,
+        uint256 retries,
+        uint8 messengerType
+    ) external;
+    function emitFailedMessageRetryScheduled(uint256 messageId, uint256 nextRetryTimestamp) external;
+    function emitBatchMessagesSent(uint16[] memory dstChainIds, uint8 messengerType, uint256 totalFee) external;
+    function emitBatchRetryProcessed(uint256[] memory messageIds, uint256 successfulRetries, uint256 failedRetries) external;
+    }
 
 interface IPositionManager {
     function mintPosition(uint256 positionId, address recipient) external;
