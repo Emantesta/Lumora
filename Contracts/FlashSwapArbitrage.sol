@@ -9,19 +9,18 @@ import {ReentrancyGuardUpgradeable} from "@openzeppelin/contracts-upgradeable/ut
 import {PausableUpgradeable} from "@openzeppelin/contracts-upgradeable/utils/PausableUpgradeable.sol";
 import {AccessControlUpgradeable} from "@openzeppelin/contracts-upgradeable/access/AccessControlUpgradeable.sol";
 import {GovernorUpgradeable} from "@openzeppelin/contracts-upgradeable/governance/GovernorUpgradeable.sol";
-import {GovernorSettingsUpgradeable} from "@openzeppelin/contracts-upgradeable/governance/extensions/GovernorSettingsUpgradeable.sol";
-import {GovernorCountingSimpleUpgradeable} from "@openzeppelin/contracts-upgradeable/governance/extensions/GovernorCountingSimpleUpgradeable.sol";
-import {GovernorVotesUpgradeable} from "@openzeppelin/contracts-upgradeable/governance/extensions/GovernorVotesUpgradeable.sol";
-import {GovernorTimelockControlUpgradeable} from "@openzeppelin/contracts-upgradeable/governance/extensions/GovernorTimelockControlUpgradeable.sol";
 import {Client} from "@chainlink/contracts-ccip/src/v0.8/ccip/libraries/Client.sol";
 import {CCIPReceiver} from "@chainlink/contracts-ccip/src/v0.8/ccip/applications/CCIPReceiver.sol";
+import {LinkTokenInterface} from "@chainlink/contracts/src/v0.8/interfaces/LinkTokenInterface.sol";
+import {KeeperCompatibleInterface} from "@chainlink/contracts/src/v0.8/interfaces/KeeperCompatibleInterface.sol";
+import {AggregatorV3Interface} from "@chainlink/contracts/src/v0.8/interfaces/AggregatorV3Interface.sol";
 
-// Interface for PriceOracle
+// Interface for PriceOracle (unchanged)
 interface IPriceOracle {
     function getCurrentPairPrice(address pool, address token) external view returns (uint256 price, uint256 timestamp);
 }
 
-// Interface for CrossChainRetryOracle
+// Interface for CrossChainRetryOracle (unchanged)
 interface ICrossChainRetryOracle {
     struct NetworkStatus {
         bool bridgeOperational;
@@ -33,7 +32,7 @@ interface ICrossChainRetryOracle {
     function activeChainIds() external view returns (uint64[] memory);
 }
 
-// Interface for AMMPool
+// Interface for AMMPool (unchanged)
 interface IAMMPool {
     function token0() external view returns (address);
     function token1() external view returns (address);
@@ -47,27 +46,33 @@ interface IAMMPool {
     function setTargetReserveRatio(uint256 newRatio) external;
 }
 
-// Interface for Uniswap V2 Callee
+// Interface for Uniswap V2 Callee (unchanged)
 interface IUniswapV2Callee {
     function uniswapV2Call(address sender, uint256 amount0, uint256 amount1, bytes calldata data) external;
 }
 
-// Interface for lending protocol (e.g., Aave-like)
+// Interface for lending protocol (updated)
 interface ILendingProtocol {
     function getHealthFactor(address user, address asset) external view returns (uint256);
     function liquidate(address user, address collateralAsset, address debtAsset, uint256 debtToCover) external;
     function swapCollateral(address user, address fromAsset, address toAsset, uint256 amount) external;
+    function getAllUsersWithDebt() external view returns (address[] memory);
 }
 
-// Interface for external exchange (e.g., SushiSwap)
+// Interface for external exchange (unchanged)
 interface IExternalExchange {
     function swapTokens(address tokenIn, address tokenOut, uint256 amountIn, uint64 destChainId) external returns (uint256 amountOut);
     function getDynamicFee(address tokenIn, address tokenOut) external view returns (uint256 fee);
 }
 
+// Interface for Private Mempool Service (unchanged)
+interface IPrivateMempool {
+    function submitPrivateTx(bytes calldata txData, uint256 maxPriorityFee, uint256 maxFeePerGas) external payable returns (bytes32 txHash);
+}
+
 /// @title FlashSwapArbitrage
-/// @notice Contract for arbitrage, liquidations, and collateral swapping with DAO governance
-/// @dev Integrates with OpenZeppelin Governor for decentralized governance and role-based access
+/// @notice Contract for arbitrage, liquidations, and collateral swapping with DAO governance and Chainlink automation
+/// @dev Integrates Chainlink Keepers, multiple oracles, private mempools, and enhanced security
 contract FlashSwapArbitrage is
     Initializable,
     UUPSUpgradeable,
@@ -75,13 +80,15 @@ contract FlashSwapArbitrage is
     PausableUpgradeable,
     AccessControlUpgradeable,
     CCIPReceiver,
-    IUniswapV2Callee
+    IUniswapV2Callee,
+    KeeperCompatibleInterface
 {
     using SafeERC20 for IERC20;
 
     // Roles
     bytes32 public constant OPERATOR_ROLE = keccak256("OPERATOR_ROLE");
     bytes32 public constant GOVERNOR_ROLE = keccak256("GOVERNOR_ROLE");
+    bytes32 public constant KEEPER_ROLE = keccak256("KEEPER_ROLE");
 
     // Immutable addresses
     address public immutable ammPool;
@@ -91,17 +98,29 @@ contract FlashSwapArbitrage is
 
     // External contracts
     GovernorUpgradeable public governor;
-    IPriceOracle[] public priceOracles;
+    AggregatorV3Interface[] public priceFeeds; // Chainlink Price Feeds
     ICrossChainRetryOracle public retryOracle;
     address public externalExchange;
+    LinkTokenInterface public linkToken;
+    address public keeperRegistry;
+    address public privateMempool; // e.g., Flashbots or Eden Network
 
     // Storage
     mapping(uint64 => address) public crossChainAMMPools;
     mapping(address => bool) public supportedTokens;
     mapping(address => uint256) public minHealthFactor;
+    mapping(bytes32 => uint256) public retryTimestamps; // Track retry attempts
+    uint256 public gasReserve; // ETH reserve for gas funding
+    uint256 public linkReserve; // LINK reserve for Chainlink operations
     uint256 public constant PRICE_PRECISION = 1e18;
     uint256 public constant MIN_HEALTH_FACTOR = 1e18; // 1.0 in 18 decimals
     uint256 public constant MAX_FEE_BASIS_POINTS = 10000; // 100%
+    uint256 public constant MIN_GAS_RESERVE = 0.01 ether; // Minimum ETH for gas
+    uint256 public constant MIN_LINK_RESERVE = 1 ether; // Minimum LINK for Chainlink
+    uint256 public constant MAX_RETRIES = 3; // Max retry attempts
+    uint256 public constant MAX_USERS = 50; // Limit users processed in one call
+    uint256 public minProfitThreshold; // Minimum profit for arbitrage
+    uint256 public healthFactorThreshold; // Health factor threshold for liquidations
 
     // Custom errors
     error UnauthorizedCaller(address caller);
@@ -113,7 +132,7 @@ contract FlashSwapArbitrage is
     error InsufficientBalance(address token, uint256 balance, uint256 required);
     error InvalidChainId(uint64 chainId);
     error NoValidOraclePrice(address asset);
-    error RetryOrphanError(uint64 chainId);
+    error RetryOracleError(uint64 chainId);
     error LiquidationNotRequired(address user);
     error InvalidTokenPair(address tokenA, address tokenB);
     error CrossChainNotConfigured(uint64 chainId);
@@ -124,8 +143,14 @@ contract FlashSwapArbitrage is
     error InvalidOracleArray();
     error BatchSizeMismatch(uint256 expected, uint256 provided);
     error InvalidGovernorAddress(address governor);
+    error InsufficientGasReserve(uint256 reserve, uint256 required);
+    error InsufficientLinkReserve(uint256 reserve, uint256 required);
+    error MaxRetriesExceeded(bytes32 txId);
+    error InvalidPrivateMempool(address mempool);
+    error InvalidKeeperRegistry(address registry);
+    error InvalidLinkToken(address token);
 
-    // Events
+    // Events (unchanged)
     event FlashSwapInitiated(address indexed sender, uint256 amount0Out, uint256 amount1Out, uint64 chainId);
     event FlashSwapCompleted(address indexed sender, uint256 amountIn, uint256 amountOut, uint256 profit, uint64 chainId);
     event ProfitWithdrawn(address indexed token, address indexed recipient, uint256 amount);
@@ -134,7 +159,7 @@ contract FlashSwapArbitrage is
     event CollateralSwapped(address indexed user, address fromAsset, address toAsset, uint256 amount);
     event BatchCollateralSwapped(uint256 userCount, uint256 totalAmount);
     event CrossChainPoolUpdated(uint64 indexed chainId, address pool);
-    event PriceOraclesUpdated(uint256 oracleCount);
+    event PriceFeedsUpdated(uint256 feedCount);
     event RetryOracleUpdated(address indexed retryOracle);
     event ExternalExchangeUpdated(address indexed exchange);
     event SupportedTokenUpdated(address indexed token, bool supported);
@@ -143,6 +168,15 @@ contract FlashSwapArbitrage is
     event AssetsRecovered(address indexed token, uint256 amount, address indexed recipient);
     event BatchProposalCreated(uint256[] proposalIds);
     event GovernorUpdated(address indexed newGovernor);
+    event GasReserveUpdated(uint256 newReserve);
+    event LinkReserveUpdated(uint256 newReserve);
+    event PrivateMempoolUpdated(address indexed mempool);
+    event KeeperRegistryUpdated(address indexed registry);
+    event LinkTokenUpdated(address indexed token);
+    event RetryAttempted(bytes32 indexed txId, uint256 attempt);
+    event AutomationTriggered(bytes32 indexed taskId, string taskType);
+    event MinProfitThresholdUpdated(uint256 newThreshold);
+    event HealthFactorThresholdUpdated(uint256 newThreshold);
 
     /// @custom:oz-upgrades-unsafe-allow constructor
     constructor(
@@ -172,23 +206,24 @@ contract FlashSwapArbitrage is
     }
 
     /// @notice Initializes the contract
-    /// @param _governor The Governor contract address
-    /// @param _priceOracles Array of PriceOracle contract addresses
-    /// @param _retryOracle The CrossChainRetryOracle contract address
-    /// @param _externalExchange The external exchange address
-    /// @param _router The CCIP router address
     function initialize(
         address _governor,
-        address[] calldata _priceOracles,
+        address[] calldata _priceFeeds,
         address _retryOracle,
         address _externalExchange,
-        address _router
+        address _router,
+        address _linkToken,
+        address _keeperRegistry,
+        address _privateMempool
     ) external initializer {
         require(_governor != address(0), "Invalid governor address");
-        require(_priceOracles.length > 0, "Invalid oracle array");
+        require(_priceFeeds.length > 0, "Invalid oracle array");
         require(_retryOracle != address(0), "Invalid retry oracle address");
         require(_externalExchange != address(0), "Invalid exchange address");
         require(_router != address(0), "Invalid router address");
+        require(_linkToken != address(0), "Invalid LINK token address");
+        require(_keeperRegistry != address(0), "Invalid keeper registry address");
+        require(_privateMempool != address(0), "Invalid private mempool address");
 
         __UUPSUpgradeable_init();
         __ReentrancyGuard_init();
@@ -196,36 +231,238 @@ contract FlashSwapArbitrage is
         __AccessControl_init();
 
         governor = GovernorUpgradeable(_governor);
-        for (uint256 i = 0; i < _priceOracles.length; i++) {
-            require(_priceOracles[i] != address(0), "Invalid oracle address");
-            priceOracles.push(IPriceOracle(_priceOracles[i]));
+        for (uint256 i = 0; i < _priceFeeds.length; i++) {
+            require(_priceFeeds[i] != address(0), "Invalid feed address");
+            priceFeeds.push(AggregatorV3Interface(_priceFeeds[i]));
         }
         retryOracle = ICrossChainRetryOracle(_retryOracle);
         externalExchange = _externalExchange;
+        linkToken = LinkTokenInterface(_linkToken);
+        keeperRegistry = _keeperRegistry;
+        privateMempool = _privateMempool;
 
         supportedTokens[tokenA] = true;
         supportedTokens[tokenB] = true;
+        minProfitThreshold = 1e16; // 0.01 ETH equivalent
+        healthFactorThreshold = MIN_HEALTH_FACTOR;
 
         _grantRole(DEFAULT_ADMIN_ROLE, _governor);
         _grantRole(GOVERNOR_ROLE, _governor);
+        _grantRole(KEEPER_ROLE, _keeperRegistry);
 
         emit GovernorUpdated(_governor);
-        emit PriceOraclesUpdated(_priceOracles.length);
+        emit PriceFeedsUpdated(_priceFeeds.length);
         emit RetryOracleUpdated(_retryOracle);
         emit ExternalExchangeUpdated(_externalExchange);
+        emit LinkTokenUpdated(_linkToken);
+        emit KeeperRegistryUpdated(_keeperRegistry);
+        emit PrivateMempoolUpdated(_privateMempool);
         emit SupportedTokenUpdated(tokenA, true);
         emit SupportedTokenUpdated(tokenB, true);
+        emit MinProfitThresholdUpdated(minProfitThreshold);
+        emit HealthFactorThresholdUpdated(healthFactorThreshold);
     }
 
     /// @notice Authorizes contract upgrades
-    /// @param newImplementation The address of the new implementation
     function _authorizeUpgrade(address newImplementation) internal override onlyRole(GOVERNOR_ROLE) {}
 
+    /// @notice Funds gas reserve with ETH
+    function fundGasReserve() external payable {
+        gasReserve += msg.value;
+        emit GasReserveUpdated(gasReserve);
+    }
+
+    /// @notice Funds LINK reserve for Chainlink operations
+    function fundLinkReserve(uint256 amount) external {
+        IERC20(address(linkToken)).safeTransferFrom(msg.sender, address(this), amount);
+        linkReserve += amount;
+        emit LinkReserveUpdated(linkReserve);
+    }
+
+    /// @notice Gets users with undercollateralized positions from the lending protocol
+    /// @return users Array of user addresses eligible for liquidation or collateral swap
+    function _getUsers() internal view returns (address[] memory users) {
+        // Fetch all users with debt from the lending protocol
+        address[] memory allUsers = ILendingProtocol(lendingProtocol).getAllUsersWithDebt();
+        uint256 eligibleCount = 0;
+
+        // First pass: count eligible users to size the array
+        for (uint256 i = 0; i < allUsers.length && eligibleCount < MAX_USERS; i++) {
+            if (allUsers[i] == address(0)) continue;
+            // Check health factor for tokenA and tokenB
+            try ILendingProtocol(lendingProtocol).getHealthFactor(allUsers[i], tokenA) returns (uint256 healthFactorA) {
+                uint256 minHF = minHealthFactor[allUsers[i]] > 0 ? minHealthFactor[allUsers[i]] : healthFactorThreshold;
+                if (healthFactorA < minHF) {
+                    eligibleCount++;
+                    continue;
+                }
+            } catch {
+                // Skip if health factor call fails
+            }
+            try ILendingProtocol(lendingProtocol).getHealthFactor(allUsers[i], tokenB) returns (uint256 healthFactorB) {
+                uint256 minHF = minHealthFactor[allUsers[i]] > 0 ? minHealthFactor[allUsers[i]] : healthFactorThreshold;
+                if (healthFactorB < minHF) {
+                    eligibleCount++;
+                }
+            } catch {
+                // Skip if health factor call fails
+            }
+        }
+
+        // Second pass: populate the users array
+        users = new address[](eligibleCount);
+        uint256 index = 0;
+        for (uint256 i = 0; i < allUsers.length && index < eligibleCount; i++) {
+            if (allUsers[i] == address(0)) continue;
+            bool isEligible = false;
+            try ILendingProtocol(lendingProtocol).getHealthFactor(allUsers[i], tokenA) returns (uint256 healthFactorA) {
+                uint256 minHF = minHealthFactor[allUsers[i]] > 0 ? minHealthFactor[allUsers[i]] : healthFactorThreshold;
+                if (healthFactorA < minHF) {
+                    isEligible = true;
+                }
+            } catch {}
+            if (!isEligible) {
+                try ILendingProtocol(lendingProtocol).getHealthFactor(allUsers[i], tokenB) returns (uint256 healthFactorB) {
+                    uint256 minHF = minHealthFactor[allUsers[i]] > 0 ? minHealthFactor[allUsers[i]] : healthFactorThreshold;
+                    if (healthFactorB < minHF) {
+                        isEligible = true;
+                    }
+                } catch {}
+            }
+            if (isEligible) {
+                users[index] = allUsers[i];
+                index++;
+            }
+        }
+
+        return users;
+    }
+
+    /// @notice Checks if upkeep is needed for Chainlink Keepers
+    function checkUpkeep(bytes calldata) external view override returns (bool upkeepNeeded, bytes memory performData) {
+        upkeepNeeded = false;
+        // Check for arbitrage opportunities
+        (uint256 poolPrice, ) = getOraclePrice(ammPool, tokenA);
+        (uint256 externalPrice, ) = getOraclePrice(externalExchange, tokenA);
+        uint256 priceDiff = poolPrice > externalPrice ? poolPrice - externalPrice : externalPrice - poolPrice;
+        if (priceDiff * PRICE_PRECISION / poolPrice > minProfitThreshold) {
+            upkeepNeeded = true;
+            performData = abi.encode("arbitrage", uint64(0), poolPrice, externalPrice);
+            return (upkeepNeeded, performData);
+        }
+
+        // Check for liquidations and collateral swaps
+        address[] memory users = _getUsers();
+        for (uint256 i = 0; i < users.length; i++) {
+            try ILendingProtocol(lendingProtocol).getHealthFactor(users[i], tokenA) returns (uint256 healthFactor) {
+                uint256 minHF = minHealthFactor[users[i]] > 0 ? minHealthFactor[users[i]] : healthFactorThreshold;
+                if (healthFactor < minHF) {
+                    upkeepNeeded = true;
+                    // Assume debtToCover is calculated off-chain or via a separate call
+                    performData = abi.encode("liquidation", users[i], tokenA, tokenB, uint256(0));
+                    return (upkeepNeeded, performData);
+                }
+            } catch {}
+            try ILendingProtocol(lendingProtocol).getHealthFactor(users[i], tokenB) returns (uint256 healthFactor) {
+                uint256 minHF = minHealthFactor[users[i]] > 0 ? minHealthFactor[users[i]] : healthFactorThreshold;
+                if (healthFactor < minHF) {
+                    upkeepNeeded = true;
+                    // Assume amount is calculated off-chain or via a separate call
+                    performData = abi.encode("collateral", users[i], tokenB, tokenA, uint256(0));
+                    return (upkeepNeeded, performData);
+                }
+            } catch {}
+        }
+
+        return (upkeepNeeded, performData);
+    }
+
+    /// @notice Performs upkeep tasks
+    function performUpkeep(bytes calldata performData) external override onlyRole(KEEPER_ROLE) {
+        (string memory taskType, bytes memory data) = abi.decode(performData, (string, bytes));
+        bytes32 taskId = keccak256(abi.encode(taskType, data, block.timestamp));
+
+        if (keccak256(abi.encodePacked(taskType)) == keccak256(abi.encodePacked("arbitrage"))) {
+            (uint64 chainId, uint256 poolPrice, uint256 externalPrice) = abi.decode(data, (uint64, uint256, uint256));
+            _executeArbitrage(chainId, poolPrice, externalPrice);
+        } else if (keccak256(abi.encodeWithSelector(taskType) == keccak256("liquidation"))) {
+            (address user, address collateralAsset, address debtAsset, uint256 debtToCover) = abi.decode(
+                data, (address, address, address, uint256)
+            );
+            _executeLiquidation(user, collateralAsset, debtAsset, debtToCover);
+        } else if (keccak256(abi.encodeWithSignature(taskType)) == keccak256("collateral")) {
+            (address user, address fromAsset, address toAsset, uint256 amount) = abi.decode(
+                data, (address, address, address, uint256)
+            );
+            _executeCollateralSwap(user, fromAsset, toAsset, amount);
+        }
+
+        emit AutomationTriggered(taskId, taskType);
+    }
+
+    /// @notice Executes arbitrage via flash swap
+    function _executeArbitrage(uint64 chainIdchainId, uint256 poolPrice, uint256 externalPrice) internal {
+        uint256 amountOut = poolPrice > externalPrice ? 1e18 : 1e18; // Simplified amount calculation
+        bytes memory data = abi.encode(address(this), minProfitThreshold, chainId, poolPrice);
+        address targetPool = chainId == 0 ? ammPool : crossChainAMMPools[chainId];
+        _submitPrivateSwap(targetPool, amountOut, data);
+    }
+
+    /// @notice Executes liquidation
+    function _executeLiquidation(
+        address user,
+        address collateralAsset,
+        address debtAsset,
+        uint256 debtToCover
+    ) internal {
+        if (gasReserve < MIN_GAS_RESERVE) revert InsufficientGasReserve(gasReserve, MIN_GAS_RESERVE);
+        if (linkReserve < MIN_LINK_RESERVE) revert InsufficientLinkReserve(linkReserve, MIN_LINK_RESERVE);
+
+        IERC20(debtAsset).safeApprove(lendingProtocol, debtToCover);
+        ILendingProtocol(lendingProtocol).liquidate(user, collateralAsset, debtAsset, debtToCover);
+        IERC20(debtAsset).safeApprove(lendingProtocol, 0);
+        emit LiquidationTriggered(user, collateralAsset, debtAsset, debtToCover);
+    }
+
+    /// @notice Executes collateral swap
+    function _executeCollateralSwap(
+        address user,
+        address fromAsset,
+        address toAsset,
+        uint256 amount
+    ) internal {
+        if (gasReserve < MIN_GAS_RESERVE) revert InsufficientGasReserve(gasReserve, MIN_GAS_RESERVE);
+        if (linkReserve < MIN_LINK_RESERVE) revert InsufficientLinkReserve(linkReserve, MIN_LINK_RESERVE);
+
+        IERC20(fromAsset).safeApprove(lendingProtocol, amount);
+        ILendingProtocol(lendingProtocol).swapCollateral(user, fromAsset, toAsset, amount);
+        IERC20(fromAsset).safeApprove(lendingProtocol, 0);
+        emit CollateralSwapped(user, fromAsset, toAsset, amount);
+    }
+
+    /// @notice Submits swap to private mempool
+    function _submitPrivateSwap(
+        address targetPool,
+        uint256 amount0Out,
+        uint256 amount1Out,
+        bytes memory data
+    ) internal {
+        if (gasReserve < MIN_GAS_RESERVE) revert InsufficientGasReserve(gasReserve, MIN_GAS_RESERVE);
+        bytes memory txData = abi.encodeWithSelector(
+            IAMMPool.swap.selector,
+            amount0Out,
+            amount1Out,
+            address(this),
+            data
+        );
+        uint256 maxPriorityFee = 2 gwei; // Configurable
+        uint256 maxFeePerGas = 50 gwei; // Configurable
+        IPrivateMempool(privateMempool).submitPrivateTx{value: gasReserve / 100}(txData, maxPriorityFee, maxFeePerGas);
+        gasReserve -= gasReserve / 100;
+        emit GasReserveUpdated(gasReserve);
+    }
+
     /// @notice Proposes batch governance actions
-    /// @param targets Array of target contract addresses
-    /// @param values Array of ether values
-    /// @param calldatas Array of encoded function calls
-    /// @param description Proposal description
     function proposeBatch(
         address[] calldata targets,
         uint256[] calldata values,
@@ -248,7 +485,7 @@ contract FlashSwapArbitrage is
         emit BatchProposalCreated(proposalIds);
     }
 
-    /// @notice Helper to create single-element arrays for Governor propose
+    /// @notice Helper to create single-element arrays
     function _singleArray(uint256 value) internal pure returns (uint256[] memory) {
         uint256[] memory arr = new uint256[](1);
         arr[0] = value;
@@ -267,9 +504,7 @@ contract FlashSwapArbitrage is
         return arr;
     }
 
-    /// @notice Updates the cross-chain AMM pool
-    /// @param chainId The chain ID
-    /// @param pool The AMM pool address
+    /// @notice Updates cross-chain AMM pool
     function updateCrossChainPool(uint64 chainId, address pool) external onlyRole(GOVERNOR_ROLE) {
         require(chainId != 0, "Invalid chain ID");
         require(pool != address(0), "Invalid pool address");
@@ -277,51 +512,39 @@ contract FlashSwapArbitrage is
         emit CrossChainPoolUpdated(chainId, pool);
     }
 
-    /// @notice Updates the price oracles
-    /// @param _priceOracles Array of new PriceOracle addresses
-    function updatePriceOracles(address[] calldata _priceOracles) external onlyRole(GOVERNOR_ROLE) {
-        require(_priceOracles.length > 0, "Invalid oracle array");
-        delete priceOracles;
-        address[] memory fallbackOracles = new address[](_priceOracles.length - 1);
-        for (uint256 i = 0; i < _priceOracles.length; i++) {
-            require(_priceOracles[i] != address(0), "Invalid oracle address");
-            priceOracles.push(IPriceOracle(_priceOracles[i]));
-            if (i > 0) {
-                fallbackOracles[i - 1] = _priceOracles[i];
-            }
+    /// @notice Updates price feeds
+    function updatePriceOracles(address[] calldata _feeds) external onlyRole(GOVERNOR_ROLE) {
+        require(_feeds.length > 0, "Invalid oracle array");
+        delete priceFeeds;
+        for (uint256 i = 0; i < _feeds.length; i++) {
+            require(_feeds[i] != address(0), "Invalid oracle address");
+            priceFeeds.push(AggregatorV3Interface(_feeds[i]));
         }
-        IAMMPool(ammPool).setPriceOracle(_priceOracles[0], fallbackOracles);
-        emit PriceOraclesUpdated(_priceOracles.length);
+        emit PriceFeedsUpdated(_feeds.length);
     }
 
-    /// @notice Updates the retry oracle
-    /// @param _retryOracle The new CrossChainRetryOracle address
+    /// @notice Updates retry oracle
     function updateRetryOracle(address _retryOracle) external onlyRole(GOVERNOR_ROLE) {
         require(_retryOracle != address(0), "Invalid retry oracle address");
         retryOracle = ICrossChainRetryOracle(_retryOracle);
         emit RetryOracleUpdated(_retryOracle);
     }
 
-    /// @notice Updates the external exchange
-    /// @param _externalExchange The new external exchange address
+    /// @notice Updates external exchange
     function updateExternalExchange(address _externalExchange) external onlyRole(GOVERNOR_ROLE) {
         require(_externalExchange != address(0), "Invalid exchange address");
         externalExchange = _externalExchange;
         emit ExternalExchangeUpdated(_externalExchange);
     }
 
-    /// @notice Updates the supported token status
-    /// @param token The token address
-    /// @param supported Whether the token is supported
+    /// @notice Updates supported token
     function updateSupportedToken(address token, bool supported) external onlyRole(GOVERNOR_ROLE) {
         require(token != address(0), "Invalid token address");
         supportedTokens[token] = supported;
         emit SupportedTokenUpdated(token, supported);
     }
 
-    /// @notice Updates the minimum health factor
-    /// @param user The user address
-    /// @param _minHealthFactor The minimum health factor
+    /// @notice Updates minimum health factor
     function updateMinHealthFactor(address user, uint256 _minHealthFactor) external onlyRole(GOVERNOR_ROLE) {
         require(user != address(0), "Invalid user address");
         require(_minHealthFactor >= MIN_HEALTH_FACTOR, "Health factor too low");
@@ -329,8 +552,7 @@ contract FlashSwapArbitrage is
         emit MinHealthFactorUpdated(user, _minHealthFactor);
     }
 
-    /// @notice Updates the governor
-    /// @param _governor The new Governor address
+    /// @notice Updates governor
     function updateGovernor(address _governor) external onlyRole(GOVERNOR_ROLE) {
         require(_governor != address(0), "Invalid governor address");
         governor = GovernorUpgradeable(_governor);
@@ -339,34 +561,58 @@ contract FlashSwapArbitrage is
         emit GovernorUpdated(_governor);
     }
 
-    /// @notice Grants operator role to an address
-    /// @param operator The operator address
-    function grantOperatorRole(address operator) external onlyRole(GOVERNOR_ROLE) {
-        require(operator != address(0), "Invalid operator address");
-        _grantRole(OPERATOR_ROLE, operator);
+    /// @notice Updates private mempool
+    function updatePrivateMempool(address _mempool) external onlyRole(GOVERNOR_ROLE) {
+        require(_mempool != address(0), "Invalid private mempool address");
+        privateMempool = _mempool;
+        emit PrivateMempoolUpdated(_mempool);
     }
 
-    /// @notice Revokes operator role from an address
-    /// @param operator The operator address
-    function revokeOperatorRole(address operator) external onlyRole(GOVERNOR_ROLE) {
-        require(operator != address(0), "Invalid operator address");
-        _revokeRole(OPERATOR_ROLE, operator);
+    /// @notice Updates keeper registry
+    function updateKeeperRegistry(address _registry) external onlyRole(GOVERNOR_ROLE) {
+        require(_registry != address(0), "invalid keeper registry address");
+        keeperRegistry = _registry;
+        _grantRole(KEEPER_KEEPER_ROLE, _registry);
+        emit KeeperRegistryUpdated(_registry);
     }
 
-    /// @notice Gets price from multiple oracles with fallback
-    /// @param asset The asset address
-    /// @param token The token address
-    /// @return price The aggregated price
-    /// @return timestamp The latest timestamp
+    /// @notice Updates LINK token
+    function updateLinkToken(address _token) external onlyRole(GOVERNOR_ROLE) {
+        require(_token != address(0), "invalid LINK token address");
+        linkToken = linkTokenInterface(_token);
+        emit LinkTokenUpdated(_token);
+    }
+
+    /// @notice Updates minimum profit threshold
+    function updateMinProfitThreshold(uint256 _threshold) external onlyRole(GOVERNOR_ROLE) {
+        require(_threshold > 0, "Invalid threshold");
+        minProfitThreshold = _threshold;
+        emit MinProfitThresholdUpdated(_threshold);
+    }
+
+    /// @notice Updates health factor threshold
+    function updateHealthFactorThreshold(uint256 _threshold) external onlyRole(GOVERNOR_ROLE) {
+        require(_threshold >= MIN_HEALTH_FACTOR, "Invalid threshold");
+        healthFactorThreshold = _threshold;
+        emit HealthFactorThresholdUpdated(_threshold);
+    }
+
+    /// @notice Gets price from multiple Chainlink feeds
     function getOraclePrice(address asset, address token) internal view returns (uint256 price, uint256 timestamp) {
         uint256 validPrices = 0;
         uint256 totalPrice = 0;
         uint256 latestTimestamp = 0;
 
-        for (uint256 i = 0; i < priceOracles.length; i++) {
-            try priceOracles[i].getCurrentPairPrice(asset, token) returns (uint256 _price, uint256 _timestamp) {
+        for (uint256 i = 0; i < priceFeeds.length; i++) {
+            try priceFeeds[i].latestRoundData() returns (
+                uint80,
+                int256 _price,
+                uint256,
+                uint256 _timestamp,
+                uint80
+            ) {
                 if (_price > 0) {
-                    totalPrice += _price;
+                    totalPrice += uint256(_price);
                     validPrices++;
                     if (_timestamp > latestTimestamp) {
                         latestTimestamp = _timestamp;
@@ -381,11 +627,7 @@ contract FlashSwapArbitrage is
         return (totalPrice / validPrices, latestTimestamp);
     }
 
-    /// @notice Initiates a flash swap for arbitrage
-    /// @param chainId The destination chain ID (0 for local chain)
-    /// @param amount0Out The amount of tokenA to borrow
-    /// @param amount1Out The amount of tokenB to borrow
-    /// @param minProfit The minimum profit required
+    /// @notice Initiates a flash swap for arbitrage with retry logic
     function initiateFlashSwap(
         uint64 chainId,
         uint256 amount0Out,
@@ -396,29 +638,33 @@ contract FlashSwapArbitrage is
         if (amount0Out > 0 && amount1Out > 0) revert InvalidBorrowedAmount(amount0Out, amount1Out);
         if (chainId != 0 && crossChainAMMPools[chainId] == address(0)) revert CrossChainNotConfigured(chainId);
 
+        bytes32 txId = keccak256(abi.encode(msg.sender, chainId, amount0Out, amount1Out, block.timestamp));
+        if (retryTimestamps[txId] > MAX_RETRIES) revert MaxRetriesExceeded(txId);
+
         if (chainId != 0) {
             ICrossChainRetryOracle.NetworkStatus memory status = retryOracle.getNetworkStatus(chainId);
             if (!status.bridgeOperational || status.retryRecommended) {
-                uint32 retryDelay = status.randomRetryDelay;
+                retryTimestamps[txId]++;
+                emit RetryAttempted(txId, retryTimestamps[txId]);
+                uint256 retryDelay = status.randomRetryDelay;
                 require(block.timestamp >= status.lastUpdated + retryDelay, "Retry delay not met");
             }
         }
+
+        if (gasReserve < MIN_GAS_RESERVE) revert InsufficientGasReserve(gasReserve, MIN_GAS_RESERVE);
+        if (linkReserve < MIN_LINK_RESERVE) revert InsufficientLinkReserve(linkReserve, MIN_LINK_RESERVE);
 
         address asset = chainId == 0 ? ammPool : crossChainAMMPools[chainId];
         (uint256 price, ) = getOraclePrice(asset, amount1Out > 0 ? tokenB : tokenA);
         if (price == 0) revert NoValidOraclePrice(asset);
 
-        bytes memory data = abi.encode(msg.sender, minProfit, chainId, price);
+        bytes memory data = abi.encode(msg.sender, minProfit, chainId, price, txId);
         address targetPool = chainId == 0 ? ammPool : crossChainAMMPools[chainId];
-        IAMMPool(targetPool).swap(amount0Out, amount1Out, address(this), data);
+        _submitPrivateSwap(targetPool, amount0Out, amount1Out, data);
         emit FlashSwapInitiated(msg.sender, amount0Out, amount1Out, chainId);
     }
 
     /// @notice Callback for flash swap
-    /// @param sender The sender of the flash swap
-    /// @param amount0 The amount of token0 borrowed
-    /// @param amount1 The amount of token1 borrowed
-    /// @param data The callback data
     function uniswapV2Call(
         address sender,
         uint256 amount0,
@@ -431,9 +677,8 @@ contract FlashSwapArbitrage is
         if (amount0 > 0 && amount1 > 0) revert InvalidBorrowedAmount(amount0, amount1);
         if (data.length == 0) revert InvalidCallbackData();
 
-        (address initiator, uint256 minProfit, uint64 chainId, uint256 oraclePrice) = abi.decode(
-            data,
-            (address, uint256, uint64, uint256)
+        (address initiator, uint256 minProfit, uint64 chainId, uint256 oraclePrice, bytes32 txId) = abi.decode(
+            data, (address, uint256, uint64, uint256, bytes32)
         );
         if (!hasRole(OPERATOR_ROLE, initiator)) revert UnauthorizedCaller(initiator);
 
@@ -460,15 +705,11 @@ contract FlashSwapArbitrage is
 
         IERC20(inputToken).safeTransfer(targetPool, amountInWithFee);
         uint256 profit = amountReceived - amountInWithFee;
-        emit FlashSwapCompleted(sender, amountInWithFee, amountOut, profit, chainId);
+        retryTimestamps[txId] = 0; // Reset retry counter on success
+        emit FlashSwapCompleted(sender, amountInWithFee, amountReceived, profit, chainId);
     }
 
     /// @notice Executes a trade on the external exchange
-    /// @param tokenIn The input token
-    /// @param tokenOut The output token
-    /// @param amountIn The input amount
-    /// @param chainId The destination chain ID
-    /// @return amountOut The output amount
     function _executeTrade(
         address tokenIn,
         address tokenOut,
@@ -486,41 +727,32 @@ contract FlashSwapArbitrage is
     }
 
     /// @notice Triggers liquidation for an undercollateralized position
-    /// @param user The user to liquidate
-    /// @param collateralAsset The collateral asset
-    /// @param debtAsset The debt asset
-    /// @param debtToCover The amount of debt to cover
     function triggerLiquidation(
         address user,
         address collateralAsset,
         address debtAsset,
         uint256 debtToCover
-    ) external nonReentrant whenNotPaused onlyRole(OPERATOR_ROLE) {
+    ) external nonReentrant whenNotPaused {
+        if (!hasRole(KEEPER_ROLE, msg.sender) && !hasRole(OPERATOR_ROLE, msg.sender)) revert UnauthorizedCaller(msg.sender);
+
         require(supportedTokens[collateralAsset] && supportedTokens[debtAsset], "Unsupported tokens");
+        uint256 minHF = minHealthFactor[user] > 0 ? minHealthFactor[user] : healthFactorThreshold;
         uint256 healthFactor = ILendingProtocol(lendingProtocol).getHealthFactor(user, collateralAsset);
-        if (healthFactor >= minHealthFactor[user] || healthFactor >= MIN_HEALTH_FACTOR)
-            revert LiquidationNotRequired(user);
+        if (healthFactor >= minHF) revert LiquidationNotRequired(user);
 
         (uint256 price, ) = getOraclePrice(collateralAsset, debtAsset);
         if (price == 0) revert NoValidOraclePrice(collateralAsset);
 
-        IERC20(debtAsset).safeApprove(lendingProtocol, debtToCover);
-        ILendingProtocol(lendingProtocol).liquidate(user, collateralAsset, debtAsset, debtToCover);
-        IERC20(debtAsset).safeApprove(lendingProtocol, 0);
-        emit LiquidationTriggered(user, collateralAsset, debtAsset, debtToCover);
+        _executeLiquidation(user, collateralAsset, debtAsset, debtToCover);
     }
 
     /// @notice Triggers batch liquidations
-    /// @param users Array of users to liquidate
-    /// @param collateralAssets Array of collateral assets
-    /// @param debtAssets Array of debt assets
-    /// @param debtsToCover Array of debt amounts to cover
     function triggerBatchLiquidation(
         address[] calldata users,
         address[] calldata collateralAssets,
         address[] calldata debtAssets,
         uint256[] calldata debtsToCover
-    ) external nonReentrant whenNotPaused onlyRole(OPERATOR_ROLE) {
+    ) external nonReentrant whenNotPaused onlyRole(KEEPER_ROLE) {
         if (
             users.length != collateralAssets.length ||
             users.length != debtAssets.length ||
@@ -530,124 +762,103 @@ contract FlashSwapArbitrage is
         uint256 totalDebtCovered = 0;
         for (uint256 i = 0; i < users.length; i++) {
             if (!supportedTokens[collateralAssets[i]] || !supportedTokens[debtAssets[i]]) continue;
+            uint256 minHF = minHealthFactor[users[i]] > 0 ? minHealthFactor[users[i]] : healthFactorThreshold;
             uint256 healthFactor = ILendingProtocol(lendingProtocol).getHealthFactor(users[i], collateralAssets[i]);
-            if (healthFactor >= minHealthFactor[users[i]] && healthFactor >= MIN_HEALTH_FACTOR) continue;
+            if (healthFactor >= minHF) continue;
 
             (uint256 price, ) = getOraclePrice(collateralAssets[i], debtAssets[i]);
             if (price == 0) continue;
 
-            IERC20(debtAssets[i]).safeApprove(lendingProtocol, debtsToCover[i]);
-            try
-                ILendingProtocol(lendingProtocol).liquidate(
-                    users[i],
-                    collateralAssets[i],
-                    debtAssets[i],
-                    debtsToCover[i]
-                )
-            {
+            try _executeLiquidation(users[i], collateralAssets[i], debtAssets[i], debtsToCover[i]) {
                 totalDebtCovered += debtsToCover[i];
-                emit LiquidationTriggered(users[i], collateralAssets[i], debtAssets[i], debtsToCover[i]);
             } catch {
                 continue;
-            } finally {
-                IERC20(debtAssets[i]).safeApprove(lendingProtocol, 0);
             }
         }
         emit BatchLiquidationTriggered(users.length, totalDebtCovered);
     }
 
     /// @notice Swaps collateral to maintain health factor
-    /// @param user The user address
-    /// @param fromAsset The source asset
-    /// @param toAsset The target asset
-    /// @param amount The amount to swap
     function swapCollateral(
         address user,
         address fromAsset,
         address toAsset,
         uint256 amount
-    ) external nonReentrant whenNotPaused onlyRole(OPERATOR_ROLE) {
-        require(supportedTokens[fromAsset] && supportedTokens[toAsset], "Unsupported tokens");
+    ) external nonReentrant whenNotPaused {
+        if (!hasRole(KEEPER_ROLE, msg.sender) && !hasRole(OPERATOR_ROLE, msg.sender)) revert UnauthorizedCaller(msg.sender);
+
+        require(supportedTokens[fromAsset] && supportedTokens[toAsset], "unsupported tokens");
+        uint256 minHF = minHealthFactor[user] > 0 ? minHealthFactor[user] : healthFactorThreshold;
         uint256 healthFactor = ILendingProtocol(lendingProtocol).getHealthFactor(user, fromAsset);
-        uint256 minHF = minHealthFactor[user] > 0 ? minHealthFactor[user] : MIN_HEALTH_FACTOR;
         if (healthFactor >= minHF) revert HealthFactorBelowThreshold(healthFactor, minHF);
 
         (uint256 price, ) = getOraclePrice(fromAsset, toAsset);
         if (price == 0) revert NoValidOraclePrice(fromAsset);
 
-        IERC20(fromAsset).safeApprove(lendingProtocol, amount);
-        ILendingProtocol(lendingProtocol).swapCollateral(user, fromAsset, toAsset, amount);
-        IERC20(fromAsset).safeApprove(lendingProtocol, 0);
-        emit CollateralSwapped(user, fromAsset, toAsset, amount);
+        _executeCollateralSwap(user, fromAsset, toAsset, amount);
     }
 
     /// @notice Swaps collateral in batch
-    /// @param users Array of user addresses
-    /// @param fromAssets Array of source assets
-    /// @param toAssets Array of target assets
-    /// @param amounts Array of amounts to swap
     function swapBatchCollateral(
         address[] calldata users,
+        address[] users,
         address[] calldata fromAssets,
+        address[] users,
         address[] calldata toAssets,
+        uint256[] users,
         uint256[] calldata amounts
-    ) external nonReentrant whenNotPaused onlyRole(OPERATOR_ROLE) {
+    ) external nonReentrant whenNotPaused onlyRole(KEEPER_ROLE) {
         if (
             users.length != fromAssets.length ||
             users.length != toAssets.length ||
-            users.length != amounts.length
+            users.length != amounts.length ||
         ) revert BatchSizeMismatch(users.length, fromAssets.length);
 
         uint256 totalAmount = 0;
         for (uint256 i = 0; i < users.length; i++) {
             if (!supportedTokens[fromAssets[i]] || !supportedTokens[toAssets[i]]) continue;
-            uint256 healthFactor = ILendingProtocol(lendingProtocol).getHealthFactor(users[i], fromAssets[i]);
-            uint256 minHF = minHealthFactor[users[i]] > 0 ? minHealthFactor[users[i]] : MIN_HEALTH_FACTOR;
+            uint256 minHF = minHealthFactor[users[i]] > 0 ? minHealthFactor[users[i]] : healthFactorThreshold;
+            uint256 healthFactor = ILendingProtocol(lendingProtocol).getHealthFactor(users[i], fromAssets[i]]);
             if (healthFactor >= minHF) continue;
 
             (uint256 price, ) = getOraclePrice(fromAssets[i], toAssets[i]);
             if (price == 0) continue;
 
-            IERC20(fromAssets[i]).safeApprove(lendingProtocol, amounts[i]);
-            try
-                ILendingProtocol(lendingProtocol).swapCollateral(users[i], fromAssets[i], toAssets[i], amounts[i])
-            {
+            try _executeCollateralSwap(users[i], fromAssets[i], toAssets[i], amounts[i]) {
                 totalAmount += amounts[i];
-                emit CollateralSwapped(users[i], fromAssets[i], toAssets[i], amounts[i]);
             } catch {
                 continue;
-            } finally {
-                IERC20(fromAssets[i]).safeApprove(lendingProtocol, 0);
             }
         }
         emit BatchCollateralSwapped(users.length, totalAmount);
     }
 
-    /// @notice Handles cross-chain messages via CCIP
-    /// @param message The CCIP message
-    function _ccipReceive(Client.Any2EVMMessage memory message) internal override nonReentrant whenNotPaused {
+    /// @nonce Handles cross-chain messages via CCIP
+    function _ccipReceive(Client.Any2EVMMessage calldata message) internal override nonReentrant whenNotPaused {
         uint64 sourceChainId = uint64(message.sourceChainSelector);
         ICrossChainRetryOracle.NetworkStatus memory status = retryOracle.getNetworkStatus(sourceChainId);
         if (!status.bridgeOperational) revert RetryOracleError(sourceChainId);
 
-        (bytes memory data, address tokenIn, address tokenOut, uint256 amountIn, uint256 minProfit) = abi.decode(
-            message.data,
-            (bytes, address, address, uint256, uint256)
+        (bytes memory data, address tokenIn, address tokenOut, uint256 amountIn, uint256 minProfit, bytes32 txId) = abi.decode(
+            message.data, (bytes, address, address, uint256, uint256, bytes32)
         );
 
+        if (retryTimestamps[txId] > MAX_RETRIES) revert MaxRetriesExceeded(txId);
         if ((tokenIn != tokenA || tokenOut != tokenB) && (tokenIn != tokenB || tokenOut != tokenA))
             revert InvalidTokenPair(tokenIn, tokenOut);
 
         uint256 amountOut = _executeTrade(tokenIn, tokenOut, amountIn, sourceChainId);
-        if (amountOut < minProfit) revert InsufficientProfit(amountOut, minProfit);
+        if (amountOut < minProfit) {
+            retryTimestamps[txId]++;
+            emit RetryAttempted(txId, retryTimestamps[txId]);
+            revert InsufficientProfit(amountOut, minProfit);
+        }
 
+        retryTimestamps[txId] = 0;
         emit CrossChainMessageReceived(sourceChainId, message.messageId);
     }
 
-    /// @notice Withdraws accumulated profits
-    /// @param token The token to withdraw
-    /// @param recipient The recipient address
-    /// @param amount The amount to withdraw
+    /// @nonce Withdraws accumulated profits
     function withdrawProfit(
         address token,
         address recipient,
@@ -661,9 +872,7 @@ contract FlashSwapArbitrage is
         emit ProfitWithdrawn(token, recipient, amount);
     }
 
-    /// @notice Emergency recovers tokens
-    /// @param token The token to recover
-    /// @param recipient The recipient address
+    /// @nonce Emergency recovers tokens
     function emergencyRecover(address token, address recipient) external nonReentrant onlyRole(GOVERNOR_ROLE) {
         if (recipient == address(0)) revert InvalidExchangeAddress(recipient);
         uint256 balance = IERC20(token).balanceOf(address(this));
@@ -673,9 +882,8 @@ contract FlashSwapArbitrage is
         }
     }
 
-    /// @notice Revokes token approvals for specified contracts
-    /// @param token The token to revoke approvals for
-    function revokeApproval(address token) external onlyRole(GOVERNOR_ROLE) {
+    /// @nonce Revokes token approvals
+    function revokeApproval(address token) external nonReentrant onlyRole(GOVERNOR_ROLE) {
         require(token != address(0), "Invalid token address");
         IERC20(token).safeApprove(ammPool, 0);
         IERC20(token).safeApprove(externalExchange, 0);
@@ -689,22 +897,29 @@ contract FlashSwapArbitrage is
         }
     }
 
-    /// @notice Pauses the contract
-    function pause() external onlyRole(GOVERNOR_ROLE) {
+    /// @nonce Pauses the contract
+    function pause() external nonReentrant onlyRole(GOVERNOR_ROLE) {
         _pause();
     }
 
-    /// @notice Unpauses the contract
-    function unpause() external onlyRole(GOVERNOR_ROLE) {
+    /// @nonce Unpauses the contract
+    function unpause() external nonReentrant onlyRole(GOVERNOR_ROLE) {
         _unpause();
     }
 
-    /// @notice Gets active chain IDs from retry oracle
-    /// @return chainIds The active chain IDs
-    function activeChainIds() public view returns (uint64[] memory chainIds) {
+    /// @nonce Gets active chain IDs
+    function activeChainIds() external view returns (uint64[] memory) {
         return retryOracle.activeChainIds();
     }
 
-    /// @notice Receives tokens for gas fees
-    receive() external payable {}
+    /// @nonce Receives Ether for gas funding
+    receive() external payable {
+        gasReserve += msg.value;
+        emit GasReserveUpdated(gasReserve);
+    }
+
+    // Fallback function for safety
+    fallback() external payable {
+        revert("Invalid call");
+    }
 }
