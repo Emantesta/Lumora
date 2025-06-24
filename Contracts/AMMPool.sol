@@ -939,14 +939,6 @@ contract AMMPool is
         return lpFees[provider][token];
     }
 
-    function feeGrowthGlobal0X128() external view returns (uint256) {
-        return feeGrowthGlobal0X128;
-    }
-
-    function feeGrowthGlobal1X128() external view returns (uint256) {
-        return feeGrowthGlobal1X128;
-    }
-
     function isInFallbackPool(uint256 positionId) external view returns (bool) {
         return inFallbackPool[positionId];
     }
@@ -1103,16 +1095,7 @@ contract AMMPool is
         feeState.currentTick = tick;
     }
 
-    function positionCounter() external view returns (uint256) {
-        return positionCounter;
-    }
-
-    function positionCounter(uint256 newCounter) external onlyConcentratedLiquidity {
-        positionCounter = newCounter;
-    }
-
     // --- Internal Helper Functions ---
-
     function getOraclePrice() internal returns (uint256 price) {
         for (uint256 i = 0; i <= MAX_ORACLE_RETRIES; i++) {
             try IPriceOracle(primaryPriceOracle).getPrice(tokenA, tokenB) returns (int256 oraclePrice) {

@@ -5,7 +5,7 @@ import {ReentrancyGuard} from "@openzeppelin/contracts/security/ReentrancyGuard.
 import {IERC20Upgradeable} from "@openzeppelin/contracts-upgradeable/token/ERC20/IERC20Upgradeable.sol";
 import {SafeERC20Upgradeable} from "@openzeppelin/contracts-upgradeable/token/ERC20/utils/SafeERC20Upgradeable.sol";
 import {AMMPool} from "./AMMPool.sol";
-import {TickMath} from "./TickMath.sol";
+import {TickMath} from "@uniswap/v3-core/contracts/libraries/TickMath.sol";
 import {TickMathLibrary} from "./TickMathLibrary.sol";
 
 /// @title FallbackPool - Manages the fallback pool for out-of-range positions

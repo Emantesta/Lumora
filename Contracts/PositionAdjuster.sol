@@ -4,7 +4,6 @@ pragma solidity ^0.8.24;
 import "@chainlink/contracts/src/v0.8/automation/interfaces/KeeperCompatibleInterface.sol";
 import "@openzeppelin/contracts-upgradeable/security/ReentrancyGuardUpgradeable.sol";
 import "./Interfaces.sol";
-import "./AMMPool.sol";
 import "./external/uniswap/v3/TickMath.sol";
 import {UD60x18, ud} from "@prb/math/src/UD60x18.sol";
 

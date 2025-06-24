@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.24;
 
-// OpenZeppelin specific imports
+// OpenZeppelin-specific imports
 import { ERC721Upgradeable } from "@openzeppelin/contracts-upgradeable/token/ERC721/ERC721Upgradeable.sol";
 import { IERC721ReceiverUpgradeable } from "@openzeppelin/contracts-upgradeable/token/ERC721/IERC721ReceiverUpgradeable.sol";
 import { OwnableUpgradeable } from "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
@@ -11,42 +11,7 @@ import { ReentrancyGuardUpgradeable } from "@openzeppelin/contracts-upgradeable/
 import { PausableUpgradeable } from "@openzeppelin/contracts-upgradeable/security/PausableUpgradeable.sol";
 import { StringsUpgradeable } from "@openzeppelin/contracts-upgradeable/utils/StringsUpgradeable.sol";
 import { Base64Upgradeable } from "@openzeppelin/contracts-upgradeable/utils/Base64Upgradeable.sol";
-import "./Interfaces.sol"; 
-
-interface ICrossChainMessenger {
-    function sendMessage(
-        uint16 dstChainId,
-        string calldata dstAxelarChain,
-        bytes calldata destinationAddress,
-        bytes calldata payload,
-        bytes calldata adapterParams,
-        address refundAddress
-    ) external payable;
-    function estimateFees(
-        uint16 dstChainId,
-        string calldata dstAxelarChain,
-        address userApplication,
-        bytes calldata payload,
-        bytes calldata adapterParams
-    ) external view returns (uint256 nativeFee, uint256 zroFee);
-}
-
-interface ILayerZeroEndpoint {
-    function getInboundNonce(uint16 srcChainId, bytes calldata srcAddress) external view returns (uint64);
-}
-
-interface IWormhole {
-    function publishMessage(
-        uint32 nonce,
-        bytes calldata payload,
-        uint8 consistencyLevel
-    ) external payable returns (uint64 sequence);
-}
-
-interface ITokenBridge {
-    function burn(address token, uint256 amount, address recipient, uint16 dstChainId) external;
-    function mint(address token, uint256 amount, address recipient) external;
-}
+import "./Interfaces.sol";
 
 /// @title PositionManager - Enhanced upgradeable ERC721 contract for managing NFT-based liquidity positions
 /// @notice Manages NFT positions with automatic fee bridging, batch operations, and multi-bridge support
@@ -57,7 +22,8 @@ contract PositionManager is
     UUPSUpgradeable,
     ReentrancyGuardUpgradeable,
     PausableUpgradeable,
-    ERC721Upgradeable
+    ERC721Upgradeable,
+    IERC721ReceiverUpgradeable
 {
     using StringsUpgradeable for uint256;
     using Base64Upgradeable for bytes;
@@ -118,14 +84,14 @@ contract PositionManager is
         uint256 timestamp;
         uint256 nextRetryTimestamp;
     }
-    mapping(uint256 => FailedMessage) public failedMessages;
+    mapping(uint256 => FailedMessage) internal failedMessages;
 
     // Errors
-    error InvalidAMMPool(address pool);
+    error InvalidAMMPool();
     error InvalidTokenId(uint256 tokenId);
     error NotTokenOwner(uint256 tokenId);
     error InvalidChainId(uint16 chainId);
-    error InvalidMessenger(address messenger);
+    error InvalidMessenger();
     error InsufficientFee(uint256 provided, uint256 required);
     error MaxRetriesExceeded(uint256 messageId);
     error MessageNotFailed(uint256 messageId);
@@ -133,11 +99,11 @@ contract PositionManager is
     error InvalidPositionData(uint256 tokenId);
     error CrossChainPosition(uint256 tokenId);
     error Unauthorized();
-    error PositionAlreadyExists(uint256 tokenId);
+    error PositionExists(uint256 tokenId);
     error InvalidBatchSize(uint256 size);
     error FeesNotCollected(uint256 tokenId);
     error InvalidMessengerType(uint8 messengerType);
-    error InvalidBridgeType(uint8 bridgeType);
+    error InvalidBridgeType();
     error InvalidFeeDestination(address destination);
     error InsufficientAggregatedFees();
     error InvalidAddress(address addr, string message);
@@ -150,16 +116,16 @@ contract PositionManager is
     event BatchPositionsTransferred(uint256[] indexed tokenIds, address indexed owner, address indexed pool, uint256 count);
     event CrossChainPositionSent(uint256 indexed tokenId, address indexed owner, address indexed recipient, uint16 dstChainId, uint64 nonce, uint256 timelock);
     event CrossChainPositionReceived(uint256 indexed tokenId, address indexed owner, uint16 indexed srcChainId, uint64 nonce);
-    event FeesBridgedCrossChain(uint256 indexed tokenId, address indexed owner, uint256 amount0, uint256 amount1, uint16 dstChainId, uint8 bridgeType, uint64 nonce);
-    event BatchFeesBridged(address indexed owner, uint256[] tokenIds, uint256 total0, uint256 total1, uint16 dstChainId, uint8 bridgeType, uint64 nonce);
+    event FeesBridgedCrossChain(uint256 indexed tokenId, address indexed owner, uint256 amount0, uint256 amount1, uint16 dstChainId, uint256 bridgeType, uint64 nonce);
+    event BatchFeesBridged(address indexed owner, uint256[] tokenIds, uint256 total0, uint256 total1, uint16 dstChainId, uint256 bridgeType, uint64 nonce);
     event FeesAggregated(address indexed owner, uint256 amount0, uint256 amount1);
     event FeeDestinationUpdated(address indexed owner, address destination);
     event FailedMessageStored(uint256 indexed messageId, uint16 dstChainId, bytes payload);
-    event FailedMessageRetried(uint256 indexed messageId, uint16 dstChainId, uint256 retries);
+    event FailedMessageRetried(uint256 indexed messageId, bytes16 dstChainId, uint256 retries);
     event FailedMessageRetryScheduled(uint256 indexed messageId, uint256 nextRetryTimestamp);
     event TrustedRemoteManagerUpdated(uint16 indexed chainId, bytes managerAddress);
     event CrossChainMessengerUpdated(address indexed newMessenger, uint8 messengerType);
-    event TokenBridgeUpdated(uint8 bridgeType, address indexed newBridge);
+    event TokenBridgeUpdated(uint8 indexed bridgeType, address indexed newBridge);
     event BaseURIUpdated(string newBaseURI);
     event MessengerTypeUpdated(uint8 newMessengerType);
 
@@ -190,8 +156,8 @@ contract PositionManager is
         string memory _name,
         string memory _symbol
     ) external initializer {
-        if (_ammPool == address(0)) revert InvalidAMMPool(_ammPool);
-        if (_crossChainMessenger == address(0)) revert InvalidMessenger(_crossChainMessenger);
+        if (_ammPool == address(0)) revert InvalidAddress(_ammPool, "Invalid AMM pool");
+        if (_crossChainMessenger == address(0)) revert InvalidAddress(_crossChainMessenger, "Invalid messenger");
         if (_messengerType > 2) revert InvalidMessengerType(_messengerType);
 
         __Ownable_init();
@@ -203,6 +169,7 @@ contract PositionManager is
         ammPool = _ammPool;
         crossChainMessenger = _crossChainMessenger;
         messengerType = _messengerType;
+        baseURI = "";
         emit CrossChainMessengerUpdated(_crossChainMessenger, _messengerType);
         emit MessengerTypeUpdated(_messengerType);
     }
@@ -211,9 +178,9 @@ contract PositionManager is
 
     // --- NFT Management Functions ---
 
-    function mintPosition(uint256 positionId, address recipient) external nonReentrant onlyAMMPool {
+    function mintPosition(uint256 positionId, address recipient) external nonReentrant onlyAMMPool whenNotPaused {
         if (recipient == address(0)) revert InvalidAddress(recipient, "Invalid recipient");
-        if (_exists(positionId)) revert PositionAlreadyExists(positionId);
+        if (_exists(positionId)) revert PositionExists(positionId);
 
         (
             address owner,
@@ -244,7 +211,7 @@ contract PositionManager is
     function batchMintPositions(
         uint256[] calldata positionIds,
         address[] calldata recipients
-    ) external nonReentrant onlyAMMPool {
+    ) external nonReentrant onlyAMMPool whenNotPaused {
         uint256 length = positionIds.length;
         if (length == 0 || length > MAX_BATCH_SIZE || length != recipients.length) revert InvalidBatchSize(length);
 
@@ -254,7 +221,7 @@ contract PositionManager is
             uint256 positionId = positionIds[i];
             address recipient = recipients[i];
             if (recipient == address(0)) revert InvalidAddress(recipient, "Invalid recipient");
-            if (_exists(positionId)) revert PositionAlreadyExists(positionId);
+            if (_exists(positionId)) revert PositionExists(positionId);
 
             (
                 address owner,
@@ -276,7 +243,7 @@ contract PositionManager is
                 tokenB: IAMMPool(ammPool).tokenB()
             });
 
-            _aggregateFees(positionId); // Initialize fee aggregation
+            _aggregateFees(positionId);
             _safeMint(recipient, positionId);
             mintedIds[i] = positionId;
 
@@ -286,7 +253,7 @@ contract PositionManager is
         emit BatchPositionsMinted(mintedIds, msg.sender, ammPool, length);
     }
 
-    function burnPosition(uint256 tokenId) external nonReentrant onlyTokenOwner(tokenId) {
+    function burnPosition(uint256 tokenId) external nonReentrant onlyTokenOwner(tokenId) whenNotPaused {
         if (!_exists(tokenId)) revert InvalidTokenId(tokenId);
         if (isCrossChainPosition[tokenId]) revert CrossChainPosition(tokenId);
 
@@ -309,7 +276,7 @@ contract PositionManager is
         emit PositionBurned(tokenId, msg.sender);
     }
 
-    function transferToPool(uint256 tokenId) external nonReentrant onlyTokenOwner(tokenId) {
+    function transferToPool(uint256 tokenId) external nonReentrant onlyTokenOwner(tokenId) whenNotPaused {
         if (!_exists(tokenId)) revert InvalidTokenId(tokenId);
 
         _aggregateFees(tokenId); // Aggregate fees before transfer
@@ -320,9 +287,9 @@ contract PositionManager is
         emit BatchPositionsTransferred(tokenIds, msg.sender, ammPool, 1);
     }
 
-    function batchTransferToPool(uint256[] calldata tokenIds) external nonReentrant {
+    function batchTransferToPool(uint256[] calldata tokenIds) external nonReentrant whenNotPaused {
         uint256 length = tokenIds.length;
-        if (length == 0 || length > MAX_BATCH_SIZE) revert InvalidBatchSize(length);
+        if (length == 0 || length > MAX_TOKEN_SIZE) revert InvalidBatchSize(length);
 
         for (uint256 i = 0; i < length; i++) {
             uint256 tokenId = tokenIds[i];
@@ -338,23 +305,23 @@ contract PositionManager is
 
     // --- Fee Management Functions ---
 
-    function setFeeDestination(address destination) external {
+    function setFeeDestination(address destination) external whenNotPaused {
         if (destination == address(0)) revert InvalidFeeDestination(destination);
         feeDestinations[msg.sender] = destination;
         emit FeeDestinationUpdated(msg.sender, destination);
     }
 
     function _aggregateFees(uint256 tokenId) internal {
-        (, , , , , , uint256 tokensOwed0, uint256 tokensOwed1) = IAMMPool(ammPool).positions(tokenId);
-        if (tokensOwed0 > 0 || tokensOwed1 > 0) {
-            IAMMPool(ammPool).collectFees(tokenId);
-            address owner = ownerOf(tokenId);
-            feeTracking[tokenId].accumulated0 += tokensOwed0;
-            feeTracking[tokenId].accumulated1 += tokensOwed1;
-            aggregatedFees[owner].total0 += tokensOwed0;
-            aggregatedFees[owner].total1 += tokensOwed1;
-            emit FeesAggregated(owner, tokensOwed0, tokensOwed1);
-        }
+        (, , , , , uint256 tokensOwed0, uint256 tokensOwed1) = IAMMPool(ammPool).positions(tokenId);
+        if (tokensOwed0 == 0 && tokensOwed1 == 0) return; // Early return if no fees to collect
+
+        IAMMPool(ammPool).collectFees(tokenId);
+        address owner = ownerOf(tokenId);
+        feeTracking[tokenId].accumulated0 += tokensOwed0;
+        feeTracking[tokenId].accumulated1 += tokensOwed1;
+        aggregatedFees[owner].total0 += tokensOwed0;
+        aggregatedFees[owner].total1 += tokensOwed1;
+        emit FeesAggregated(owner, tokensOwed0, tokensOwed1);
     }
 
     function collectAndBridgeFees(
@@ -365,7 +332,7 @@ contract PositionManager is
     ) external payable nonReentrant onlyTokenOwner(tokenId) whenNotPausedCrossChain {
         if (!_exists(tokenId)) revert InvalidTokenId(tokenId);
         if (trustedRemoteManagers[dstChainId].length == 0) revert InvalidChainId(dstChainId);
-        if (tokenBridges[bridgeType] == address(0)) revert InvalidBridgeType(bridgeType);
+        if (tokenBridges[bridgeType] == address(0)) revert InvalidBridgeType();
 
         _aggregateFees(tokenId);
         FeeTracking storage fees = feeTracking[tokenId];
@@ -374,12 +341,13 @@ contract PositionManager is
 
         if (amount0 == 0 && amount1 == 0) revert FeesNotCollected(tokenId);
 
-        address recipient = feeDestinations[msg.sender] != address(0) ? feeDestinations[msg.sender] : msg.sender;
-        address bridge = tokenBridges[bridgeType];
-
+        // Update state before external calls
         fees.lastBridged0 = fees.accumulated0;
         fees.lastBridged1 = fees.accumulated1;
         fees.lastDstChainId = dstChainId;
+
+        address recipient = feeDestinations[msg.sender] != address(0) ? feeDestinations[msg.sender] : msg.sender;
+        address bridge = tokenBridges[bridgeType];
 
         string memory dstAxelarChain = chainIdToAxelarChain[dstChainId];
         bytes memory destinationAddress = trustedRemoteManagers[dstChainId];
@@ -390,11 +358,13 @@ contract PositionManager is
             dstChainId,
             dstAxelarChain,
             address(this),
+            destinationAddress,
             payload,
             adapterParams
         );
         if (msg.value < nativeFee) revert InsufficientFee(msg.value, nativeFee);
 
+        // Perform external calls after state updates
         if (amount0 > 0) {
             ITokenBridge(bridge).burn(IAMMPool(ammPool).tokenA(), amount0, recipient, dstChainId);
         }
@@ -440,13 +410,12 @@ contract PositionManager is
         uint256 length = tokenIds.length;
         if (length == 0 || length > MAX_BATCH_SIZE) revert InvalidBatchSize(length);
         if (trustedRemoteManagers[dstChainId].length == 0) revert InvalidChainId(dstChainId);
-        if (tokenBridges[bridgeType] == address(0)) revert InvalidBridgeType(bridgeType);
+        if (tokenBridges[bridgeType] == address(0)) revert InvalidBridgeType();
 
         uint256 total0;
         uint256 total1;
-        address recipient = feeDestinations[msg.sender] != address(0) ? feeDestinations[msg.sender] : msg.sender;
-        address bridge = tokenBridges[bridgeType];
 
+        // Update state before external calls
         for (uint256 i = 0; i < length; i++) {
             uint256 tokenId = tokenIds[i];
             if (!_exists(tokenId)) revert InvalidTokenId(tokenId);
@@ -466,12 +435,8 @@ contract PositionManager is
 
         if (total0 == 0 && total1 == 0) revert FeesNotCollected(0);
 
-        if (total0 > 0) {
-            ITokenBridge(bridge).burn(IAMMPool(ammPool).tokenA(), total0, recipient, dstChainId);
-        }
-        if (total1 > 0) {
-            ITokenBridge(bridge).burn(IAMMPool(ammPool).tokenB(), total1, recipient, dstChainId);
-        }
+        address recipient = feeDestinations[msg.sender] != address(0) ? feeDestinations[msg.sender] : msg.sender;
+        address bridge = tokenBridges[bridgeType];
 
         string memory dstAxelarChain = chainIdToAxelarChain[dstChainId];
         bytes memory destinationAddress = trustedRemoteManagers[dstChainId];
@@ -482,10 +447,19 @@ contract PositionManager is
             dstChainId,
             dstAxelarChain,
             address(this),
+            destinationAddress,
             payload,
             adapterParams
         );
         if (msg.value < nativeFee) revert InsufficientFee(msg.value, nativeFee);
+
+        // Perform external calls after state updates
+        if (total0 > 0) {
+            ITokenBridge(bridge).burn(IAMMPool(ammPool).tokenA(), total0, recipient, dstChainId);
+        }
+        if (total1 > 0) {
+            ITokenBridge(bridge).burn(IAMMPool(ammPool).tokenB(), total1, recipient, dstChainId);
+        }
 
         try ICrossChainMessenger(crossChainMessenger).sendMessage{value: nativeFee}(
             dstChainId,
@@ -502,15 +476,15 @@ contract PositionManager is
             emit BatchFeesBridged(msg.sender, tokenIds, total0, total1, dstChainId, bridgeType, nonce);
         } catch {
             uint256 messageId = failedMessageCount++;
-            failedMessages[messageId] = FailedMessage({
-                dstChainId: dstChainId,
-                dstAxelarChain: dstAxelarChain,
-                payload: payload,
-                adapterParams: adapterParams,
-                retries: 0,
-                timestamp: block.timestamp,
-                nextRetryTimestamp: block.timestamp + RETRY_DELAY
-            });
+            failedMessages[messageId] = FailedMessage(
+                dstChainId = dstChainId,
+                dstAxelarChain = dstAxelarChain,
+                payload = payload,
+                adapterParams = adapterParams,
+                retries = 0,
+                timestamp = block.timestamp,
+                nextRetryTimestamp = block.timestamp + RETRY_DELAY
+            );
             emit FailedMessageStored(messageId, dstChainId, payload);
             emit FailedMessageRetryScheduled(messageId, block.timestamp + RETRY_DELAY);
         }
@@ -522,25 +496,21 @@ contract PositionManager is
         bytes calldata adapterParams
     ) external payable nonReentrant whenNotPausedCrossChain {
         if (trustedRemoteManagers[dstChainId].length == 0) revert InvalidChainId(dstChainId);
-        if (tokenBridges[bridgeType] == address(0)) revert InvalidBridgeType(bridgeType);
+        if (tokenBridges[bridgeType] == address(0)) revert InvalidBridgeType();
 
         AggregatedFees storage fees = aggregatedFees[msg.sender];
-        if (fees.total0 < FEE_AGGREGATION_THRESHOLD && fees.total1 < FEE_AGGREGATION_THRESHOLD) revert InsufficientAggregatedFees();
+        if (fees.total0 < FEE_AGGREGATION_THRESHOLD && fees.total1 < FEE_AGGREGATION_THRESHOLD) {
+            revert InsufficientAggregatedFees();
+        }
 
-        address recipient = feeDestinations[msg.sender] != address(0) ? feeDestinations[msg.sender] : msg.sender;
-        address bridge = tokenBridges[bridgeType];
-
+        // Update state before external calls
         uint256 amount0 = fees.total0;
         uint256 amount1 = fees.total1;
         fees.total0 = 0;
         fees.total1 = 0;
 
-        if (amount0 > 0) {
-            ITokenBridge(bridge).burn(IAMMPool(ammPool).tokenA(), amount0, recipient, dstChainId);
-        }
-        if (amount1 > 0) {
-            ITokenBridge(bridge).burn(IAMMPool(ammPool).tokenB(), amount1, recipient, dstChainId);
-        }
+        address recipient = feeDestinations[msg.sender] != address(0) ? feeDestinations[msg.sender] : msg.sender;
+        address bridge = tokenBridges[bridgeType];
 
         string memory dstAxelarChain = chainIdToAxelarChain[dstChainId];
         bytes memory destinationAddress = trustedRemoteManagers[dstChainId];
@@ -555,6 +525,14 @@ contract PositionManager is
             adapterParams
         );
         if (msg.value < nativeFee) revert InsufficientFee(msg.value, nativeFee);
+
+        // Perform external calls after state updates
+        if (amount0 > 0) {
+            ITokenBridge(bridge).burn(IAMMPool(ammPool).tokenA(), amount0, recipient, dstChainId);
+        }
+        if (amount1 > 0) {
+            ITokenBridge(bridge).burn(IAMMPool(ammPool).tokenB(), amount1, recipient, dstChainId);
+        }
 
         try ICrossChainMessenger(crossChainMessenger).sendMessage{value: nativeFee}(
             dstChainId,
@@ -609,6 +587,7 @@ contract PositionManager is
         if (liquidity == 0) revert InvalidPositionData(tokenId);
         if (tokensOwed0 > 0 || tokensOwed1 > 0) revert FeesNotCollected(tokenId);
 
+        // Update state before external calls
         isCrossChainPosition[tokenId] = true;
         _burn(tokenId);
 
@@ -687,6 +666,7 @@ contract PositionManager is
         bytes[] memory payloads = new bytes[](length);
         uint256 totalNativeFee;
 
+        // Update state before external calls
         for (uint256 i = 0; i < length; i++) {
             uint256 tokenId = tokenIds[i];
             if (!_exists(tokenId)) revert InvalidTokenId(tokenId);
@@ -720,6 +700,7 @@ contract PositionManager is
                 position.tokenB
             );
 
+            // Note: Consider batch fee estimation if ICrossChainMessenger supports it to reduce gas costs
             (uint256 nativeFee,) = ICrossChainMessenger(crossChainMessenger).estimateFees(
                 dstChainId,
                 dstAxelarChain,
@@ -788,8 +769,8 @@ contract PositionManager is
             address tokenB
         ) = abi.decode(payload, (address, uint256, int24, int24, uint256, uint64, uint256, address, address));
 
-        if (block.timestamp < timelock) revert Unauthorized(); // Timelock check
-        if (_exists(tokenId)) revert PositionAlreadyExists(tokenId);
+        if (block.timestamp < timelock) revert Unauthorized();
+        if (_exists(tokenId)) revert PositionExists(tokenId);
         if (recipient == address(0) || liquidity == 0) revert InvalidPositionData(tokenId);
         if (IAMMPool(ammPool).tokenA() != tokenA || IAMMPool(ammPool).tokenB() != tokenB) revert InvalidPositionData(tokenId);
 
@@ -806,12 +787,12 @@ contract PositionManager is
         _safeMint(recipient, tokenId);
 
         IAMMPool(ammPool).addConcentratedLiquidityCrossChain(
-            0,
-            0,
+            tokenId,
+            address(0),
             tickLower,
             tickUpper,
             srcChainId,
-            ""
+            recipient
         );
 
         emit CrossChainPositionReceived(tokenId, recipient, srcChainId, nonce);
@@ -819,16 +800,16 @@ contract PositionManager is
 
     // --- Retry Mechanism ---
 
-    function retryFailedMessage(uint256 messageId) external payable nonReentrant whenNotPausedCrossChain {
+    function retryFailedMessage(uint256 messageId) external payable nonReentrant whenNotPaused {
         FailedMessage storage message = failedMessages[messageId];
         if (message.retries >= MAX_CROSS_CHAIN_RETRIES) revert MaxRetriesExceeded(messageId);
         if (message.timestamp == 0) revert MessageNotFailed(messageId);
-        if (block.timestamp < message.nextRetryTimestamp) revert RetryNotReady(messageId, message.nextRetryTimestamp);
-
-        unchecked {
-            message.retries++;
-            message.nextRetryTimestamp = block.timestamp + (RETRY_DELAY * (2 ** message.retries));
+        if (block.timestamp < message.nextRetryTimestamp) {
+            revert RetryNotReady(messageId, message.nextRetryTimestamp);
         }
+
+        message.retries++;
+        message.nextRetryTimestamp = block.timestamp + (RETRY_DELAY * (2 ** message.retries));
 
         (uint256 nativeFee,) = ICrossChainMessenger(crossChainMessenger).estimateFees(
             message.dstChainId,
@@ -859,9 +840,7 @@ contract PositionManager is
 
         if (success) {
             delete failedMessages[messageId];
-            unchecked {
-                failedMessageCount--;
-            }
+            failedMessageCount--;
         }
     }
 
@@ -877,18 +856,17 @@ contract PositionManager is
         Position memory position = positionData[tokenId];
         FeeTracking memory fees = feeTracking[tokenId];
         string memory json = string(abi.encodePacked(
-            "{\"name\":\"AMMPool Position #",
-            tokenId.toString(),
-            "\",\"description\":\"Liquidity position in AMMPool\",\"attributes\":",
-            "[{\"trait_type\":\"Pool\",\"value\":\"", _toHexString(position.pool), "\"},",
+            "{\"name\":\"AMMPool Position #", tokenId.toString(),
+            "\",\"description\":\"Liquidity position in AMMPool\",\"attributes\":[",
+            "{\"trait_type\":\"Pool\",\"value\":\"", _toHexString(position.pool), "\"},",
             "{\"trait_type\":\"TokenA\",\"value\":\"", _toHexString(position.tokenA), "\"},",
             "{\"trait_type\":\"TokenB\",\"value\":\"", _toHexString(position.tokenB), "\"},",
             "{\"trait_type\":\"TickLower\",\"value\":\"", int24ToString(position.tickLower), "\"},",
             "{\"trait_type\":\"TickUpper\",\"value\":\"", int24ToString(position.tickUpper), "\"},",
             "{\"trait_type\":\"Liquidity\",\"value\":\"", position.liquidity.toString(), "\"},",
             "{\"trait_type\":\"SourceChainId\",\"value\":\"", uint256(position.sourceChainId).toString(), "\"},",
-            "{\"trait_type\":\"AccumulatedFees0\",\"value\":\"", fees.accumulated0.toString(), "\"},",
-            "{\"trait_type\":\"AccumulatedFees1\",\"value\":\"", fees.accumulated1.toString(), "\"}]}"
+            "{\"trait_type\":\"Amount0\",\"value\":\"", fees.accumulated0.toString(), "\"},",
+            "{\"trait_type\":\"Amount1\",\"value\":\"", fees.accumulated1.toString(), "\"}]}"
         ));
 
         return string(abi.encodePacked("data:application/json;base64,", Base64Upgradeable.encode(bytes(json))));
@@ -896,7 +874,7 @@ contract PositionManager is
 
     // --- View Functions ---
 
-    function getPositionData(uint256 tokenId) external view returns (Position memory, FeeTracking memory) {
+    function getPositionData(uint256 tokenId) external view returns (Position memory position, FeeTracking memory tracking) {
         if (!_exists(tokenId)) revert InvalidTokenId(tokenId);
         return (positionData[tokenId], feeTracking[tokenId]);
     }
@@ -908,14 +886,14 @@ contract PositionManager is
 
     // --- Governance Functions ---
 
-    function updateTrustedRemoteManager(uint16 chainId, bytes calldata managerAddress) external onlyOwner {
+    function updateTrustedRemoteManager(uint16 chainId, bytes calldata managerAddress) external onlyOwner whenNotPaused {
         if (chainId == 0) revert InvalidChainId(chainId);
         trustedRemoteManagers[chainId] = managerAddress;
         emit TrustedRemoteManagerUpdated(chainId, managerAddress);
     }
 
-    function updateCrossChainMessenger(address newMessenger, uint8 newMessengerType) external onlyOwner {
-        if (newMessenger == address(0)) revert InvalidMessenger(newMessenger);
+    function updateCrossChainMessenger(address newMessenger, uint8 newMessengerType) external onlyOwner whenNotPaused {
+        if (newMessenger == address(0)) revert InvalidAddress(newMessenger, "Invalid messenger");
         if (newMessengerType > 2) revert InvalidMessengerType(newMessengerType);
         crossChainMessenger = newMessenger;
         messengerType = newMessengerType;
@@ -923,18 +901,18 @@ contract PositionManager is
         emit MessengerTypeUpdated(newMessengerType);
     }
 
-    function updateTokenBridge(uint8 bridgeType, address newBridge) external onlyOwner {
-        if (newBridge == address(0)) revert InvalidAddress(newBridge, "Invalid bridge");
+    function updateTokenBridge(uint8 bridgeType, address newBridge) external onlyOwner whenNotPaused {
+        if (newBridge == address(0)) revert InvalidAddress(newBridge, "Invalid bridge address");
         tokenBridges[bridgeType] = newBridge;
         emit TokenBridgeUpdated(bridgeType, newBridge);
     }
 
-    function updateBaseURI(string calldata newBaseURI) external onlyOwner {
+    function updateBaseURI(string memory newBaseURI) external onlyOwner whenNotPaused {
         baseURI = newBaseURI;
         emit BaseURIUpdated(newBaseURI);
     }
 
-    function updateChainIdMapping(uint16 chainId, string calldata axelarChain) external onlyOwner {
+    function updateChainId(uint16 chainId, string memory axelarChain) external onlyOwner whenNotPaused {
         if (chainId == 0) revert InvalidChainId(chainId);
         chainIdToAxelarChain[chainId] = axelarChain;
     }
@@ -955,7 +933,8 @@ contract PositionManager is
         } else if (messengerType == 1) {
             return nonces[dstChainId];
         } else if (messengerType == 2) {
-            return IWormhole(crossChainMessenger).publishMessage(0, "", 1);
+            // Note: Wormhole nonce handling may need customization based on specific bridge implementation
+            return nonces[dstChainId];
         } else {
             revert InvalidMessengerType(messengerType);
         }
@@ -972,7 +951,7 @@ contract PositionManager is
     }
 
     function _toHexChar(uint8 b) internal pure returns (bytes1) {
-        return b < 10 ? bytes1(b + 48) : bytes1(b + 87);
+        return bytes1(b < 10 ? b + 48 : b + 87);
     }
 
     function int24ToString(int24 value) internal pure returns (string memory) {
@@ -984,10 +963,10 @@ contract PositionManager is
         address,
         uint256,
         bytes calldata
-    ) external pure returns (bytes4) {
-        return this.onERC721Received.selector;
+    ) external pure override returns (bytes4) {
+        return IERC721ReceiverUpgradeable.onERC721Received.selector;
     }
 
     // --- Storage Gap ---
-    uint256[49] private __gap;
+    uint256[50] private __gap;
 }
