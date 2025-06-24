@@ -43,6 +43,7 @@ contract GovernanceModule is ReentrancyGuard {
     error InvalidReserveRatio(uint256 ratio);
     error InvalidPrice(uint256 expected, uint256 actual);
     error InvalidToken(address token);
+    error InsufficientReserve(uint256 amountOut, uint256 reserveOut);
 
     // Events
     event GovernanceProposalCreated(uint256 indexed proposalId, address target, bytes data, uint256 proposedAt);

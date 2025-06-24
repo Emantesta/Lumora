@@ -13,6 +13,16 @@ interface IPriceOracle {
 }
 
 interface IAMMPool {
+    struct FailedMessage {
+        uint16 dstChainId;
+        bytes sender;
+        uint256 timestamp;
+        uint8 messengerType;
+        uint256 retries;
+        uint256 nextRetryTimestamp;
+        bytes payload;
+    }
+
     function positions(uint256 positionId) external view returns (
         address owner,
         int24 tickLower,
@@ -74,8 +84,8 @@ interface IAMMPool {
     function tokenBridge() external view returns (address);
     function tokenBridgeType(address token) external view returns (uint8);
     function failedMessageCount() external view returns (uint256);
-    function setFailedMessage(uint256 messageId, AMMPool.FailedMessage memory message) external;
-    function getFailedMessage(uint256 messageId) external view returns (AMMPool.FailedMessage memory);
+    function setFailedMessage(uint256 messageId, FailedMessage memory message) external;
+    function getFailedMessage(uint256 messageId) external view returns (FailedMessage memory);
     function deleteFailedMessage(uint256 messageId) external;
     function updateFailedMessage(uint256 messageId, uint256 retries, uint256 nextRetryTimestamp) external;
     function incrementFailedMessageCount() external;
@@ -133,7 +143,7 @@ interface IAMMPool {
     function emitFailedMessageRetryScheduled(uint256 messageId, uint256 nextRetryTimestamp) external;
     function emitBatchMessagesSent(uint16[] memory dstChainIds, uint8 messengerType, uint256 totalFee) external;
     function emitBatchRetryProcessed(uint256[] memory messageIds, uint256 successfulRetries, uint256 failedRetries) external;
-    }
+} // Ensure closing brace for IAMMPool
 
 interface IPositionManager {
     function mintPosition(uint256 positionId, address recipient) external;
@@ -152,13 +162,13 @@ interface IPositionManager {
         uint8 bridgeType,
         bytes calldata adapterParams
     ) external payable;
-}
+} // Ensure closing brace for IPositionManager
 
 interface IPositionAdjuster {
     function adjustPosition(uint256 positionId, int24 newTickLower, int24 newTickUpper) external;
     function exitFallbackPool(uint256 positionId) external;
     function adjust(uint256 positionId, int24 tickLower, int24 tickUpper, uint256 liquidity) external;
-}
+} // Ensure closing brace for IPositionAdjuster
 
 interface ICommonStructs {
     struct InitParams {

@@ -479,9 +479,12 @@ contract ConcentratedLiquidity is ReentrancyGuard {
         uint256 amountIn,
         bool isToken0Input
     ) internal pure returns (uint256 amountOut, uint256 amountUsed) {
+        uint256 deltaPrice;
         if (isToken0Input) {
             // token0 -> token1 (price decreases)
-            uint256 deltaPrice = sqrtPriceX96 - nextSqrtPriceX96;
+            deltaPrice = sqrtPriceX96 > nextSqrtPriceX96 
+                ? sqrtPriceX96 - nextSqrtPriceX96 
+                : nextSqrtPriceX96 - sqrtPriceX96;
             amountOut = FullMath.mulDiv(liquidity, deltaPrice, 1 << 96);
             amountUsed = FullMath.mulDiv(
                 liquidity,
@@ -490,7 +493,9 @@ contract ConcentratedLiquidity is ReentrancyGuard {
             );
         } else {
             // token1 -> token0 (price increases)
-            uint256 deltaPrice = nextSqrtPriceX96 - sqrtPriceX96;
+            deltaPrice = nextSqrtPriceX96 > sqrtPriceX96 
+                ? nextSqrtPriceX96 - sqrtPriceX96 
+                : sqrtPriceX96 - nextSqrtPriceX96;
             amountOut = FullMath.mulDiv(liquidity, deltaPrice, 1 << 96);
             amountUsed = FullMath.mulDiv(liquidity, deltaPrice, sqrtPriceX96);
         }

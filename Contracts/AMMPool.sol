@@ -718,8 +718,8 @@ contract AMMPool is
 
         // Update tick and price only for non-concentrated liquidity swaps
         if (!usedConcentratedLiquidity) {
-            int24 currentTick = feeState.currentTick;
-            uint160 sqrtPriceX96 = TickMathLibrary.tickToSqrtPriceX96(currentTick);
+            int24 _currentTick = feeState.currentTick; // Renamed to _currentTick
+            uint160 sqrtPriceX96 = TickMathLibrary.tickToSqrtPriceX96(_currentTick);
             uint160 nextSqrtPriceX96 = TickMathLibrary.calculateNextPrice(this, sqrtPriceX96, isTokenAInput, amountInWithFee);
             feeState.currentTick = TickMathLibrary.sqrtPriceX96ToTick(nextSqrtPriceX96);
         }
@@ -1403,54 +1403,73 @@ contract AMMPool is
 
     function emitCrossChainSwap(
         address user,
-        uint256 amountA,
-        uint256 amountB,
-        uint16 address,
+        address inputToken,
+        uint256 amountIn,
+        uint256 amountOut,
+        uint16 chainId,
         uint64 nonce,
         uint256 estimatedConfirmationTime,
-        uint8 messenger
+        uint8 messengerType
     ) external onlyCrossChainModule {
-        emit CrossChainSwap(address user, address inputToken, uint256 amountIn, uint256 amountOut, uint16 chainId, uint64 nonce, uint256 estimatedConfirmationTime, uint8 messengerType);
+        emit CrossChainSwap(user, inputToken, amountIn, amountOut, chainId, nonce, estimatedConfirmationTime, messengerType);
     }
 
     function emitFailedMessageStored(
         uint256 messageId,
-        uint16 chainId,
-        bytes memory,
-        uint256 sender,
-        uint64 timestamp,
-        uint8 messenger
+        uint16 dstChainId,
+        bytes memory sender,
+        uint256 timestamp,
+        uint8 messengerType
     ) external onlyCrossChainModule {
-        emit FailedMessageStored(uint256 messageId, uint16 dstChainId, bytes sender, uint256 timestamp, uint8 messengerType);
+        emit FailedMessageStored(messageId, dstChainId, sender, timestamp, messengerType);
     }
 
     function emitFailedMessageRetried(
         uint256 messageId,
-        uint16 chainId,
+        uint16 dstChainId,
         uint64 retries,
-        uint8 messenger
+        uint8 messengerType
     ) external onlyCrossChainModule {
-        emit FailedMessageRetried(uint256 messageId, uint16 dstChainId, uint256 retries, uint8 messengerType);
+        emit FailedMessageRetried(messageId, dstChainId, retries, messengerType);
     }
 
     function emitFailedMessageRetryScheduled(uint256 messageId, uint256 nextRetryTimestamp) external onlyCrossChainModule {
         emit FailedMessageRetryScheduled(messageId, nextRetryTimestamp);
     }
 
-    function emitBatchMessagesSent(uint16[] memoryIds, uint8 messageType, uint256 totalFee) external onlyCrossChainModule {
-        emit BatchMessagesSent(uint16[] memoryIds, uint8 messengerType, uint256 totalNativeFee);
+    function emitBatchMessagesSent(
+        uint16[] memory dstChainIds,
+        uint8 messengerType,
+        uint256 totalNativeFee
+    ) external onlyCrossChainModule {
+        emit BatchMessagesSent(dstChainIds, messengerType, totalNativeFee);
+    }    
+
+    function emitBatchRetryProcessed(
+        uint256[] memory messageIds,
+        uint256 successfulRetries,
+        uint256 failedRetries
+    ) external onlyCrossChainModule {
+        emit BatchRetryProcessed(messageIds, successfulRetries, failedRetries);
     }
 
-    function emitBatchRetryProcessed(uint256[] memoryIds, uint256 success, uint256 failed) external onlyCrossChainModule {
-        emit BatchRetryProcessed(uint256[] memoryIds, uint256 successfulRetries, uint256 failedRetries);
+    function emitPositionCreated(
+        uint256 positionId,
+        address owner,
+        int24 tickLower,
+        int24 tickUpper,
+        uint128 liquidity
+    ) external onlyConcentratedLiquidity {
+        emit PositionCreated(positionId, owner, tickLower, tickUpper, liquidity);
     }
 
-    function emitPositionCreated(uint256 positionId, address owner, uint256 tickLowerLimit, uint256 tickUpperLimit, uint128 amount) external onlyConcentratedLiquidity {
-        emit PositionCreated(positionId, owner, int24 lowerLimit, int24 upperLimit, uint128 amount);
-    }
-
-    function emitPositionUpdated(uint256 positionId, uint256 tickLowerLimit, uint256 tickUpperLimit, uint128 amount) external onlyConcentratedLiquidity {
-        emit PositionUpdated(positionId, int24 lowerLimit, int24 upperLimit, uint128 amount);
+    function emitPositionUpdated(
+        uint256 positionId,
+        int24 tickLower,
+        int24 tickUpper,
+        uint128 liquidity
+    ) external onlyConcentratedLiquidity {
+        emit PositionUpdated(positionId, tickLower, tickUpper, liquidity);
     }
 
     function emitFeesCollected(uint256 positionId, uint256 fees0, uint256 fees1) external onlyConcentratedLiquidity {

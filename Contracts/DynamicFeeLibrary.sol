@@ -106,6 +106,7 @@ library DynamicFeeLibrary {
 
     /// @notice Validates swap price against oracle price
     /// @param state The AMMPool state
+    /// @param pool The AMMPool contract instance
     /// @param inputToken The input token address
     /// @param amountIn The input amount
     /// @param amountOut The output amount
@@ -113,6 +114,7 @@ library DynamicFeeLibrary {
     /// @param tokenB The address of tokenB
     function validatePrice(
         State storage state,
+        AMMPool pool,
         address inputToken,
         uint256 amountIn,
         uint256 amountOut,

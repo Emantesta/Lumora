@@ -193,7 +193,7 @@ contract FallbackPool is ReentrancyGuard {
     /// @param isTokenAInput True if tokenA is the input token
     /// @param amountIn The input amount
     /// @param amountOut The output amount
-    function updateFallbackReserves(bool isTokenAInput, uint256 amountIn, uint256 amountOut) external onlyPool {
+    function updateFallbackReserves(bool isTokenAInput, uint256 amountIn, uint256 amountOut) internal {
         if (isTokenAInput) {
             fallbackReserves.reserveA += amountIn;
             fallbackReserves.reserveB -= amountOut;

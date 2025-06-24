@@ -194,7 +194,7 @@ contract LumoraShield is Initializable, UUPSUpgradeable, ERC721Upgradeable, Reen
     event PolicyTraded(uint256 indexed policyId, address indexed seller, address indexed buyer, uint256 price);
     event PoolInvested(uint16 indexed chainId, address indexed asset, uint256 amount);
     event TreasuryFeeCollected(address indexed asset, uint256 amount);
-    event CrossChainInvestment(uint256 indexed investmentId, uint16 indexed chainId, address indexed asset, uint256 amount, uint16 dstChainId);
+    event CrossChainInvestmentInitiated(uint256 indexed investmentId, uint16 indexed chainId, address indexed asset, uint256 amount, uint16 dstChainId);
     event CrossChainInvestmentConfirmed(uint256 indexed investmentId, bool success);
     event TreasuryFeeUpdated(uint256 newFee);
     event MarketplaceFeeUpdated(uint256 newFee);
@@ -622,7 +622,7 @@ contract LumoraShield is Initializable, UUPSUpgradeable, ERC721Upgradeable, Reen
             adapterParams
         ) {
             emit PoolInvested(chainId, asset, amount);
-            emit CrossChainInvestment(investmentCounter, chainId, asset, amount, dstChainId);
+            emit CrossChainInvestmentInitiated(investmentCounter, chainId, asset, amount, dstChainId);
         } catch {
             _retryInvestment(investmentCounter, chainId, payload);
         }
@@ -764,16 +764,16 @@ contract LumoraShield is Initializable, UUPSUpgradeable, ERC721Upgradeable, Reen
         if (asset == ammPool.tokenA() || asset == ammPool.tokenB()) {
             address primaryOracle = ammPool.getPriceOracle();
             if (primaryOracle != address(0)) {
-                try IPriceOracle(primaryOracle).getPrice(ammPool.tokenA(), ammPool.tokenB()) returns (int256 price) {
-                    if (price <= 0) revert InvalidPrice(uint256(price));
-                    return uint256(price);
+                try IPriceOracle(primaryOracle).getPrice(ammPool.tokenA(), ammPool.tokenB()) returns (int256 oraclePrice) {
+                    if (oraclePrice <= 0) revert InvalidPrice(uint256(oraclePrice));
+                    return uint256(oraclePrice);
                 } catch {
                     address[] memory fallbackOracles = ammPool.getFallbackPriceOracles();
                     for (uint256 i = 0; i < fallbackOracles.length; i++) {
                         if (fallbackOracles[i] != address(0)) {
-                            try IPriceOracle(fallbackOracles[i]).getPrice(ammPool.tokenA(), ammPool.tokenB()) returns (int256 price) {
-                                if (price <= 0) revert InvalidPrice(uint256(price));
-                                return uint256(price);
+                            try IPriceOracle(fallbackOracles[i]).getPrice(ammPool.tokenA(), ammPool.tokenB()) returns (int256 oraclePrice) {
+                                if (oraclePrice <= 0) revert InvalidPrice(uint256(oraclePrice));
+                                return uint256(oraclePrice);
                             } catch {}
                         }
                     }
@@ -833,11 +833,25 @@ contract LumoraShield is Initializable, UUPSUpgradeable, ERC721Upgradeable, Reen
         uint256 price;
 
         if (asset == ammPool.tokenA() || asset == ammPool.tokenB()) {
-            try _getPrice(asset, 0) returns (uint256 oraclePrice) {
-                price = oraclePrice;
+            // Directly call _getPrice and skip update if it reverts
+            try IPriceOracle(ammPool.getPriceOracle()).getPrice(ammPool.tokenA(), ammPool.tokenB()) returns (int256 oraclePrice) {
+                if (oraclePrice <= 0) return; // Skip if price is invalid
+                price = uint256(oraclePrice);
             } catch {
-                // solhint-disable-next-line no-empty-blocks
-                return; // Skip update if oracle fails
+                // Try fallback oracles
+                address[] memory fallbackOracles = ammPool.getFallbackPriceOracles();
+                for (uint256 i = 0; i < fallbackOracles.length; i++) {
+                    if (fallbackOracles[i] != address(0)) {
+                        try IPriceOracle(fallbackOracles[i]).getPrice(ammPool.tokenA(), ammPool.tokenB()) returns (int256 oraclePrice) {
+                            if (oraclePrice <= 0) continue; // Skip if price is invalid
+                            price = uint256(oraclePrice);
+                            break; // Exit loop on successful price retrieval
+                        } catch {
+                            continue; // Try next fallback oracle
+                        }
+                    }
+                }
+                if (price == 0) return; // Skip update if no valid price was found
             }
         } else {
             AggregatorV3Interface oracle = chainlinkOracles[asset];
@@ -856,7 +870,7 @@ contract LumoraShield is Initializable, UUPSUpgradeable, ERC721Upgradeable, Reen
 
         emit PriceHistoryUpdated(asset, price, block.timestamp);
     }
-
+    
     /// @notice Handles payment for premiums in ETH, USDC, or SHIELD.
     /// @param payWithShield Whether to pay with SHIELD tokens.
     /// @param payWithUSDC Whether to pay with USDC.
@@ -939,7 +953,7 @@ contract LumoraShield is Initializable, UUPSUpgradeable, ERC721Upgradeable, Reen
             address(0),
             investment.adapterParams
         ) {
-            emit CrossChainInvestment(investmentId, dstChainId, asset, investmentAmount, dstChainId);
+            emit CrossChainInvestmentInitiated(investmentId, dstChainId, asset, investmentAmount, dstChainId);
         } catch {
             if (investment.retryCount >= MAX_RETRY_ATTEMPTS) {
                 riskPool.totalBalance = riskPool.totalBalance + investment.amount;

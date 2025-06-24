@@ -11,7 +11,7 @@ import { ReentrancyGuardUpgradeable } from "@openzeppelin/contracts-upgradeable/
 import { PausableUpgradeable } from "@openzeppelin/contracts-upgradeable/security/PausableUpgradeable.sol";
 import { StringsUpgradeable } from "@openzeppelin/contracts-upgradeable/utils/StringsUpgradeable.sol";
 import { Base64Upgradeable } from "@openzeppelin/contracts-upgradeable/utils/Base64Upgradeable.sol";
-import "./Interfaces.sol";
+import { IAMMPool, ICrossChainMessenger, ITokenBridge, ILayerZeroEndpoint } from "./Interfaces.sol";
 
 /// @title PositionManager - Enhanced upgradeable ERC721 contract for managing NFT-based liquidity positions
 /// @notice Manages NFT positions with automatic fee bridging, batch operations, and multi-bridge support
