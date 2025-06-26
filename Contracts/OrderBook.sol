@@ -10,16 +10,10 @@ import "@openzeppelin/contracts-upgradeable/token/ERC20/utils/SafeERC20Upgradeab
 import "@openzeppelin/contracts-upgradeable/token/ERC20/IERC20Upgradeable.sol";
 import "@openzeppelin/contracts-upgradeable/utils/cryptography/ECDSAUpgradeable.sol";
 import "@openzeppelin/contracts-upgradeable/utils/cryptography/EIP712Upgradeable.sol";
-import "./PriceOracle.sol";
-import "./GovernanceModule.sol";
-import "./AMMPool.sol";
-import "./GovernanceToken.sol";
-import "./CrossChainModule.sol";
-import "./CrossChainRetryOracle.sol";
 
-/// @title OrderBook - Advanced DEX order book with AMM, governance token, and multi-oracle integration
-/// @notice Manages limit, market, and stop-loss orders with concentrated liquidity, gasless trading, and cross-chain functionality
-/// @dev Uses UUPS proxy, GovernanceModule, AMMPool, GovernanceToken, CrossChainModule, and PriceOracle for price data
+/// @title OrderBook - Advanced DEX order book with perpetual futures, AMM, governance, and cross-chain functionality
+/// @notice Manages limit, market, stop-loss, and perpetual orders with concentrated liquidity and gasless trading
+/// @dev Uses UUPS proxy, integrates with PriceOracle, GovernanceModule, AMMPool, GovernanceToken, and CrossChainModule
 contract OrderBook is
     Initializable,
     UUPSUpgradeable,
@@ -31,23 +25,77 @@ contract OrderBook is
     using SafeERC20Upgradeable for IERC20Upgradeable;
     using ECDSAUpgradeable for bytes32;
 
-    /// @notice Packed structure representing an order (2 storage slots)
+    // Interfaces
+    interface IPriceOracle {
+        function getSpotPrice(address tokenA, address tokenB) external view returns (uint256);
+        function getIndexPrice(address tokenA, address tokenB) external view returns (uint256);
+        function getCurrentPairPrice(address, address) external view returns (uint256 price, bool cachedStatus);
+    }
+
+    interface ICrossChainModule {
+        function sendCrossChainOrder(address targetChain, bytes memory orderData) external;
+        function receiveCrossChainOrder(bytes memory orderData) external;
+        function batchCrossChainMessages(
+            uint16[] memory dstChainIds,
+            string[] memory dstChainNames,
+            bytes[] memory payloads,
+            bytes[] memory adapterParams,
+            uint256[] memory retryDelays
+        ) external payable;
+    }
+
+    interface IAMMPool {
+        function token0() external view returns (address);
+        function token1() external view returns (address);
+        function treasury() external view returns (address);
+        function swap(uint256 amount0Out, uint256 amount1Out, address to, bytes calldata data) external returns (uint256);
+        function getVolatility() external view returns (uint256);
+        function adjustLiquidityRange(uint256 minPrice, uint256 maxPrice) external;
+        function getConcentratedPrice() external view returns (uint256);
+        function rebalanceReserves(uint16 chainId) external;
+        function chainIdToAxelarChain(uint16 chainId) external view returns (string memory);
+    }
+
+    interface IGovernanceModule {
+        // Placeholder for governance interface
+    }
+
+    interface IGovernanceToken {
+        function transfer(address to, uint256 amount) external returns (bool);
+        function transferFrom(address from, address to, uint256 amount) external returns (bool);
+    }
+
+    interface ICrossChainRetryOracle {
+        struct NetworkStatus {
+            bool bridgeOperational;
+            bool retryRecommended;
+            uint256 recommendedRetryDelay;
+        }
+        function getNetworkStatus(uint64 chainId) external view returns (NetworkStatus memory);
+    }
+
+    /// @notice Packed structure representing an order
     struct Order {
-        address user; // Order creator (160 bits)
-        address tokenA; // Base token (160 bits)
-        address tokenB; // Quote token (160 bits)
-        uint96 price; // Price per token in wei (96 bits, max ~79 trillion wei)
-        uint96 amount; // Token amount (96 bits)
-        uint96 triggerPrice; // Trigger price for stop-loss (96 bits)
-        uint64 timestamp; // Creation time (64 bits, ~584 billion years)
-        uint64 expiryTimestamp; // Expiry time (64 bits)
-        uint256 orderId; // Unique global order ID (256 bits)
-        // Packed flags (8 bits total)
+        address user; // Order creator
+        address tokenA; // Base token
+        address tokenB; // Quote token
+        uint96 price; // Price per token in wei
+        uint96 amount; // Token amount
+        uint96 triggerPrice; // Trigger price for stop-loss
+        uint64 timestamp; // Creation time
+        uint64 expiryTimestamp; // Expiry time
+        uint256 orderId; // Unique global order ID
         bool isBuy : 1; // True for buy, false for sell
         bool isMarket : 1; // True for market order
         bool isStopLoss : 1; // True for stop-loss order
-        bool locked : 1; // True if locked for lending
+        bool locked : 1; // True if locked
         bool useConcentratedLiquidity : 1; // Use AMM concentrated liquidity
+        bool isPerpetual : 1; // True for perpetual contract
+        uint256 leverage; // Leverage (e.g., 20x = 20)
+        uint256 initialMargin; // Collateral deposited
+        uint256 maintenanceMargin; // Minimum margin to avoid liquidation
+        uint256 lastFundingTimestamp; // Last funding rate application
+        int256 cumulativeFunding; // Funding payments (positive = owed, negative = received)
     }
 
     /// @notice Structure for fee tiers
@@ -108,6 +156,7 @@ contract OrderBook is
         uint256 unclaimedTokens; // Unclaimed governance tokens
     }
 
+    // Storage
     uint256[] public bidHeap; // Max-heap for bids
     uint256[] public askHeap; // Min-heap for asks
     mapping(uint256 => Order) public orders; // Order ID to Order
@@ -116,12 +165,13 @@ contract OrderBook is
     mapping(uint256 => bool) public orderExists; // Order existence
     mapping(address => uint256[]) public stopLossOrders; // User to stop-loss order IDs
     uint256 public nextOrderId; // Global order ID counter
-    GovernanceModule public governanceModule;
-    AMMPool public ammPool;
-    GovernanceToken public governanceToken;
-    CrossChainModule public crossChainModule;
-    CrossChainRetryOracle public retryOracle;
-    PriceOracle public priceOracle;
+    IGovernanceModule public governanceModule;
+    IAMMPool public ammPool;
+    IGovernanceToken public governanceToken;
+    ICrossChainModule public crossChainModule;
+    ICrossChainRetryOracle public retryOracle;
+    IPriceOracle public priceOracle;
+    IERC20Upgradeable public usdc; // USDC contract for perpetuals collateral
     uint256 public constant MAX_ORDERS_PER_USER = 100;
     uint256 public constant MAX_MATCHES_PER_TX = 10;
     FeeTier[2] public feeTiers; // Fixed-size array for 2 fee tiers
@@ -146,8 +196,15 @@ contract OrderBook is
     uint256 public minFeesForReward; // Minimum fees for reward
     uint256 public rewardClaimCooldown; // Reward claim cooldown
     uint64 public oracleStalenessThreshold; // Oracle price staleness threshold
+    // Perpetual-specific storage
+    uint256 public constant FUNDING_INTERVAL = 1 hours; // Funding rate applied hourly
+    uint256 public constant MAX_LEVERAGE = 50; // Max 50x leverage
+    mapping(address => uint256) public userEquity; // Tracks user collateral (USDC)
+    mapping(address => int256) public userFundingBalance; // Net funding payments per user
+    uint256 public fundingRateCapBps = 10; // Max 0.1% per hour
+    uint256 public liquidationFeeBps = 50; // 0.5% liquidation fee
 
-    /// @notice Custom errors
+    // Custom Errors
     error InvalidOrder();
     error InvalidOrderId(uint256 orderId);
     error NotOrderOwner(address user);
@@ -187,8 +244,14 @@ contract OrderBook is
     error InvalidAddress(address addr, string message);
     error InvalidOperation(string message);
     error PriceOracleStale(uint256 timestamp);
+    error NotPerpetualOrder(uint256 orderId);
+    error FundingNotDue(uint256 orderId);
+    error ExcessiveLeverage(uint256 leverage);
+    error InsufficientMargin(uint256 margin);
+    error MarginTransferFailed();
+    error PositionNotLiquidatable(uint256 orderId);
 
-    /// @notice Events
+    // Events
     event OrderPlaced(
         address indexed user,
         bool isBuy,
@@ -203,6 +266,9 @@ contract OrderBook is
         uint256 expiryTimestamp,
         bool useConcentratedLiquidity
     );
+    event PerpetualOrderPlaced(bytes32 orderId, address indexed user, bool isBuy, uint256 leverage, uint256 margin);
+    event FundingRateApplied(address indexed user, bytes32 orderId, int256 fundingAmount);
+    event PositionLiquidated(bytes32 orderId, address indexed user, uint256 collateralReturned, uint256 fee);
     event OrderCancelled(address indexed user, uint256 orderId);
     event OrderLocked(uint256 orderId);
     event OrderUnlocked(uint256 orderId);
@@ -219,6 +285,7 @@ contract OrderBook is
     event CrossChainModuleSet(address indexed crossChainModule);
     event RetryOracleSet(address indexed retryOracle);
     event PriceOracleSet(address indexed priceOracle);
+    event USDCSet(address indexed usdc);
     event FeeTiersUpdated(FeeTier[2] feeTiers);
     event UserTypeSet(address indexed user, uint8 userType);
     event CrossChainOrderPlaced(
@@ -256,6 +323,7 @@ contract OrderBook is
     event TraderRewardsClaimed(address indexed user, uint256 amount);
     event RewardParametersSet(uint256 rewardRateBps, uint256 minFeesForReward, uint256 rewardClaimCooldown);
     event OracleStalenessThresholdSet(uint256 threshold);
+    event FundingParametersSet(uint256 fundingRateCapBps, uint256 liquidationFeeBps, uint256 maxLeverage);
 
     /// @dev EIP-712 typehash for signed orders
     bytes32 private constant ORDER_TYPEHASH = keccak256(
@@ -274,7 +342,8 @@ contract OrderBook is
         address _governanceToken,
         address _crossChainModule,
         address _retryOracle,
-        address _priceOracle
+        address _priceOracle,
+        address _usdc
     ) external initializer {
         if (_governanceModule == address(0)) revert InvalidGovernance(_governanceModule);
         if (_ammPool == address(0)) revert InvalidAddress(_ammPool, "Invalid AMMPool address");
@@ -282,18 +351,20 @@ contract OrderBook is
         if (_crossChainModule == address(0)) revert InvalidAddress(_crossChainModule, "Invalid CrossChainModule address");
         if (_retryOracle == address(0)) revert InvalidAddress(_retryOracle, "Invalid RetryOracle address");
         if (_priceOracle == address(0)) revert InvalidAddress(_priceOracle, "Invalid PriceOracle address");
+        if (_usdc == address(0)) revert InvalidAddress(_usdc, "Invalid USDC address");
 
         __Pausable_init();
         __ReentrancyGuard_init();
         __UUPSUpgradeable_init();
         __EIP712_init("OrderBook", "1");
 
-        governanceModule = GovernanceModule(_governanceModule);
-        ammPool = AMMPool(_ammPool);
-        governanceToken = GovernanceToken(_governanceToken);
-        crossChainModule = CrossChainModule(_crossChainModule);
-        retryOracle = CrossChainRetryOracle(_retryOracle);
-        priceOracle = PriceOracle(_priceOracle);
+        governanceModule = IGovernanceModule(_governanceModule);
+        ammPool = IAMMPool(_ammPool);
+        governanceToken = IGovernanceToken(_governanceToken);
+        crossChainModule = ICrossChainModule(_crossChainModule);
+        retryOracle = ICrossChainRetryOracle(_retryOracle);
+        priceOracle = IPriceOracle(_priceOracle);
+        usdc = IERC20Upgradeable(_usdc);
 
         nextOrderId = 1;
         nextMatchId = 1;
@@ -314,11 +385,13 @@ contract OrderBook is
         emit CrossChainModuleSet(_crossChainModule);
         emit RetryOracleSet(_retryOracle);
         emit PriceOracleSet(_priceOracle);
+        emit USDCSet(_usdc);
         emit FeeTiersUpdated(feeTiers);
         emit VolatilityThresholdSet(volatilityThreshold);
         emit LiquidityRangeMultiplierSet(liquidityRangeMultiplier);
         emit RewardParametersSet(rewardRateBps, minFeesForReward, rewardClaimCooldown);
         emit OracleStalenessThresholdSet(oracleStalenessThreshold);
+        emit FundingParametersSet(fundingRateCapBps, liquidationFeeBps, MAX_LEVERAGE);
     }
 
     /// @dev Authorizes upgrades via governance
@@ -350,30 +423,172 @@ contract OrderBook is
             tokenA,
             tokenB,
             expiryTimestamp,
-            useConcentratedLiquidity
+            useConcentratedLiquidity,
+            false,
+            0,
+            0
         );
         if (isMarket) {
             matchOrders(0);
         }
     }
 
+    /// @notice Places a perpetual order
+    function placePerpetualOrder(
+        address tokenA,
+        address tokenB,
+        uint256 amount,
+        bool isBuy,
+        uint256 leverage,
+        uint256 margin
+    ) external whenNotPaused nonReentrant returns (uint256 orderId) {
+        if (leverage > MAX_LEVERAGE) revert ExcessiveLeverage(leverage);
+        if (margin < amount.div(leverage)) revert InsufficientMargin(margin);
+        if (!usdc.transferFrom(msg.sender, address(this), margin)) revert MarginTransferFailed();
+
+        orderId = nextOrderId++;
+        Order storage order = orders[orderId];
+        order.user = msg.sender;
+        order.tokenA = tokenA;
+        order.tokenB = tokenB;
+        order.amount = uint96(amount);
+        order.isBuy = isBuy;
+        order.isPerpetual = true;
+        order.leverage = leverage;
+        order.initialMargin = margin;
+        order.maintenanceMargin = margin.mul(80).div(100); // 80% of initial margin
+        order.timestamp = uint64(block.timestamp);
+        order.lastFundingTimestamp = block.timestamp;
+
+        userOrders[msg.sender].push(orderId);
+        userEquity[msg.sender] = userEquity[msg.sender].add(margin);
+        orderExists[orderId] = true;
+
+        emit PerpetualOrderPlaced(bytes32(orderId), msg.sender, isBuy, leverage, margin);
+        _matchPerpetualOrder(orderId);
+        return orderId;
+    }
+
+    /// @notice Places a cross-chain perpetual order
+    function placeCrossChainPerpetualOrder(
+        address targetChain,
+        address tokenA,
+        address tokenB,
+        uint256 amount,
+        bool isBuy,
+        uint256 leverage,
+        uint256 margin
+    ) external whenNotPaused nonReentrant {
+        if (leverage > MAX_LEVERAGE) revert ExcessiveLeverage(leverage);
+        if (margin < amount.div(leverage)) revert InsufficientMargin(margin);
+        if (!usdc.transferFrom(msg.sender, address(this), margin)) revert MarginTransferFailed();
+
+        bytes memory orderData = abi.encode(
+            msg.sender,
+            tokenA,
+            tokenB,
+            amount,
+            isBuy,
+            leverage,
+            margin,
+            block.timestamp
+        );
+        crossChainModule.sendCrossChainOrder(targetChain, orderData);
+    }
+
+    /// @notice Receives cross-chain perpetual order
+    function receiveCrossChainPerpetualOrder(bytes memory orderData) external nonReentrant {
+        if (msg.sender != address(crossChainModule)) revert Unauthorized();
+        (
+            address user,
+            address tokenA,
+            address tokenB,
+            uint256 amount,
+            bool isBuy,
+            uint256 leverage,
+            uint256 margin,
+            uint256 timestamp
+        ) = abi.decode(orderData, (address, address, address, uint256, bool, uint256, uint256, uint256));
+
+        uint256 orderId = placePerpetualOrder(tokenA, tokenB, amount, isBuy, leverage, margin);
+        orders[orderId].timestamp = uint64(timestamp); // Preserve original timestamp
+    }
+
+    /// @notice Applies funding rate for a perpetual order
+    function applyFunding(uint256 orderId) external nonReentrant {
+        Order storage order = orders[orderId];
+        if (!order.isPerpetual) revert NotPerpetualOrder(orderId);
+        if (block.timestamp < order.lastFundingTimestamp + FUNDING_INTERVAL) revert FundingNotDue(orderId);
+
+        uint256 spotPrice = priceOracle.getSpotPrice(order.tokenA, order.tokenB);
+        uint256 indexPrice = priceOracle.getIndexPrice(order.tokenA, order.tokenB);
+
+        // Calculate funding rate: (spot - index) / index * interval / 24 hours
+        int256 premium = int256(spotPrice) - int256(indexPrice);
+        int256 fundingRate = (premium * int256(FUNDING_INTERVAL) * 1e4) / (int256(indexPrice) * 24 hours);
+        if (fundingRate > int256(fundingRateCapBps)) fundingRate = int256(fundingRateCapBps);
+        if (fundingRate < -int256(fundingRateCapBps)) fundingRate = -int256(fundingRateCapBps);
+
+        // Calculate funding payment: position size * funding rate
+        uint256 positionSize = order.amount.mul(order.leverage);
+        int256 fundingAmount = (int256(positionSize) * fundingRate) / 1e4;
+        if (!order.isBuy) fundingAmount = -fundingAmount; // Shorts pay/receive opposite of longs
+
+        // Update order and user balances
+        order.cumulativeFunding += fundingAmount;
+        userFundingBalance[order.user] += fundingAmount;
+        order.lastFundingTimestamp = block.timestamp;
+
+        emit FundingRateApplied(order.user, bytes32(orderId), fundingAmount);
+    }
+
+    /// @notice Batch applies funding for multiple orders
+    function batchApplyFunding(uint256[] calldata orderIds) external nonReentrant {
+        for (uint256 i = 0; i < orderIds.length; i++) {
+            applyFunding(orderIds[i]);
+        }
+    }
+
+    /// @notice Liquidates an under-margined position
+    function liquidatePosition(uint256 orderId) external nonReentrant {
+        Order storage order = orders[orderId];
+        if (!order.isPerpetual) revert NotPerpetualOrder(orderId);
+        if (!_isUnderMargined(order)) revert PositionNotLiquidatable(orderId);
+
+        uint256 collateral = order.initialMargin;
+        uint256 liquidationFee = collateral.mul(liquidationFeeBps).div(1e4);
+        uint256 remainingCollateral = collateral.sub(liquidationFee);
+
+        userEquity[order.user] = userEquity[order.user].sub(collateral);
+        if (!usdc.transfer(order.user, remainingCollateral)) revert MarginTransferFailed();
+        if (!usdc.transfer(ammPool.treasury(), liquidationFee)) revert MarginTransferFailed();
+
+        delete orders[orderId];
+        orderExists[orderId] = false;
+        _removeUserOrder(order.user, orderId);
+
+        emit PositionLiquidated(bytes32(orderId), order.user, remainingCollateral, liquidationFee);
+    }
+
     /// @notice Places a signed order (gasless)
     function placeOrderWithSignature(SignedOrder calldata signedOrder) external whenNotPaused nonReentrant {
-        bytes32 structHash = keccak256(abi.encode(
-            ORDER_TYPEHASH,
-            signedOrder.user,
-            signedOrder.isBuy,
-            signedOrder.isMarket,
-            signedOrder.isStopLoss,
-            signedOrder.price,
-            signedOrder.triggerPrice,
-            signedOrder.amount,
-            signedOrder.expiryTimestamp,
-            signedOrder.tokenA,
-            signedOrder.tokenB,
-            signedOrder.useConcentratedLiquidity,
-            signedOrder.nonce
-        ));
+        bytes32 structHash = keccak256(
+            abi.encode(
+                ORDER_TYPEHASH,
+                signedOrder.user,
+                signedOrder.isBuy,
+                signedOrder.isMarket,
+                signedOrder.isStopLoss,
+                signedOrder.price,
+                signedOrder.triggerPrice,
+                signedOrder.amount,
+                signedOrder.expiryTimestamp,
+                signedOrder.tokenA,
+                signedOrder.tokenB,
+                signedOrder.useConcentratedLiquidity,
+                signedOrder.nonce
+            )
+        );
         bytes32 hash = _hashTypedDataV4(structHash);
         address signer = hash.recover(signedOrder.signature);
         if (signer != signedOrder.user) revert InvalidSignature();
@@ -391,7 +606,10 @@ contract OrderBook is
             signedOrder.tokenA,
             signedOrder.tokenB,
             signedOrder.expiryTimestamp,
-            signedOrder.useConcentratedLiquidity
+            signedOrder.useConcentratedLiquidity,
+            false,
+            0,
+            0
         );
 
         if (signedOrder.isMarket) {
@@ -424,7 +642,10 @@ contract OrderBook is
             tokenA,
             tokenB,
             expiryTimestamp,
-            useConcentratedLiquidity
+            useConcentratedLiquidity,
+            false,
+            0,
+            0
         );
         emit OffChainOrderSubmitted(nextOrderId - 1);
     }
@@ -447,11 +668,13 @@ contract OrderBook is
         if (dstChainId == 0) revert InvalidChainId(dstChainId);
         _validateOrder(isBuy, isMarket, isStopLoss, price, triggerPrice, amount, tokenA, tokenB, expiryTimestamp);
 
-        CrossChainRetryOracle.NetworkStatus memory status = retryOracle.getNetworkStatus(uint64(dstChainId));
-        if (!status.retryRecommended || !status.bridgeOperational) revert CrossChainModule.RetryNotRecommended(dstChainId);
+        ICrossChainRetryOracle.NetworkStatus memory status = retryOracle.getNetworkStatus(uint64(dstChainId));
+        if (!status.retryRecommended || !status.bridgeOperational) revert InvalidOperation("Retry not recommended");
 
         uint256 orderId;
-        unchecked { orderId = nextOrderId++; }
+        unchecked {
+            orderId = nextOrderId++;
+        }
         if (crossChainOrders[dstChainId][orderId]) revert CrossChainOrderExists(dstChainId, orderId);
 
         IERC20Upgradeable collateralToken = IERC20Upgradeable(isBuy ? tokenB : tokenA);
@@ -507,24 +730,22 @@ contract OrderBook is
         if (userOrders[user].length >= MAX_ORDERS_PER_USER) return;
         _validateOrder(isBuy, isMarket, isStopLoss, price, triggerPrice, amount, tokenA, tokenB, expiryTimestamp);
 
-        Order memory order = Order({
-            user: user,
-            isBuy: isBuy,
-            isMarket: isMarket,
-            isStopLoss: isStopLoss,
-            price: price,
-            triggerPrice: triggerPrice,
-            amount: amount,
-            timestamp: uint64(block.timestamp),
-            expiryTimestamp: expiryTimestamp,
-            locked: false,
-            orderId: orderId,
-            tokenA: tokenA,
-            tokenB: tokenB,
-            useConcentratedLiquidity: useConcentratedLiquidity
-        });
+        Order storage order = orders[orderId];
+        order.user = user;
+        order.isBuy = isBuy;
+        order.isMarket = isMarket;
+        order.isStopLoss = isStopLoss;
+        order.price = price;
+        order.triggerPrice = triggerPrice;
+        order.amount = amount;
+        order.timestamp = uint64(block.timestamp);
+        order.expiryTimestamp = expiryTimestamp;
+        order.locked = false;
+        order.orderId = orderId;
+        order.tokenA = tokenA;
+        order.tokenB = tokenB;
+        order.useConcentratedLiquidity = useConcentratedLiquidity;
 
-        orders[orderId] = order;
         userOrders[user].push(orderId);
         orderExists[orderId] = true;
 
@@ -564,11 +785,20 @@ contract OrderBook is
         Order storage order = orders[orderId];
         if (order.user != msg.sender) revert NotOrderOwner(msg.sender);
         if (order.locked) revert OrderLocked(orderId);
-        if (order.expiryTimestamp != 0 && order.expiryTimestamp <= block.timestamp)
-            revert OrderExpired(orderId);
+        if (order.expiryTimestamp != 0 && order.expiryTimestamp <= block.timestamp) revert OrderExpired(orderId);
+
+        if (order.isPerpetual) {
+            uint256 collateral = order.initialMargin;
+            userEquity[order.user] = userEquity[order.user].sub(collateral);
+            if (!usdc.transfer(order.user, collateral)) revert MarginTransferFailed();
+        } else {
+            IERC20Upgradeable collateralToken = IERC20Upgradeable(order.isBuy ? order.tokenB : order.tokenA);
+            uint256 collateral = order.isMarket ? uint256(order.amount) : uint256(order.price) * order.amount;
+            collateralToken.safeTransfer(order.user, collateral);
+        }
 
         if (order.isStopLoss) {
-            _removeStopLossOrder(order.user, orderId);
+            _removeOrderStopLossOrder(order.user, orderId);
         }
         _removeOrder(orderId, order.isBuy);
         emit OrderCancelled(msg.sender, orderId);
@@ -576,33 +806,52 @@ contract OrderBook is
 
     /// @notice Matches orders
     function matchOrders(uint256 minAmountOut) external whenNotPaused nonReentrant {
-        if (bidHeap.length == 0 && askHeap.length == 0) revert NoMatchableOrders();
+        if (bidHeap.length == 0 && askHeap.length == 0) revert NoMatchableOrders;
+        // Prioritize perpetual orders
+        for (uint256 i = 0; i < userOrders[msg.sender].length; i++) {
+            uint256 orderId = userOrders[orderIds[msg.sender][i];
+            Order storage order = orders[orderId];
+            if (order.isPerpetual) {
+                _matchPerpetualOrder(orderId);
+            }
+        }
         _checkStopLossOrders();
-        _matchOrders(minAmountOut, MAX_MATCHES_PER_TX);
+        _matchOrders(minAmountOut, MAX_MATCHES_PER);
     }
 
     /// @notice Matches multiple orders
     function matchMultipleOrders(uint256 maxMatches, uint256 minAmountOut) external whenNotPaused nonReentrant {
-        if (bidHeap.length == 0 && askHeap.length == 0) revert NoMatchableOrders();
+        if (bidHeap.length == 0 && askHeap.length == 0) revert NoMatchableOrders;
         if (maxMatches == 0 || maxMatches > MAX_MATCHES_PER_TX) revert InvalidAmount(maxMatches);
+        // Prioritize perpetual orders
+        for (uint256 i = 0; i < userOrders[msg.sender].length; i++) {
+            uint256 orderId = userOrders[msg.sender][i];
+            Order storage order = orders[orderId];
+            if (order.isPerpetual && maxMatches > 0) {
+                _matchPerpetualOrder(orderId);
+                maxMatches--;
+            }
+        }
         _checkStopLossOrders();
         _matchOrders(minAmountOut, maxMatches);
     }
 
-    /// @notice Matches orders across chains
+    /// @notice Matches orders cross-chain
     function matchOrdersCrossChain(
         uint16 dstChainId,
         uint256 minAmountOut,
         bytes calldata adapterParams
     ) external payable whenNotPaused nonReentrant {
         if (dstChainId == 0) revert InvalidChainId(dstChainId);
-        if (bidHeap.length == 0 || askHeap.length == 0) revert NoMatchableOrders();
+        if (bidHeap.length == 0 || askHeap.length == 0) revert NoMatchableOrders;
 
-        CrossChainRetryOracle.NetworkStatus memory status = retryOracle.getNetworkStatus(uint64(dstChainId));
-        if (!status.retryRecommended || !status.bridgeOperational) revert CrossChainModule.RetryNotRecommended(dstChainId);
+        ICrossChainRetryOracle.NetworkStatus memory status = retryOracle.getNetworkStatus(uint64(dstChainId));
+        if (!status.retryRecommended || !status.bridgeOperational) revert InvalidOperation("Retry not recommended");
 
         uint256 matchId;
-        unchecked { matchId = nextMatchId++; }
+        unchecked {
+            matchId = nextMatchId++;
+        }
         if (crossChainMatches[dstChainId][matchId]) revert CrossChainMatchExists(dstChainId, matchId);
 
         uint256 bidId = bidHeap[0];
@@ -613,7 +862,8 @@ contract OrderBook is
         if (
             bid.expiryTimestamp != 0 && bid.expiryTimestamp <= block.timestamp ||
             ask.expiryTimestamp != 0 && ask.expiryTimestamp <= block.timestamp ||
-            bid.price < ask.price || bid.locked || ask.locked
+            bid.price < ask.price || bid.locked || ask.locked ||
+            (bid.isPerpetual != ask.isPerpetual)
         ) revert NoMatchableOrders();
 
         uint256 tradeAmount = bid.amount < ask.amount ? bid.amount : ask.amount;
@@ -671,7 +921,9 @@ contract OrderBook is
         if (uint8(proposalType) > uint8(ProposalType.Other)) revert InvalidProposalType(uint8(proposalType));
 
         uint256 proposalId;
-        unchecked { proposalId = nextProposalId++; }
+        unchecked {
+            proposalId = nextProposalId++;
+        }
         Proposal storage proposal = proposals[proposalId];
         proposal.proposalId = proposalId;
         proposal.proposer = msg.sender;
@@ -688,7 +940,7 @@ contract OrderBook is
         if (proposal.proposalId == 0) revert InvalidProposal(proposalId);
         if (proposal.endTime < block.timestamp) revert ProposalEnded(proposalId);
         if (proposal.hasVoted[msg.sender]) revert AlreadyVoted(msg.sender);
-        if (stakedTokens[msg.sender] == 0) revert InsufficientStake(msg.sender, stakedTokens[msg.sender]));
+        if (stakedTokens[msg.sender] == 0) revert InsufficientStake(msg.sender, stakedTokens[msg.sender]);
 
         proposal.hasVoted[msg.sender] = true;
         proposal.voteCount += stakedTokens[msg.sender];
@@ -723,9 +975,12 @@ contract OrderBook is
     /// @notice Claims trader rewards
     function claimTraderRewards() external nonReentrant {
         TraderReward storage reward = traderRewards[msg.sender];
-        if (reward.accumulatedFees < minFeesForReward) revert InsufficientFeesForReward(msg.sender, reward.accumulatedFees);
-        if (block.timestamp < reward.lastClaimTimestamp + rewardClaimCooldown)
+        if (reward.accumulatedFees < minFeesForReward) {
+            revert InsufficientFeesForReward(msg.sender, reward.accumulatedFees);
+        }
+        if (block.timestamp < reward.lastClaimTimestamp + rewardClaimCooldown) {
             revert RewardCooldownActive(msg.sender, reward.lastClaimTimestamp + rewardClaimCooldown);
+        }
 
         uint256 rewardAmount = reward.unclaimedTokens;
         reward.unclaimedTokens = 0;
@@ -827,10 +1082,19 @@ contract OrderBook is
     /// @notice Cancels multiple orders
     function batchCancelOrders(uint256[] calldata orderIds) external nonReentrant {
         _restrictGovernance();
-        for (uint256 i; i < orderIds.length; ) {
+        for (uint256 i = 0; i < orderIds.length; i++) {
             if (orderExists[orderIds[i]]) {
                 Order storage order = orders[orderIds[i]];
                 if (!order.locked && (order.expiryTimestamp == 0 || order.expiryTimestamp > block.timestamp)) {
+                    if (order.isPerpetual) {
+                        uint256 collateral = order.initialMargin;
+                        userEquity[order.user] = userEquity[order.user].sub(collateral);
+                        if (!usdc.transfer(order.user, collateral)) revert MarginTransferFailed();
+                    } else {
+                        IERC20Upgradeable collateralToken = IERC20Upgradeable(order.isBuy ? order.tokenB : order.tokenA);
+                        uint256 collateral = order.isMarket ? uint256(order.amount) : uint256(order.price) * order.amount;
+                        collateralToken.safeTransfer(order.user, collateral);
+                    }
                     if (order.isStopLoss) {
                         _removeStopLossOrder(order.user, orderIds[i]);
                     }
@@ -838,7 +1102,6 @@ contract OrderBook is
                     emit OrderCancelled(order.user, orderIds[i]);
                 }
             }
-            unchecked { ++i; }
         }
         emit BatchOrdersCancelled(orderIds);
     }
@@ -850,29 +1113,39 @@ contract OrderBook is
         uint256 count = 0;
 
         for (uint256 i = bidHeap.length; i > 0 && count < maxOrders; ) {
-            unchecked { --i; }
+            unchecked {
+                --i;
+            }
             uint256 orderId = bidHeap[i];
             Order storage order = orders[orderId];
             if (order.expiryTimestamp != 0 && order.expiryTimestamp <= block.timestamp) {
                 expiredIds[count] = orderId;
                 _removeOrder(orderId, true);
-                unchecked { ++count; }
+                unchecked {
+                    ++count;
+                }
             }
         }
 
         for (uint256 i = askHeap.length; i > 0 && count < maxOrders; ) {
-            unchecked { --i; }
+            unchecked {
+                --i;
+            }
             uint256 orderId = askHeap[i];
             Order storage order = orders[orderId];
             if (order.expiryTimestamp != 0 && order.expiryTimestamp <= block.timestamp) {
                 expiredIds[count] = orderId;
                 _removeOrder(orderId, false);
-                unchecked { ++count; }
+                unchecked {
+                    ++count;
+                }
             }
         }
 
         if (count < maxOrders) {
-            assembly { mstore(expiredIds, count) }
+            assembly {
+                mstore(expiredIds, count)
+            }
         }
 
         emit ExpiredOrdersCleaned(expiredIds);
@@ -881,11 +1154,7 @@ contract OrderBook is
     /// @notice Takes order book snapshot
     function takeSnapshot() public nonReentrant {
         _restrictGovernance();
-        snapshots.push(Snapshot({
-            timestamp: uint64(block.timestamp),
-            bidOrderIds: bidHeap,
-            askOrderIds: askHeap
-        }));
+        snapshots.push(Snapshot({timestamp: uint64(block.timestamp), bidOrderIds: bidHeap, askOrderIds: askHeap}));
         emit SnapshotTaken(snapshots.length - 1, block.timestamp);
     }
 
@@ -904,17 +1173,25 @@ contract OrderBook is
         uint256[] storage userOrderIds = userOrders[msg.sender];
         uint256 totalA = 0;
         uint256 totalB = 0;
+        uint256 totalCollateral = 0;
 
         for (uint256 i = userOrderIds.length; i > 0; ) {
-            unchecked { --i; }
+            unchecked {
+                --i;
+            }
             uint256 orderId = userOrderIds[i];
             Order storage order = orders[orderId];
             if (order.user == msg.sender) {
-                uint256 collateral = order.isMarket ? order.amount : uint256(order.price) * order.amount;
-                if (order.isBuy) {
-                    totalB += collateral;
+                if (order.isPerpetual) {
+                    totalCollateral += order.initialMargin;
+                    userEquity[msg.sender] = userEquity[msg.sender].sub(order.initialMargin);
                 } else {
-                    totalA += collateral;
+                    uint256 collateral = order.isMarket ? uint256(order.amount) : uint256(order.price) * order.amount;
+                    if (order.isBuy) {
+                        totalB += collateral;
+                    } else {
+                        totalA += collateral;
+                    }
                 }
                 if (order.isStopLoss) {
                     _removeStopLossOrder(msg.sender, orderId);
@@ -925,6 +1202,7 @@ contract OrderBook is
 
         if (totalA > 0) IERC20Upgradeable(ammPool.token0()).safeTransfer(msg.sender, totalA);
         if (totalB > 0) IERC20Upgradeable(ammPool.token1()).safeTransfer(msg.sender, totalB);
+        if (totalCollateral > 0) usdc.safeTransfer(msg.sender, totalCollateral);
 
         emit EmergencyWithdrawal(msg.sender, totalA, totalB);
     }
@@ -944,11 +1222,11 @@ contract OrderBook is
     /// @notice Sets fee tiers
     function setFeeTiers(FeeTier[2] calldata _feeTiers) external {
         _restrictGovernance();
-        for (uint256 i; i < 2; ) {
-            if (_feeTiers[i].feeRateBps == 0 || _feeTiers[i].feeRateBps > 1000)
+        for (uint256 i = 0; i < 2; i++) {
+            if (_feeTiers[i].feeRateBps == 0 || _feeTiers[i].feeRateBps > 1000) {
                 revert InvalidFeeTier(_feeTiers[i].orderSizeThreshold, _feeTiers[i].feeRateBps);
+            }
             feeTiers[i] = _feeTiers[i];
-            unchecked { ++i; }
         }
         emit FeeTiersUpdated(_feeTiers);
     }
@@ -996,8 +1274,9 @@ contract OrderBook is
     function getAggregatedPrice(address tokenA, address tokenB) public view returns (uint256) {
         try priceOracle.getCurrentPairPrice(address(this), tokenA) returns (uint256 price, bool cachedStatus) {
             if (price == 0) revert NoValidPrice();
-            if (cachedStatus && block.timestamp > timestamp + oracleStalenessThreshold)
+            if (cachedStatus && block.timestamp > timestamp + oracleStalenessThreshold) {
                 revert PriceOracleStale(block.timestamp);
+            }
             return price;
         } catch {
             revert PriceOracleError();
@@ -1016,41 +1295,51 @@ contract OrderBook is
         address tokenA,
         address tokenB,
         uint64 expiryTimestamp,
-        bool useConcentratedLiquidity
+        bool useConcentratedLiquidity,
+        bool isPerpetual,
+        uint256 leverage,
+        uint256 margin
     ) internal {
         _validateOrder(isBuy, isMarket, isStopLoss, price, triggerPrice, amount, tokenA, tokenB, expiryTimestamp);
         if (userOrders[user].length >= MAX_ORDERS_PER_USER) revert TooManyOrders(user);
 
-        IERC20Upgradeable collateralToken = IERC20Upgradeable(isBuy ? tokenB : tokenA);
-        uint256 collateral = isMarket ? amount : uint256(price) * amount;
-        collateralToken.safeTransferFrom(user, address(this), collateral);
+        if (!isPerpetual) {
+            IERC20Upgradeable collateralToken = IERC20Upgradeable(isBuy ? tokenB : tokenA);
+            uint256 collateral = isMarket ? amount : uint256(price) * amount;
+            collateralToken.safeTransferFrom(user, address(this), collateral);
+        }
 
         uint256 orderId;
-        unchecked { orderId = nextOrderId++; }
-        Order memory order = Order({
-            user: user,
-            isBuy: isBuy,
-            isMarket: isMarket,
-            isStopLoss: isStopLoss,
-            price: price,
-            triggerPrice: triggerPrice,
-            amount: amount,
-            timestamp: uint64(block.timestamp),
-            expiryTimestamp: expiryTimestamp,
-            locked: false,
-            orderId: orderId,
-            tokenA: tokenA,
-            tokenB: tokenB,
-            useConcentratedLiquidity: useConcentratedLiquidity
-        });
+        unchecked {
+            orderId = nextOrderId++;
+        }
+        Order storage order = orders[orderId];
+        order.user = user;
+        order.isBuy = isBuy;
+        order.isMarket = isMarket;
+        order.isStopLoss = isStopLoss;
+        order.price = price;
+        order.triggerPrice = triggerPrice;
+        order.amount = amount;
+        order.timestamp = uint64(block.timestamp);
+        order.expiryTimestamp = expiryTimestamp;
+        order.locked = false;
+        order.orderId = orderId;
+        order.tokenA = tokenA;
+        order.tokenB = tokenB;
+        order.useConcentratedLiquidity = useConcentratedLiquidity;
+        order.isPerpetual = isPerpetual;
+        order.leverage = leverage;
+        order.initialMargin = margin;
+        order.maintenanceMargin = margin.mul(80).div(100);
+        order.lastFundingTimestamp = isPerpetual ? block.timestamp : 0;
 
-        orders[orderId] = order;
         userOrders[user].push(orderId);
         orderExists[orderId] = true;
 
         if (isStopLoss) {
             stopLossOrders[user].push(orderId);
-        } else if (!isMarket) {
+        } else if (!isMarket && !isPerpetual) {
             if (isBuy) {
                 bidHeap.push(orderId);
                 orderHeapIndex[orderId] = bidHeap.length - 1;
@@ -1078,6 +1367,60 @@ contract OrderBook is
         );
     }
 
+    /// @dev Matches a perpetual order
+    function _matchPerpetualOrder(uint256 orderId) internal {
+        Order storage order = orders[orderId];
+        if (!order.isPerpetual) revert NotPerpetualOrder(orderId);
+
+        // Check for liquidation
+        if (_isUnderMargined(order)) {
+            liquidatePosition(orderId);
+            return;
+        }
+
+        // Apply funding if due
+        if (block.timestamp >= order.lastFundingTimestamp + FUNDING_INTERVAL) {
+            applyFunding(orderId);
+        }
+
+        // Simplified matching logic for perpetuals (assumes AMM counterparty)
+        uint256 positionSize = order.amount.mul(order.leverage);
+        uint256 currentPrice = priceOracle.getSpotPrice(order.tokenA, order.tokenB);
+        uint256 tradeValue = positionSize.mul(currentPrice).div(1e18);
+
+        // Approve tokens for AMM swap
+        usdc.approve(address(ammPool), order.initialMargin);
+
+        // Perform swap via AMM
+        uint256 amountOut = ammPool.swap(
+            order.isBuy ? positionSize : 0,
+            order.isBuy ? 0 : positionSize,
+            address(this),
+            ""
+        );
+
+        // Update trader rewards
+        uint256 fee = tradeValue.mul(feeTiers[0].feeRateBps).div(1e4);
+        _updateTraderRewards(order.user, fee);
+
+        // Update order price to current market price
+        order.price = uint96(currentPrice);
+    }
+
+    /// @dev Checks if a position is under-margined
+    function _isUnderMargined(Order memory order) internal view returns (bool) {
+        if (!order.isPerpetual) return false;
+        uint256 positionSize = order.amount.mul(order.leverage);
+        uint256 currentPrice = priceOracle.getSpotPrice(order.tokenA, order.tokenB);
+        uint256 positionValue = positionSize.mul(currentPrice).div(1e18);
+        int256 unrealizedPnL = order.isBuy
+            ? int256(currentPrice).sub(int256(order.price)).mul(int256(positionSize)).div(1e18)
+            : int256(order.price).sub(int256(currentPrice)).mul(int256(positionSize)).div(1e18);
+
+        uint256 availableMargin = order.initialMargin.add(uint256(unrealizedPnL)).sub(uint256(order.cumulativeFunding));
+        return availableMargin < order.maintenanceMargin;
+    }
+
     /// @dev Validates order parameters
     function _validateOrder(
         bool isBuy,
@@ -1091,10 +1434,9 @@ contract OrderBook is
         uint64 expiryTimestamp
     ) internal view {
         if (amount == 0) revert InvalidAmount(amount);
-        if (tokenA != ammPool.token0() || tokenB != ammPool.token1())
-            revert InvalidTokenPair(tokenA, tokenB);
-        if (expiryTimestamp != 0 && expiryTimestamp <= block.timestamp)
-            revert InvalidExpiry(expiryTimestamp);
+        if (tokenA != ammPool.token0() || tokenB != ammPool.token1()) revert InvalidTokenPair(tokenA, tokenB);
+        if (expiryTimestamp != 0 && expiryTimestamp <= block.timestamp) revert InvalidExpiry(expiryTimestamp);
+        if (isStopLoss && triggerPrice == 0) revert InvalidTriggerPrice(triggerPrice);
     }
 
     /// @dev Checks and triggers stop-loss orders
@@ -1103,12 +1445,22 @@ contract OrderBook is
         uint256 gasLimit = gasleft();
         uint256 gasPerIteration = 50000; // Estimated gas per user iteration
 
-        for (uint256 i; i < userOrders.length; ) {
+        address[] memory users = new address[](userOrders.length);
+        uint256 userCount = 0;
+        for (uint256 i = 0; i < userOrders.length; i++) {
+            if (userOrders[i] != address(0)) {
+                users[userCount++] = userOrders[i];
+            }
+        }
+
+        for (uint256 i = 0; i < userCount; i++) {
             if (gasLimit < gasPerIteration) break;
-            address user = userOrders[i];
+            address user = users[i];
             uint256[] storage userStopLoss = stopLossOrders[user];
             for (uint256 j = userStopLoss.length; j > 0; ) {
-                unchecked { --j; }
+                unchecked {
+                    --j;
+                }
                 uint256 orderId = userStopLoss[j];
                 Order memory order = orders[orderId];
                 if (
@@ -1129,20 +1481,18 @@ contract OrderBook is
                 }
             }
             gasLimit -= gasPerIteration;
-            unchecked { ++i; }
         }
     }
 
     /// @dev Removes stop-loss order
     function _removeStopLossOrder(address user, uint256 orderId) internal {
         uint256[] storage userStopLoss = stopLossOrders[user];
-        for (uint256 i; i < userStopLoss.length; ) {
+        for (uint256 i = 0; i < userStopLoss.length; i++) {
             if (userStopLoss[i] == orderId) {
                 userStopLoss[i] = userStopLoss[userStopLoss.length - 1];
                 userStopLoss.pop();
                 break;
             }
-            unchecked { ++i; }
         }
     }
 
@@ -1160,11 +1510,12 @@ contract OrderBook is
         uint256[] memory askHeapCache = askHeap;
 
         // Batch transfers and events
-        struct {
+        struct Transfer {
             address user;
             address token;
             uint256 amount;
-        } memory[] memory transfers = new uint256[](maxMatches * 3); // For bid, asks, treasury
+        }
+        Transfer[] memory transfers = new Transfer[](maxMatches * 3); // For bid, ask, treasury
         uint256 transferCount = 0;
         uint256[] memory matchedOrderIds = new uint256[](maxMatches * 2); // For bid and ask IDs
         uint256 matchOrderCount = 0;
@@ -1191,50 +1542,58 @@ contract OrderBook is
             }
 
             bool isMarketMatch = bid.isMarket || ask.isMarket;
-            if (!isMarketMatch && bid.price < ask.price || bid.locked || ask.locked) break;
-
-            uint256 tradePrice;
-            if (isMarketMatch?) {
-                tradePrice = ask.price;
-                if (tradePrice == 0 || tradePrice > currentPrice * 115 / 100 || tradePrice < currentPrice * 85 / 100)
-                    revert InvalidPrice(tradePrice);
-            } else {
-                tradePrice = bid.useConcentratedLiquidity || ask.useConcentratedLiquidity
-                    ? ammPool.getConcentratedPrice()
-                    : (bid.price + ask.price) / 2;
+            if (!isMarketMatch && bid.price < ask.price || bid.locked || ask.locked || (bid.isPerpetual != ask.isPerpetual)) {
+                break;
             }
 
+            uint256 tradePrice;
+            if (isMarketMatch) {
+                tradePrice = ask.price;
+                if (tradePrice == 0 || tradePrice > currentPrice * 115 / 100 || tradePrice < currentPrice * 85 / 100) {
+                    revert InvalidPrice(tradePrice);
+                }
+            } else {
+                tradePrice = bid.useConcentratedLiquidity || ask.useConcentratedLiquidity ?
+                    ammPool.getConcentratedPrice() :
+                    (bid.price + ask.price) / 2;
             uint256 tradeValue;
-            unchecked { tradeValue = tradePrice * bid.min(ask.amount); }
-            uint256 amount = _getFeeRate(msg.sender, tradeValue);
+            unchecked {
+                tradeValue = tradePrice * bid.amount.min(ask.amount);
+            }
+
+            uint256 feeRate = _getFeeRate(msg.sender, tradeValue);
             uint256 tradeAmount = min(bid.amount, ask.amount);
             uint256 totalFee;
-            unchecked { totalFee = tradeAmount * tradePrice * feeRate / 10000; }
+            unchecked {
+                totalFee = tradeAmount * tradePrice * feeRate / 10000;
+            }
 
             // Update trader rewards
             _updateTraderRewards(bid.user, totalFee);
             _updateTraderRewards(ask.user, totalFee);
 
             // Batch fees
+            uint256 lpFee = totalFee / 4;
             uint256 lpFee;
             uint256 govFee;
             uint256 treasuryFee;
             unchecked {
-                lpFee = totalFee / 4;
+                lpFee = totalFee;
+                lpFee lpFee / 4;
                 govFee = totalFee / 4;
-                treasuryFee = totalFee - lpFee - govFee;
+                treasuryFee lpFee - totalFee - lpFee - fee;
                 lpRewardPool += lpFee;
                 governanceRewardPool += govFee;
             }
-
-            // Batch token approvals
+            }
+            // Approve tokens for AMM swap
             IERC20Upgradeable(bid.tokenB).approve(address(ammPool), tradeAmount * tradePrice);
-            IERC20Upgradeable(ask.tokenA).approve(address(ammPool), tradeAmount);
+            IERC20(orderableAsk.token(ask.tokenA).approve(address(ammPool), tradeAmount));
 
             // Perform swap
             uint256 amountOut = ammPool.swap(
                 bid.tokenA == ammPool.token0() ? tradeAmount : 0,
-                bid.tokenA == ammPool.token0() ? 0 : tradeAmount,
+                bid.tokenA == ammPool.token0() ? 0 : tradeAmount : ,
                 address(this),
                 ""
             );
@@ -1251,8 +1610,8 @@ contract OrderBook is
             orders[askId].amount -= uint96(tradeAmount);
 
             // Store matched order IDs
-            matchedOrderIds[matchOrderCount++] = address(bidId);
-            matchedOrderIds[matchOrderCount++] = address(askId);
+            matchedOrderIds[matchOrderCount++] = bidId;
+            matchedOrderIds[matchOrderCount++] = askId;
 
             if (orders[bidId].amount == 0) {
                 _removeOrder(bidId, true);
@@ -1274,14 +1633,19 @@ contract OrderBook is
         }
 
         // Execute batch transfers
-        for (uint256 i; i < transferCount; ) {
+        for (uint256 i = 0; i < transferCount; i++) {
             IERC20Upgradeable(transfers[i].token).safeTransfer(transfers[i].user, transfers[i].amount);
-            unchecked { ++i; }
         }
 
         // Emit batched events
         for (uint256 i = 0; i < matchOrderCount; i += 2) {
-            emit OrdersMatched(matchedOrderIds[i], matchedOrderIds[i + 1], tradePrice, tradeAmount, totalFee);
+            emit OrdersMatched(
+                matchedOrderIds[i],
+                matchedOrderIds[i + 1],
+                tradePrice,
+                tradeAmount,
+                totalFee
+            );
         }
 
         // Update heaps if modified
@@ -1295,12 +1659,8 @@ contract OrderBook is
         uint256 index = orderHeapIndex[orderId];
         uint256[] storage heap = isBuy ? bidHeap : askHeap;
 
-        IERC20Upgradeable collateralToken = IERC20Upgradeable(isBuy ? order.tokenB : order.tokenA);
-        uint256 collateral = order.isMarket ? order.amount : uint256(order.price) * order.amount;
-        collateralToken.safeTransfer(order.user, collateral);
-
-        if (!order.isMarket && !order.isStopLoss) {
-            heap[index] = heap[last(heap.length - 1)];
+        if (!order.isMarket && !order.isStopLoss && !order.isPerpetual) {
+            heap[index] = heap[heap.length - 1];
             orderHeapIndex[heap[index]] = index;
             heap.pop();
             if (index < heap.length) {
@@ -1321,8 +1681,7 @@ contract OrderBook is
         mapping(uint256 => Order) storage ordersCache = orders;
 
         while (index > 0) {
-            uint256 parent;
-            unchecked { parent = (index - 1) / 2; }
+            uint256 parent = (index - 1) / 2;
             uint256 childId = heapCache[index];
             uint256 parentId = heapCache[parent];
             Order memory child = ordersCache[childId];
@@ -1352,12 +1711,8 @@ contract OrderBook is
         uint256 length = heapCache.length;
 
         while (true) {
-            uint256 left;
-            uint256 right;
-            unchecked {
-                left = 2 * index + 1;
-                right = 2 * index + 2;
-            }
+            uint256 left = 2 * index + 1;
+            uint256 right = 2 * index + 2;
             uint256 largest = index;
             uint256 largestId = heapCache[largest];
 
@@ -1405,8 +1760,7 @@ contract OrderBook is
         mapping(uint256 => Order) storage ordersCache = orders;
 
         while (index > 0) {
-            uint256 parent;
-            unchecked { parent = (index - 1) / 2; }
+            uint256 parent = (index - 1) / 2;
             uint256 childId = heapCache[index];
             uint256 parentId = heapCache[parent];
             Order memory child = ordersCache[childId];
@@ -1436,12 +1790,8 @@ contract OrderBook is
         uint256 length = heapCache.length;
 
         while (true) {
-            uint256 left;
-            uint256 right;
-            unchecked {
-                left = 2 * index + 1;
-                right = 2 * index + 2;
-            }
+            uint256 left = 2 * index + 1;
+            uint256 right = 2 * index + 2;
             uint256 smallest = index;
             uint256 smallestId = heapCache[smallest];
 
@@ -1450,7 +1800,7 @@ contract OrderBook is
                 if (
                     ordersCache[leftId].price < ordersCache[smallestId].price ||
                     (ordersCache[leftId].price == ordersCache[smallestId].price &&
-                    ordersCache[leftId].timestamp < ordersCache[smallestId].timestamp)
+                        ordersCache[leftId].timestamp < ordersCache[smallestId].timestamp)
                 ) {
                     smallest = left;
                     smallestId = leftId;
@@ -1462,9 +1812,8 @@ contract OrderBook is
                 if (
                     ordersCache[rightId].price < ordersCache[smallestId].price ||
                     (ordersCache[rightId].price == ordersCache[smallestId].price &&
-                    ordersCache[rightId].timestamp < ordersCache[smallestId].timestamp)
-                )
-                {
+                        ordersCache[rightId].timestamp < ordersCache[smallestId].timestamp)
+                ) {
                     smallest = right;
                 }
             }
@@ -1487,120 +1836,252 @@ contract OrderBook is
     /// @dev Removes user order
     function _removeUserOrder(address user, uint256 orderId) internal {
         uint256[] storage userOrderIds = userOrders[user];
-        for (uint256 i; i < userOrderIds.length; ) {
+        for (uint256 i = 0; i < userOrderIds.length; i++) {
             if (userOrderIds[i] == orderId) {
                 userOrderIds[i] = userOrderIds[userOrderIds.length - 1];
                 userOrderIds.pop();
                 break;
             }
-            unchecked { ++i; }
         }
     }
 
-    /// @dev Gets fee rate for a user
+        /// @dev Gets fee rate for a user based on order size and user type
     function _getFeeRate(address user, uint256 tradeValue) internal view returns (uint256) {
-        uint8 userType = userTypes[user];
-        uint256 baseFee = feeTiers[1].feeRateBps;
-
-        if (tradeValue >= feeTiers[0].orderSizeThreshold) {
-            baseFee = feeTiers[0].feeRateBps;
+        uint256 feeRate = feeTiers[0].feeRateBps;
+        if (tradeValue >= feeTiers[1].orderSizeThreshold) {
+            feeRate = feeTiers[1].feeRateBps;
         }
-
-        return userType == 1 ? baseFee / 2 : baseFee;
+        if (userTypes[user] == 1) { // Institutional user
+            feeRate = feeRate.mul(80).div(100); // 20% discount
+        }
+        return feeRate;
     }
 
-    /// @dev Restricts to governance
-    function _restrictGovernance() internal view {
-        if (msg.sender != address(governanceModule)) revert Unauthorized();
+    /// @dev Updates trader rewards based on fees paid
+    function _updateTraderRewards(address user, uint256 fee) internal {
+        TraderReward storage reward = traderRewards[user];
+        reward.accumulatedFees = reward.accumulatedFees.add(fee);
+        uint256 newReward = fee.mul(rewardRateBps).div(1e4);
+        reward.unclaimedTokens = reward.unclaimedTokens.add(newReward);
     }
 
-    /// @dev Adjusts liquidity range
+    /// @dev Adjusts liquidity range based on volatility
     function _adjustLiquidityRange() internal {
         uint256 volatility = ammPool.getVolatility();
         if (volatility > volatilityThreshold) {
             uint256 currentPrice = getAggregatedPrice(ammPool.token0(), ammPool.token1());
-            uint256 rangeDelta;
-            unchecked { rangeDelta = currentPrice * volatility * liquidityRangeMultiplier / 1e18; }
-            uint256 minPrice = currentPrice - rangeDelta;
-            uint256 maxPrice = currentPrice + rangeDelta;
+            uint256 range = currentPrice.mul(liquidityRangeMultiplier).div(1e18);
+            uint256 minPrice = currentPrice.sub(range);
+            uint256 maxPrice = currentPrice.add(range);
             ammPool.adjustLiquidityRange(minPrice, maxPrice);
             emit LiquidityRangeSet(minPrice, maxPrice);
         }
     }
 
-    /// @dev Updates trader rewards
-    function _updateTraderRewards(address user, uint256 fee) internal {
-        TraderReward storage reward = traderRewards[user];
-        reward.accumulatedFees += fee;
-        if (reward.accumulatedFees >= minFeesForReward) {
-            uint256 rewardAmount;
-            unchecked { rewardAmount = fee * rewardRateBps / 10000; }
-            reward.unclaimedTokens += rewardAmount;
-        }
-    }
-
-    /// @dev Executes parameter change
+    /// @dev Executes parameter change from governance proposal
     function _executeParameterChange(string memory paramName, uint256 value) internal {
         bytes32 paramHash = keccak256(abi.encodePacked(paramName));
-        if (paramHash == keccak256(abi.encodePacked("volatilityThreshold"_threshold)))) {
+        if (paramHash == keccak256(abi.encodePacked("volatilityThreshold"))) {
             if (value == 0) revert InvalidVolatility(value);
             volatilityThreshold = value;
             emit VolatilityThresholdSet(value);
-        } else if (paramHash == keccak256(abi.encodePacked("liquidityRange"_multiplier"_threshold))) {
+        } else if (paramHash == keccak256(abi.encodePacked("liquidityRangeMultiplier"))) {
             if (value == 0) revert InvalidAmount(value);
             liquidityRangeMultiplier = value;
             emit LiquidityRangeMultiplierSet(value);
-        } else if (paramHash == keccak256(abi.encodePacked("_rewardRate"_bps"_feeRateBps))) {
-            if (value > 10000) revert InvalidFeeTier(0, value));
-            rewardRate = value;
-            emit RewardParametersSet(_rewardRateBps, minFeesReward, rewardClaimCooldown);
-        } else if (paramHash == keccak256(abi.encodePacked("_minFees"_for_reward"_threshold))) {
+        } else if (paramHash == keccak256(abi.encodePacked("rewardRateBps"))) {
+            if (value > 10000) revert InvalidFeeTier(0, value);
+            rewardRateBps = value;
+            emit RewardParametersSet(rewardRateBps, minFeesForReward, rewardClaimCooldown);
+        } else if (paramHash == keccak256(abi.encodePacked("minFeesForReward"))) {
             minFeesForReward = value;
-            emit RewardParametersSet(_rewardRateBps)
-        } else if (paramHash == keccak256(abi.encodePacked("_reward"_claim_cooldown"_threshold))) {
+            emit RewardParametersSet(rewardRateBps, minFeesForReward, rewardClaimCooldown);
+        } else if (paramHash == keccak256(abi.encodePacked("rewardClaimCooldown"))) {
             rewardClaimCooldown = value;
-            emit RewardParametersSet(_rewardRateBps, minFeesReward, rewardClaimCooldown);
-        } else if (paramHash == keccak256(abi.encodePacked("_oracle"_staleness"_threshold"))) {
-            if (value == 0)) revert InvalidAmount(value);
+            emit RewardParametersSet(rewardRateBps, minFeesForReward, rewardClaimCooldown);
+        } else if (paramHash == keccak256(abi.encodePacked("oracleStalenessThreshold"))) {
+            if (value == 0) revert InvalidAmount(value);
             oracleStalenessThreshold = uint64(value);
-            emit OracleStalenessThresholdSet(_threshold(value));
+            emit OracleStalenessThresholdSet(value);
+        } else if (paramHash == keccak256(abi.encodePacked("fundingRateCapBps"))) {
+            if (value > 100) revert InvalidFeeTier(0, value); // Max 1%
+            fundingRateCapBps = value;
+            emit FundingParametersSet(fundingRateCapBps, liquidationFeeBps, MAX_LEVERAGE);
+        } else if (paramHash == keccak256(abi.encodePacked("liquidationFeeBps"))) {
+            if (value > 500) revert InvalidFeeTier(0, value); // Max 5%
+            liquidationFeeBps = value;
+            emit FundingParametersSet(fundingRateCapBps, liquidationFeeBps, MAX_LEVERAGE);
         } else {
-            revert InvalidOperation("Unknown"_parameter"_invalid");
+            revert InvalidOperation("Unknown parameter");
         }
     }
 
-    /// @dev Convert single value to array
-    function _toArray(uint16 item) internal pure returns (uint16[] memory) {
+    /// @dev Restricts function to governance module
+    function _restrictGovernance() internal view {
+        if (msg.sender != address(governanceModule)) revert Unauthorized();
+    }
+
+    /// @dev Utility to convert uint16 to array
+    function _toArray(uint16 value) internal pure returns (uint16[] memory) {
         uint16[] memory arr = new uint16[](1);
-        arr[0] = item;
+        arr[0] = value;
         return arr;
     }
 
-    /// @dev Convert single value to array
-    function _toArray(string memory item) internal pure returns (string[] memory) {
+    /// @dev Utility to convert string to array
+    function _toArray(string memory value) internal pure returns (string[] memory) {
         string[] memory arr = new string[](1);
-        arr[0] = item;
+        arr[0] = value;
         return arr;
     }
 
-    /// @dev Convert single value to array
-    function _toArray(bytes memory item) internal pure returns (bytes[] memory) {
+    /// @dev Utility to convert bytes to array
+    function _toArray(bytes memory value) internal pure returns (bytes[] memory) {
         bytes[] memory arr = new bytes[](1);
-        arr[0] = item;
+        arr[0] = value;
         return arr;
     }
 
-    /// @dev Convert single value to array
-    function _toArray(uint256 item) internal pure returns (uint256[] memory) {
+    /// @dev Utility to convert uint256 to array
+    function _toArray(uint256 value) internal pure returns (uint256[] memory) {
         uint256[] memory arr = new uint256[](1);
-        arr[0] = item;
+        arr[0] = value;
         return arr;
     }
 
+    /// @dev Utility to find minimum of two uint256 values
+    function min(uint256 a, uint256 b) internal pure returns (uint256) {
+        return a < b ? a : b;
     }
 
-    /// @dev Returns minimum value
-    function min(uint256 a, uint256 b) internal pure returns (uint256) {
-        return a <= b ? a : b;
+    /// @notice Sets the governance module address
+    function setGovernanceModule(address _governanceModule) external {
+        _restrictGovernance();
+        if (_governanceModule == address(0)) revert InvalidGovernance(_governanceModule);
+        governanceModule = IGovernanceModule(_governanceModule);
+        emit GovernanceModuleSet(_governanceModule);
     }
+
+    /// @notice Sets the AMM pool address
+    function setAMMPool(address _ammPool) external {
+        _restrictGovernance();
+        if (_ammPool == address(0)) revert InvalidAddress(_ammPool, "Invalid AMMPool address");
+        ammPool = IAMMPool(_ammPool);
+        emit AMMPoolSet(_ammPool);
+    }
+
+    /// @notice Sets the governance token address
+    function setGovernanceToken(address _governanceToken) external {
+        _restrictGovernance();
+        if (_governanceToken == address(0)) revert InvalidAddress(_governanceToken, "Invalid GovernanceToken address");
+        governanceToken = IGovernanceToken(_governanceToken);
+        emit GovernanceTokenSet(_governanceToken);
+    }
+
+    /// @notice Sets the cross-chain module address
+    function setCrossChainModule(address _crossChainModule) external {
+        _restrictGovernance();
+        if (_crossChainModule == address(0)) revert InvalidAddress(_crossChainModule, "Invalid CrossChainModule address");
+        crossChainModule = ICrossChainModule(_crossChainModule);
+        emit CrossChainModuleSet(_crossChainModule);
+    }
+
+    /// @notice Sets the retry oracle address
+    function setRetryOracle(address _retryOracle) external {
+        _restrictGovernance();
+        if (_retryOracle == address(0)) revert InvalidAddress(_retryOracle, "Invalid RetryOracle address");
+        retryOracle = ICrossChainRetryOracle(_retryOracle);
+        emit RetryOracleSet(_retryOracle);
+    }
+
+    /// @notice Sets the price oracle address
+    function setPriceOracle(address _priceOracle) external {
+        _restrictGovernance();
+        if (_priceOracle == address(0)) revert InvalidAddress(_priceOracle, "Invalid PriceOracle address");
+        priceOracle = IPriceOracle(_priceOracle);
+        emit PriceOracleSet(_priceOracle);
+    }
+
+    /// @notice Sets the USDC address
+    function setUSDC(address _usdc) external {
+        _restrictGovernance();
+        if (_usdc == address(0)) revert InvalidAddress(_usdc, "Invalid USDC address");
+        usdc = IERC20Upgradeable(_usdc);
+        emit USDCSet(_usdc);
+    }
+
+    /// @notice Retrieves user orders
+    function getUserOrders(address user) external view returns (uint256[] memory) {
+        return userOrders[user];
+    }
+
+    /// @notice Retrieves user equity (collateral balance)
+    function getUserEquity(address user) external view returns (uint256) {
+        return userEquity[user];
+    }
+
+    /// @notice Retrieves user funding balance
+    function getUserFundingBalance(address user) external view returns (int256) {
+        return userFundingBalance[user];
+    }
+
+    /// @notice Retrieves trader rewards for a user
+    function getTraderRewards(address user) external view returns (TraderReward memory) {
+        return traderRewards[user];
+    }
+
+    /// @notice Retrieves proposal details
+    function getProposal(uint256 proposalId) external view returns (
+        uint256 id,
+        address proposer,
+        string memory description,
+        uint256 voteCount,
+        uint64 endTime,
+        bool executed,
+        ProposalType proposalType
+    ) {
+        Proposal storage proposal = proposals[proposalId];
+        return (
+            proposal.proposalId,
+            proposal.proposer,
+            proposal.description,
+            proposal.voteCount,
+            proposal.endTime,
+            proposal.executed,
+            proposal.proposalType
+        );
+    }
+
+    /// @notice Checks if a user has voted on a proposal
+    function hasVoted(address user, uint256 proposalId) external view returns (bool) {
+        return proposals[proposalId].hasVoted[user];
+    }
+
+    /// @notice Retrieves total staked tokens
+    function getTotalStaked() external view returns (uint256) {
+        return totalStaked;
+    }
+
+    /// @notice Retrieves staked tokens for a user
+    function getStakedTokens(address user) external view returns (uint256) {
+        return stakedTokens[user];
+    }
+
+    /// @notice Retrieves LP reward pool balance
+    function getLPRewardPool() external view returns (uint256) {
+        return lpRewardPool;
+    }
+
+    /// @notice Retrieves governance reward pool balance
+    function getGovernanceRewardPool() external view returns (uint256) {
+        return governanceRewardPool;
+    }
+
+    /// @notice Retrieves funding parameters
+    function getFundingParameters() external view returns (uint256, uint256, uint256) {
+        return (fundingRateCapBps, liquidationFeeBps, MAX_LEVERAGE);
+    }
+
+    /// @notice Fallback function to receive native tokens
+    receive() external payable {}
 }
