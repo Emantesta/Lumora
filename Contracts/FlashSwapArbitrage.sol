@@ -14,6 +14,7 @@ import {CCIPReceiver} from "@chainlink/contracts-ccip/src/v0.8/ccip/applications
 import {LinkTokenInterface} from "@chainlink/contracts/src/v0.8/shared/interfaces/LinkTokenInterface.sol";
 import {KeeperCompatibleInterface} from "@chainlink/contracts/src/v0.8/automation/interfaces/KeeperCompatibleInterface.sol";
 import {AggregatorV3Interface} from "@chainlink/contracts/src/v0.8/shared/interfaces/AggregatorV3Interface.sol";
+import {IERC165} from "@openzeppelin/contracts/interfaces/IERC165.sol";
 
 // Uniswap V3 Interfaces
 import {ISwapRouter} from "@uniswap/v3-periphery/contracts/interfaces/ISwapRouter.sol";
@@ -156,48 +157,55 @@ contract FlashSwapArbitrage is
     bytes32 public constant GOVERNOR_ROLE = keccak256("GOVERNOR_ROLE");
     bytes32 public constant KEEPER_ROLE = keccak256("KEEPER_ROLE");
 
-    // Immutable addresses
-    address public immutable uniswapV3Factory;
-    address public immutable uniswapV3SwapRouter;
-    address public immutable sushiSwapRouter;
-    address public immutable sushiSwapPair; // Pair for tokenA/tokenB
-    address public immutable lendingProtocol; // Aave Pool
-    address public immutable tokenA;
-    address public immutable tokenB;
-    address public immutable aaveDataProvider;
-    address public immutable aaveIncentivesController;
-    address public immutable ammPool; // AMM Pool
+    // Constants
+    uint256 private constant PRICE_PRECISION = 1e18;
+    uint256 private constant MIN_HEALTH_FACTOR = 1e18;
+    uint256 private constant MAX_FEE_BASIS_POINTS = 10000;
+    uint256 private constant MIN_GAS_RESERVE = 0.01 ether;
+    uint256 private constant MIN_LINK_RESERVE = 1 ether;
+    uint256 private constant MAX_RETRIES = 3;
+    uint256 private constant MAX_USERS = 50;
+    uint256 private constant MAX_PRIORITY_FEE = 2 gwei;
+    uint256 private constant MAX_FEE_PER_GAS = 50 gwei;
 
-    // External contracts
-    GovernorUpgradeable public governor;
-    AggregatorV3Interface[] public priceFeeds; // Chainlink Price Feeds
+    // Immutable addresses
+    address public immutable UNISWAP_V3_FACTORY;
+    address public immutable UNISWAP_V3_SWAP_ROUTER;
+    address public immutable SUSHI_SWAP_ROUTER;
+    address public immutable SUSHI_SWAP_PAIR;
+    address public immutable LENDING_PROTOCOL;
+    address public immutable TOKEN_A;
+    address public immutable TOKEN_B;
+    address public immutable AAVE_DATA_PROVIDER;
+    address public immutable AAVE_INCENTIVES_CONTROLLER;
+    address public immutable AMM_POOL;
+
+    // Struct for reserves
+    struct Reserves {
+        uint256 gasReserve;
+        uint256 linkReserve;
+    }
+
+    // Storage
+    Reserves public reserves;
+    address payable public governor;
+    AggregatorV3Interface[] public priceFeeds;
     ICrossChainRetryOracle public retryOracle;
     address public externalExchange;
     LinkTokenInterface public linkToken;
     address public keeperRegistry;
-    address public privateMempool; // e.g., Flashbots
-
-    // Storage
+    address public privateMempool;
     mapping(uint64 => address) public crossChainAMMPools;
     mapping(address => bool) public supportedTokens;
     mapping(address => uint256) public minHealthFactor;
-    mapping(bytes32 => uint256) public retryTimestamps; // Track retry attempts
-    uint256 public gasReserve; // ETH reserve for gas funding
-    uint256 public linkReserve; // LINK reserve for Chainlink operations
-    uint256[] public uniswapFeeTiers; // Supported Uniswap V3 fee tiers (e.g., 500, 3000, 10000)
-    uint256 public constant PRICE_PRECISION = 1e18;
-    uint256 public constant MIN_HEALTH_FACTOR = 1e18; // 1.0 in 18 decimals
-    uint256 public constant MAX_FEE_BASIS_POINTS = 10000; // 100%
-    uint256 public constant MIN_GAS_RESERVE = 0.01 ether; // Minimum ETH for gas
-    uint256 public constant MIN_LINK_RESERVE = 1 ether; // Minimum LINK for Chainlink
-    uint256 public constant MAX_RETRIES = 3; // Max retry attempts
-    uint256 public constant MAX_USERS = 50; // Limit users processed in one call
-    uint256 public minProfitThreshold; // Minimum profit for arbitrage
-    uint256 public healthFactorThreshold; // Health factor threshold for liquidations
-    uint256 public dynamicBonusThreshold; // Threshold for dynamic liquidation bonus
-    uint256 public maxLiquidationBonus; // Maximum liquidation bonus percentage
-    uint256 public minLiquidationBonus; // Minimum liquidation bonus percentage
-    mapping(address => uint256) public userLiquidationBonuses; // Dynamic bonuses per user
+    mapping(bytes32 => uint256) public retryTimestamps;
+    uint256[] public uniswapFeeTiers;
+    uint256 public minProfitThreshold;
+    uint256 public healthFactorThreshold;
+    uint256 public dynamicBonusThreshold;
+    uint256 public maxLiquidationBonus;
+    uint256 public minLiquidationBonus;
+    mapping(address => uint256) public userLiquidationBonuses;
 
     // Custom errors
     error UnauthorizedCaller(address caller);
@@ -235,7 +243,7 @@ contract FlashSwapArbitrage is
     error InvalidSushiSwapPair(address pair);
     error InvalidAMMPoolAddress(address pool);
     error AMMPoolSwapFailed(uint256 amountOut, uint256 minAmountOut);
-    error AMMPoolInsufficientReserves(uint256 reserveA, uint256 reserveB);
+    error InvalidOperation(string message);
 
     // Events
     event FlashSwapInitiated(address indexed sender, uint256 amountIn, uint256 amountOutMin, uint64 chainId, uint24 feeTier, bool isSushiSwap, bool isAMMPool);
@@ -285,41 +293,39 @@ contract FlashSwapArbitrage is
         address _aaveIncentivesController,
         address _ammPool
     ) CCIPReceiver(_router) {
-        require(_uniswapV3Factory != address(0), "Invalid Uniswap V3 factory address");
-        require(_uniswapV3SwapRouter != address(0), "Invalid Uniswap V3 router address");
-        require(_sushiSwapRouter != address(0), "Invalid SushiSwap router address");
-        require(_sushiSwapPair != address(0), "Invalid SushiSwap pair address");
-        require(_lendingProtocol != address(0), "Invalid lending protocol address");
-        require(_tokenA != address(0) && _tokenB != address(0), "Invalid token addresses");
-        require(_tokenA != _tokenB, "Tokens must be different");
-        require(_aaveDataProvider != address(0), "Invalid Aave data provider address");
-        require(_aaveIncentivesController != address(0), "Invalid Aave incentives controller address");
-        require(_ammPool != address(0), "Invalid AMM pool address");
+        if (_uniswapV3Factory == address(0)) revert InvalidOperation("Invalid factory");
+        if (_uniswapV3SwapRouter == address(0)) revert InvalidOperation("Invalid router");
+        if (_sushiSwapRouter == address(0)) revert InvalidOperation("Invalid SushiSwap router");
+        if (_sushiSwapPair == address(0)) revert InvalidSushiSwapPair(_sushiSwapPair);
+        if (_lendingProtocol == address(0)) revert InvalidOperation("Invalid protocol");
+        if (_tokenA == address(0) || _tokenB == address(0)) revert InvalidOperation("Invalid tokens");
+        if (_tokenA == _tokenB) revert InvalidOperation("Same tokens");
+        if (_aaveDataProvider == address(0)) revert InvalidAaveDataProvider(_aaveDataProvider);
+        if (_aaveIncentivesController == address(0)) revert InvalidAaveIncentivesController(_aaveIncentivesController);
+        if (_ammPool == address(0)) revert InvalidAMMPoolAddress(_ammPool);
 
         address pairToken0 = ISushiSwapPair(_sushiSwapPair).token0();
         address pairToken1 = ISushiSwapPair(_sushiSwapPair).token1();
-        require(
-            (_tokenA == pairToken0 && _tokenB == pairToken1) || (_tokenA == pairToken1 && _tokenB == pairToken0),
-            "Invalid token pair for SushiSwap"
-        );
+        if (
+            !((_tokenA == pairToken0 && _tokenB == pairToken1) || (_tokenA == pairToken1 && _tokenB == pairToken0))
+        ) revert InvalidTokenPair(_tokenA, _tokenB);
 
         address ammToken0 = IAMMPool(_ammPool).token0();
         address ammToken1 = IAMMPool(_ammPool).token1();
-        require(
-            (_tokenA == ammToken0 && _tokenB == ammToken1) || (_tokenA == ammToken1 && _tokenB == ammToken0),
-            "Invalid token pair for AMM pool"
-        );
+        if (
+            !((_tokenA == ammToken0 && _tokenB == ammToken1) || (_tokenA == ammToken1 && _tokenB == ammToken0))
+        ) revert InvalidTokenPair(_tokenA, _tokenB);
 
-        uniswapV3Factory = _uniswapV3Factory;
-        uniswapV3SwapRouter = _uniswapV3SwapRouter;
-        sushiSwapRouter = _sushiSwapRouter;
-        sushiSwapPair = _sushiSwapPair;
-        lendingProtocol = _lendingProtocol;
-        tokenA = _tokenA;
-        tokenB = _tokenB;
-        aaveDataProvider = _aaveDataProvider;
-        aaveIncentivesController = _aaveIncentivesController;
-        ammPool = _ammPool;
+        UNISWAP_V3_FACTORY = _uniswapV3Factory;
+        UNISWAP_V3_SWAP_ROUTER = _uniswapV3SwapRouter;
+        SUSHI_SWAP_ROUTER = _sushiSwapRouter;
+        SUSHI_SWAP_PAIR = _sushiSwapPair;
+        LENDING_PROTOCOL = _lendingProtocol;
+        TOKEN_A = _tokenA;
+        TOKEN_B = _tokenB;
+        AAVE_DATA_PROVIDER = _aaveDataProvider;
+        AAVE_INCENTIVES_CONTROLLER = _aaveIncentivesController;
+        AMM_POOL = _ammPool;
         _disableInitializers();
     }
 
@@ -335,24 +341,24 @@ contract FlashSwapArbitrage is
         address _privateMempool,
         uint256[] calldata _feeTiers
     ) external initializer {
-        require(_governor != address(0), "Invalid governor address");
-        require(_priceFeeds.length > 0, "Invalid oracle array");
-        require(_retryOracle != address(0), "Invalid retry oracle address");
-        require(_externalExchange != address(0), "Invalid exchange address");
-        require(_router != address(0), "Invalid router address");
-        require(_linkToken != address(0), "Invalid LINK token address");
-        require(_keeperRegistry != address(0), "Invalid keeper registry address");
-        require(_privateMempool != address(0), "Invalid private mempool address");
-        require(_feeTiers.length > 0, "Invalid fee tiers");
+        if (_governor == address(0)) revert InvalidGovernorAddress(_governor);
+        if (_priceFeeds.length == 0) revert InvalidOracleArray();
+        if (_retryOracle == address(0)) revert InvalidOperation("Invalid oracle");
+        if (_externalExchange == address(0)) revert InvalidExchangeAddress(_externalExchange);
+        if (_router == address(0)) revert InvalidOperation("Invalid router");
+        if (_linkToken == address(0)) revert InvalidLinkToken(_linkToken);
+        if (_keeperRegistry == address(0)) revert InvalidKeeperRegistry(_keeperRegistry);
+        if (_privateMempool == address(0)) revert InvalidPrivateMempool(_privateMempool);
+        if (_feeTiers.length == 0) revert InvalidOperation("Invalid fee tiers");
 
         __UUPSUpgradeable_init();
         __ReentrancyGuard_init();
         __Pausable_init();
         __AccessControl_init();
 
-        governor = GovernorUpgradeable(_governor);
+        governor = payable(_governor);
         for (uint256 i = 0; i < _priceFeeds.length; i++) {
-            require(_priceFeeds[i] != address(0), "Invalid feed address");
+            if (_priceFeeds[i] == address(0)) revert InvalidOperation("Invalid feed");
             priceFeeds.push(AggregatorV3Interface(_priceFeeds[i]));
         }
         retryOracle = ICrossChainRetryOracle(_retryOracle);
@@ -361,17 +367,17 @@ contract FlashSwapArbitrage is
         keeperRegistry = _keeperRegistry;
         privateMempool = _privateMempool;
         for (uint256 i = 0; i < _feeTiers.length; i++) {
-            require(_feeTiers[i] == 500 || _feeTiers[i] == 3000 || _feeTiers[i] == 10000, "Invalid fee tier");
+            if (_feeTiers[i] != 500 && _feeTiers[i] != 3000 && _feeTiers[i] != 10000) revert InvalidFeeTier(_feeTiers[i]);
             uniswapFeeTiers.push(_feeTiers[i]);
         }
 
-        supportedTokens[tokenA] = true;
-        supportedTokens[tokenB] = true;
-        minProfitThreshold = 1e16; // 0.01 ETH equivalent
+        supportedTokens[TOKEN_A] = true;
+        supportedTokens[TOKEN_B] = true;
+        minProfitThreshold = 1e16;
         healthFactorThreshold = MIN_HEALTH_FACTOR;
-        dynamicBonusThreshold = 0.9e18; // 0.9 health factor
-        maxLiquidationBonus = 10800; // 8% max bonus
-        minLiquidationBonus = 10500; // 5% min bonus
+        dynamicBonusThreshold = 0.9e18;
+        maxLiquidationBonus = 10800;
+        minLiquidationBonus = 10500;
 
         _grantRole(DEFAULT_ADMIN_ROLE, _governor);
         _grantRole(GOVERNOR_ROLE, _governor);
@@ -384,13 +390,18 @@ contract FlashSwapArbitrage is
         emit LinkTokenUpdated(_linkToken);
         emit KeeperRegistryUpdated(_keeperRegistry);
         emit PrivateMempoolUpdated(_privateMempool);
-        emit SupportedTokenUpdated(tokenA, true);
-        emit SupportedTokenUpdated(tokenB, true);
+        emit SupportedTokenUpdated(TOKEN_A, true);
+        emit SupportedTokenUpdated(TOKEN_B, true);
         emit MinProfitThresholdUpdated(minProfitThreshold);
         emit HealthFactorThresholdUpdated(healthFactorThreshold);
         emit DynamicBonusThresholdUpdated(dynamicBonusThreshold);
         emit FeeTiersUpdated(_feeTiers);
-        emit AMMPoolUpdated(ammPool);
+        emit AMMPoolUpdated(AMM_POOL);
+    }
+
+    /// @notice Supports interface override for IERC165
+    function supportsInterface(bytes4 interfaceId) public view override(AccessControlUpgradeable, CCIPReceiver) returns (bool) {
+        return super.supportsInterface(interfaceId);
     }
 
     /// @notice Authorizes contract upgrades
@@ -398,25 +409,25 @@ contract FlashSwapArbitrage is
 
     /// @notice Funds gas reserve with ETH
     function fundGasReserve() external payable {
-        gasReserve += msg.value;
-        emit GasReserveUpdated(gasReserve);
+        reserves.gasReserve += msg.value;
+        emit GasReserveUpdated(reserves.gasReserve);
     }
 
     /// @notice Funds LINK reserve for Chainlink operations
     function fundLinkReserve(uint256 amount) external {
         IERC20(address(linkToken)).safeTransferFrom(msg.sender, address(this), amount);
-        linkReserve += amount;
-        emit LinkReserveUpdated(linkReserve);
+        reserves.linkReserve += amount;
+        emit LinkReserveUpdated(reserves.linkReserve);
     }
 
     /// @notice Gets users with undercollateralized positions from Aave
     function _getUsers() internal view returns (address[] memory users) {
-        address[] memory allUsers = ILendingProtocol(lendingProtocol).getAllUsersWithDebt();
+        address[] memory allUsers = ILendingProtocol(LENDING_PROTOCOL).getAllUsersWithDebt();
         uint256 eligibleCount = 0;
 
         for (uint256 i = 0; i < allUsers.length && eligibleCount < MAX_USERS; i++) {
             if (allUsers[i] == address(0)) continue;
-            try IAavePool(lendingProtocol).getUserAccountData(allUsers[i]) returns (
+            try IAavePool(LENDING_PROTOCOL).getUserAccountData(allUsers[i]) returns (
                 uint256,
                 uint256,
                 uint256,
@@ -428,16 +439,14 @@ contract FlashSwapArbitrage is
                 if (healthFactor < minHF) {
                     eligibleCount++;
                 }
-            } catch {
-                continue;
-            }
+            } catch {}
         }
 
         users = new address[](eligibleCount);
         uint256 index = 0;
         for (uint256 i = 0; i < allUsers.length && index < eligibleCount; i++) {
             if (allUsers[i] == address(0)) continue;
-            try IAavePool(lendingProtocol).getUserAccountData(allUsers[i]) returns (
+            try IAavePool(LENDING_PROTOCOL).getUserAccountData(allUsers[i]) returns (
                 uint256,
                 uint256,
                 uint256,
@@ -450,17 +459,13 @@ contract FlashSwapArbitrage is
                     users[index] = allUsers[i];
                     index++;
                 }
-            } catch {
-                continue;
-            }
+            } catch {}
         }
-
-        return users;
     }
 
     /// @notice Calculates dynamic liquidation bonus based on health factor
     function _calculateDynamicBonus(address user) internal view returns (uint256 bonus) {
-        (, , , , , uint256 healthFactor) = IAavePool(lendingProtocol).getUserAccountData(user);
+        (, , , , , uint256 healthFactor) = IAavePool(LENDING_PROTOCOL).getUserAccountData(user);
         if (healthFactor < dynamicBonusThreshold) {
             uint256 bonusRange = maxLiquidationBonus - minLiquidationBonus;
             uint256 bonusIncrement = bonusRange * (MIN_HEALTH_FACTOR - healthFactor) / MIN_HEALTH_FACTOR;
@@ -468,11 +473,11 @@ contract FlashSwapArbitrage is
         } else {
             bonus = minLiquidationBonus;
         }
-        return bonus;
     }
 
     /// @notice Updates dynamic liquidation bonus for a user
     function updateUserLiquidationBonus(address user) external onlyRole(GOVERNOR_ROLE) {
+        if (user == address(0)) revert InvalidOperation("Invalid user");
         uint256 bonus = _calculateDynamicBonus(user);
         userLiquidationBonuses[user] = bonus;
         emit LiquidationBonusUpdated(user, bonus);
@@ -482,9 +487,9 @@ contract FlashSwapArbitrage is
     function _selectBestUniswapV3Pool(address tokenIn, address tokenOut) internal view returns (address pool, uint24 feeTier) {
         uint128 highestLiquidity = 0;
         for (uint256 i = 0; i < uniswapFeeTiers.length; i++) {
-            address poolAddress = IUniswapV3Factory(uniswapV3Factory).getPool(tokenIn, tokenOut, uint24(uniswapFeeTiers[i]));
+            address poolAddress = IUniswapV3Factory(UNISWAP_V3_FACTORY).getPool(tokenIn, tokenOut, uint24(uniswapFeeTiers[i]));
             if (poolAddress == address(0)) continue;
-            (uint128 liquidity, , , , , , ) = IUniswapV3Pool(poolAddress).slot0();
+            uint128 liquidity = IUniswapV3Pool(poolAddress).liquidity();
             if (liquidity > highestLiquidity) {
                 highestLiquidity = liquidity;
                 pool = poolAddress;
@@ -496,9 +501,23 @@ contract FlashSwapArbitrage is
 
     /// @notice Gets Uniswap V3 TWAP price
     function _getUniswapV3Price(address pool, address tokenIn) internal view returns (uint256 price, uint256 timestamp) {
-        (uint32[] memory secondsAgos, int24[] memory tickCumulatives, ) = OracleLibrary.consult(pool, 300); // 5-minute TWAP
-        int24 tick = int24((tickCumulatives[1] - tickCumulatives[0]) / int32(secondsAgos[1] - secondsAgos[0]));
-        price = OracleLibrary.getQuoteAtTick(tick, 1e18, tokenIn, tokenIn == tokenA ? tokenB : tokenA);
+        // Check pool cardinality to ensure sufficient observations
+        (, , , uint16 observationCardinality, , , ) = IUniswapV3Pool(pool).slot0();
+        require(observationCardinality > 1, "Insufficient cardinality");
+
+        // Define the time period for TWAP (e.g., 300 seconds)
+        uint32 secondsAgo = 300;
+
+        // Call OracleLibrary.consult to get the arithmetic mean tick and liquidity
+        (int24 tick, ) = OracleLibrary.consult(pool, secondsAgo);
+
+        // Get the price quote using OracleLibrary
+        price = OracleLibrary.getQuoteAtTick(
+            tick,
+            1e18, // Base amount (1 token with 18 decimals)
+            tokenIn,
+            tokenIn == TOKEN_A ? TOKEN_B : TOKEN_A
+        );
         timestamp = block.timestamp;
     }
 
@@ -525,25 +544,22 @@ contract FlashSwapArbitrage is
     }
 
     /// @notice Checks if upkeep is needed for Chainlink Keepers
-    function checkUpkeep(bytes calldata) external view override returns (bool upkeepNeeded, bytes memory performData) {
+    function checkUpkeep(bytes calldata checkData) external view override returns (bool upkeepNeeded, bytes memory performData) {
         upkeepNeeded = false;
 
-        // Check for arbitrage opportunities (Uniswap V3, SushiSwap, AMM Pool)
-        (address uniswapPool, uint24 feeTier) = _selectBestUniswapV3Pool(tokenA, tokenB);
-        (uint256 uniswapPrice, ) = _getUniswapV3Price(uniswapPool, tokenA);
-        (uint256 sushiPrice, ) = _getSushiSwapPrice(sushiSwapPair, tokenA);
-        (uint256 ammPrice, ) = _getAMMPoolPrice(ammPool, tokenA);
-        (uint256 externalPrice, ) = getOraclePrice(externalExchange, tokenA);
+        (address uniswapPool, uint24 feeTier) = _selectBestUniswapV3Pool(TOKEN_A, TOKEN_B);
+        (uint256 uniswapPrice, ) = _getUniswapV3Price(uniswapPool, TOKEN_A);
+        (uint256 sushiPrice, ) = _getSushiSwapPrice(SUSHI_SWAP_PAIR, TOKEN_A);
+        (uint256 ammPrice, ) = _getAMMPoolPrice(AMM_POOL, TOKEN_A);
+        (uint256 externalPrice, ) = getOraclePrice(externalExchange, TOKEN_A);
 
-        uint256 maxPrice = uniswapPrice;
-        if (sushiPrice > maxPrice) maxPrice = sushiPrice;
-        if (ammPrice > maxPrice) maxPrice = ammPrice;
-        if (externalPrice > maxPrice) maxPrice = externalPrice;
+        uint256 maxPrice = uniswapPrice > sushiPrice ? uniswapPrice : sushiPrice;
+        maxPrice = ammPrice > maxPrice ? ammPrice : maxPrice;
+        maxPrice = externalPrice > maxPrice ? externalPrice : maxPrice;
 
-        uint256 minPrice = uniswapPrice;
-        if (sushiPrice < minPrice) minPrice = sushiPrice;
-        if (ammPrice < minPrice) minPrice = ammPrice;
-        if (externalPrice < minPrice) minPrice = externalPrice;
+        uint256 minPrice = uniswapPrice < sushiPrice ? uniswapPrice : sushiPrice;
+        minPrice = ammPrice < minPrice ? ammPrice : minPrice;
+        minPrice = externalPrice < minPrice ? externalPrice : minPrice;
 
         uint256 priceDiff = maxPrice - minPrice;
 
@@ -555,10 +571,9 @@ contract FlashSwapArbitrage is
             return (upkeepNeeded, performData);
         }
 
-        // Check for liquidations and collateral swaps
         address[] memory users = _getUsers();
         for (uint256 i = 0; i < users.length; i++) {
-            try IAavePool(lendingProtocol).getUserAccountData(users[i]) returns (
+            try IAavePool(LENDING_PROTOCOL).getUserAccountData(users[i]) returns (
                 uint256,
                 uint256,
                 uint256,
@@ -569,37 +584,33 @@ contract FlashSwapArbitrage is
                 uint256 minHF = minHealthFactor[users[i]] > 0 ? minHealthFactor[users[i]] : healthFactorThreshold;
                 if (healthFactor < minHF) {
                     upkeepNeeded = true;
-                    performData = abi.encode("liquidation", users[i], tokenA, tokenB, false);
+                    performData = abi.encode("liquidation", users[i], TOKEN_A, TOKEN_B, false);
                     return (upkeepNeeded, performData);
                 }
-            } catch {
-                continue;
-            }
+            } catch {}
         }
-
-        return (upkeepNeeded, performData);
     }
 
     /// @notice Performs upkeep tasks
     function performUpkeep(bytes calldata performData) external override onlyRole(KEEPER_ROLE) whenNotPaused {
-        (string memory taskType, bytes memory data) = abi.decode(performData, (string, bytes));
-        bytes32 taskId = keccak256(abi.encode(taskType, data, block.timestamp));
+        (string memory taskType, bytes memory taskData) = abi.decode(performData, (string, bytes));
+        bytes32 taskId = keccak256(abi.encode(taskType, taskData, block.timestamp));
 
         if (keccak256(abi.encodePacked(taskType)) == keccak256(abi.encodePacked("arbitrage"))) {
-            (uint64 chainId, uint256 poolPrice, uint256 externalPrice, uint24 feeTier, bool isSushiSwap, bool isAMMPool) = abi.decode(
-                data,
+            (uint64 chainId, uint256 poolPrice, , uint24 feeTier, bool isSushiSwap, bool isAMMPool) = abi.decode(
+                taskData,
                 (uint64, uint256, uint256, uint24, bool, bool)
             );
-            _executeArbitrage(chainId, poolPrice, externalPrice, feeTier, isSushiSwap, isAMMPool);
+            _executeArbitrage(chainId, poolPrice, feeTier, isSushiSwap, isAMMPool);
         } else if (keccak256(abi.encodePacked(taskType)) == keccak256(abi.encodePacked("liquidation"))) {
             (address user, address collateralAsset, address debtAsset, bool receiveAToken) = abi.decode(
-                data,
+                taskData,
                 (address, address, address, bool)
             );
             _executeFlashLoanLiquidation(user, collateralAsset, debtAsset, receiveAToken);
         } else if (keccak256(abi.encodePacked(taskType)) == keccak256(abi.encodePacked("collateral"))) {
             (address user, address fromAsset, address toAsset, uint256 amount) = abi.decode(
-                data,
+                taskData,
                 (address, address, address, uint256)
             );
             _executeCollateralSwap(user, fromAsset, toAsset, amount);
@@ -609,46 +620,58 @@ contract FlashSwapArbitrage is
     }
 
     /// @notice Executes arbitrage via Uniswap V3, SushiSwap, or AMM Pool
-    function _executeArbitrage(uint64 chainId, uint256 poolPrice, uint256 externalPrice, uint24 feeTier, bool isSushiSwap, bool isAMMPool) internal {
-        uint256 amountIn = 1e18; // Simplified amount
+    function _executeArbitrage(uint64 chainId, uint256 poolPrice, uint24 feeTier, bool isSushiSwap, bool isAMMPool) internal {
+        uint256 amountIn = 1e18;
         bytes memory data = abi.encode(address(this), minProfitThreshold, chainId, poolPrice, feeTier, isSushiSwap, isAMMPool);
         if (isSushiSwap) {
             _submitSushiSwapFlashSwap(amountIn, data);
         } else if (isAMMPool) {
-            _submitAMMPoolSwap(tokenA, tokenB, amountIn, data, chainId);
+            _submitAMMPoolSwap(TOKEN_A, TOKEN_B, amountIn, data, chainId);
         } else {
-            _submitUniswapV3Swap(tokenA, tokenB, amountIn, data, feeTier);
+            _submitUniswapV3Swap(TOKEN_A, TOKEN_B, amountIn, data, feeTier);
         }
     }
 
     /// @notice Initiates flash loan for liquidation
-    function _executeFlashLoanLiquidation(
+function _executeFlashLoanLiquidation(
+    address user,
+    address collateralAsset,
+    address debtAsset,
+    bool receiveAToken
+) internal nonReentrant {
+    if (reserves.gasReserve < MIN_GAS_RESERVE) revert InsufficientGasReserve(reserves.gasReserve, MIN_GAS_RESERVE);
+    if (reserves.linkReserve < MIN_LINK_RESERVE) revert InsufficientLinkReserve(reserves.linkReserve, MIN_LINK_RESERVE);
+
+    (, uint256 totalDebtBase, , , , ) = IAavePool(LENDING_PROTOCOL).getUserAccountData(user);
+    uint256 debtToCover = totalDebtBase;
+    uint256 bonus = userLiquidationBonuses[user] > 0 ? userLiquidationBonuses[user] : minLiquidationBonus;
+
+    bytes memory params = abi.encode(user, collateralAsset, debtAsset, debtToCover, bonus, receiveAToken);
+    IERC20(debtAsset).safeApprove(LENDING_PROTOCOL, debtToCover);
+
+    try IAavePool(LENDING_PROTOCOL).flashLoanSimple(
+        address(this),
+        debtAsset,
+        debtToCover,
+        params,
+        0
+    ) {
+        emit FlashLoanExecuted(debtAsset, debtToCover, 0);
+    } catch {
+        IERC20(debtAsset).safeApprove(LENDING_PROTOCOL, 0);
+        revert FlashLoanFailed(debtAsset, debtToCover);
+    }
+    IERC20(debtAsset).safeApprove(LENDING_PROTOCOL, 0);
+}
+    
+    /// @notice Initiates flash loan for liquidation (external entry point)
+    function executeFlashLoanLiquidation(
         address user,
         address collateralAsset,
         address debtAsset,
         bool receiveAToken
-    ) internal nonReentrant {
-        if (gasReserve < MIN_GAS_RESERVE) revert InsufficientGasReserve(gasReserve, MIN_GAS_RESERVE);
-        if (linkReserve < MIN_LINK_RESERVE) revert InsufficientLinkReserve(linkReserve, MIN_LINK_RESERVE);
-
-        (, uint256 totalDebtBase, , , , ) = IAavePool(lendingProtocol).getUserAccountData(user);
-        uint256 debtToCover = totalDebtBase; // Cover all debt
-        uint256 bonus = userLiquidationBonuses[user] > 0 ? userLiquidationBonuses[user] : minLiquidationBonus;
-
-        bytes memory params = abi.encode(user, collateralAsset, debtAsset, debtToCover, bonus, receiveAToken);
-        IERC20(debtAsset).safeApprove(lendingProtocol, debtToCover);
-
-        try IAavePool(lendingProtocol).flashLoanSimple(
-            address(this),
-            debtAsset,
-            debtToCover,
-            params,
-            0 // referralCode
-        ) {
-            emit FlashLoanExecuted(debtAsset, debtToCover, 0);
-        } catch {
-            revert FlashLoanFailed(debtAsset, debtToCover);
-        }
+    ) external nonReentrant onlyRole(KEEPER_ROLE) {
+        _executeFlashLoanLiquidation(user, collateralAsset, debtAsset, receiveAToken);
     }
 
     /// @notice Aave flash loan callback
@@ -659,17 +682,17 @@ contract FlashSwapArbitrage is
         address initiator,
         bytes calldata params
     ) external returns (bool) {
-        require(msg.sender == lendingProtocol, "Unauthorized");
-        require(initiator == address(this), "Invalid initiator");
+        if (msg.sender != LENDING_PROTOCOL) revert UnauthorizedCaller(msg.sender);
+        if (initiator != address(this)) revert InvalidOperation("Invalid initiator");
 
         (address user, address collateralAsset, address debtAsset, uint256 debtToCover, uint256 bonus, bool receiveAToken) = abi.decode(
             params,
             (address, address, address, uint256, uint256, bool)
         );
 
-        IAavePool(lendingProtocol).liquidationCall(collateralAsset, debtAsset, user, debtToCover, receiveAToken);
+        IAavePool(LENDING_PROTOCOL).liquidationCall(collateralAsset, debtAsset, user, debtToCover, receiveAToken);
         uint256 totalRepay = amount + premium;
-        IERC20(asset).safeApprove(lendingProtocol, totalRepay);
+        IERC20(asset).safeApprove(LENDING_PROTOCOL, totalRepay);
         emit LiquidationTriggered(user, collateralAsset, debtAsset, debtToCover, bonus);
         emit FlashLoanExecuted(asset, amount, premium);
 
@@ -683,12 +706,12 @@ contract FlashSwapArbitrage is
         address toAsset,
         uint256 amount
     ) internal {
-        if (gasReserve < MIN_GAS_RESERVE) revert InsufficientGasReserve(gasReserve, MIN_GAS_RESERVE);
-        if (linkReserve < MIN_LINK_RESERVE) revert InsufficientLinkReserve(linkReserve, MIN_LINK_RESERVE);
+        if (reserves.gasReserve < MIN_GAS_RESERVE) revert InsufficientGasReserve(reserves.gasReserve, MIN_GAS_RESERVE);
+        if (reserves.linkReserve < MIN_LINK_RESERVE) revert InsufficientLinkReserve(reserves.linkReserve, MIN_LINK_RESERVE);
 
-        IERC20(fromAsset).safeApprove(lendingProtocol, amount);
-        ILendingProtocol(lendingProtocol).swapCollateral(user, fromAsset, toAsset, amount);
-        IERC20(fromAsset).safeApprove(lendingProtocol, 0);
+        IERC20(fromAsset).safeApprove(LENDING_PROTOCOL, amount);
+        ILendingProtocol(LENDING_PROTOCOL).swapCollateral(user, fromAsset, toAsset, amount);
+        IERC20(fromAsset).safeApprove(LENDING_PROTOCOL, 0);
         emit CollateralSwapped(user, fromAsset, toAsset, amount);
     }
 
@@ -700,7 +723,7 @@ contract FlashSwapArbitrage is
         bytes memory data,
         uint24 feeTier
     ) internal {
-        if (gasReserve < MIN_GAS_RESERVE) revert InsufficientGasReserve(gasReserve, MIN_GAS_RESERVE);
+        if (reserves.gasReserve < MIN_GAS_RESERVE) revert InsufficientGasReserve(reserves.gasReserve, MIN_GAS_RESERVE);
         ISwapRouter.ExactInputSingleParams memory params = ISwapRouter.ExactInputSingleParams({
             tokenIn: tokenIn,
             tokenOut: tokenOut,
@@ -712,11 +735,10 @@ contract FlashSwapArbitrage is
             sqrtPriceLimitX96: 0
         });
         bytes memory txData = abi.encodeWithSelector(ISwapRouter.exactInputSingle.selector, params);
-        uint256 maxPriorityFee = 2 gwei;
-        uint256 maxFeePerGas = 50 gwei;
-        IPrivateMempool(privateMempool).submitPrivateTx{value: gasReserve / 100}(txData, maxPriorityFee, maxFeePerGas);
-        gasReserve -= gasReserve / 100;
-        emit GasReserveUpdated(gasReserve);
+        uint256 gasUsed = reserves.gasReserve / 100;
+        IPrivateMempool(privateMempool).submitPrivateTx{value: gasUsed}(txData, MAX_PRIORITY_FEE, MAX_FEE_PER_GAS);
+        reserves.gasReserve -= gasUsed;
+        emit GasReserveUpdated(reserves.gasReserve);
     }
 
     /// @notice Submits SushiSwap flash swap to private mempool
@@ -724,8 +746,8 @@ contract FlashSwapArbitrage is
         uint256 amountIn,
         bytes memory data
     ) internal {
-        if (gasReserve < MIN_GAS_RESERVE) revert InsufficientGasReserve(gasReserve, MIN_GAS_RESERVE);
-        (uint256 amount0Out, uint256 amount1Out) = tokenA == ISushiSwapPair(sushiSwapPair).token0()
+        if (reserves.gasReserve < MIN_GAS_RESERVE) revert InsufficientGasReserve(reserves.gasReserve, MIN_GAS_RESERVE);
+        (uint256 amount0Out, uint256 amount1Out) = TOKEN_A == ISushiSwapPair(SUSHI_SWAP_PAIR).token0()
             ? (amountIn, uint256(0))
             : (uint256(0), amountIn);
         bytes memory txData = abi.encodeWithSelector(
@@ -735,11 +757,10 @@ contract FlashSwapArbitrage is
             address(this),
             data
         );
-        uint256 maxPriorityFee = 2 gwei;
-        uint256 maxFeePerGas = 50 gwei;
-        IPrivateMempool(privateMempool).submitPrivateTx{value: gasReserve / 256}(txData, maxPriorityFee, maxFeePerGas);
-        gasReserve -= gasReserve / 256;
-        emit GasReserveUpdated(gasReserve);
+        uint256 gasUsed = reserves.gasReserve / 256;
+        IPrivateMempool(privateMempool).submitPrivateTx{value: gasUsed}(txData, MAX_PRIORITY_FEE, MAX_FEE_PER_GAS);
+        reserves.gasReserve -= gasUsed;
+        emit GasReserveUpdated(reserves.gasReserve);
     }
 
     /// @notice Submits AMM pool swap
@@ -750,10 +771,10 @@ contract FlashSwapArbitrage is
         bytes memory data,
         uint64 chainId
     ) internal {
-        if (gasReserve < MIN_GAS_RESERVE) revert InsufficientGasReserve(gasReserve, MIN_GAS_RESERVE);
-        IERC20(tokenIn).safeApprove(ammPool, amountIn);
+        if (reserves.gasReserve < MIN_GAS_RESERVE) revert InsufficientGasReserve(reserves.gasReserve, MIN_GAS_RESERVE);
+        IERC20(tokenIn).safeApprove(AMM_POOL, amountIn);
         if (chainId == 0) {
-            uint256 amountOut = IAMMPool(ammPool).swap(tokenIn, amountIn, 0, address(this));
+            uint256 amountOut = IAMMPool(AMM_POOL).swap(tokenIn, amountIn, 0, address(this));
             (address initiator, uint256 minProfit, , , , , ) = abi.decode(
                 data,
                 (address, uint256, uint64, uint256, uint24, bool, bool)
@@ -763,11 +784,12 @@ contract FlashSwapArbitrage is
             emit FlashSwapCompleted(initiator, amountIn, amountOut, profit, chainId);
         } else {
             bytes memory adapterParams = "";
-            IAMMPool(ammPool).swapCrossChain{value: gasReserve / 256}(tokenIn, amountIn, 0, uint16(chainId), adapterParams);
-            gasReserve -= gasReserve / 256;
-            emit GasReserveUpdated(gasReserve);
+            uint256 gasUsed = reserves.gasReserve / 256;
+            IAMMPool(AMM_POOL).swapCrossChain{value: gasUsed}(tokenIn, amountIn, 0, uint16(chainId), adapterParams);
+            reserves.gasReserve -= gasUsed;
+            emit GasReserveUpdated(reserves.gasReserve);
         }
-        IERC20(tokenIn).safeApprove(ammPool, 0);
+        IERC20(tokenIn).safeApprove(AMM_POOL, 0);
     }
 
     /// @notice Uniswap V3 swap callback
@@ -776,21 +798,21 @@ contract FlashSwapArbitrage is
         int256 amount1Delta,
         bytes calldata data
     ) external {
-        (address uniswapPool, uint24 feeTier) = _selectBestUniswapV3Pool(tokenA, tokenB);
-        require(msg.sender == uniswapPool, "Unauthorized");
+        (address uniswapPool, uint24 feeTier) = _selectBestUniswapV3Pool(TOKEN_A, TOKEN_B);
+        if (msg.sender != uniswapPool) revert UnauthorizedCaller(msg.sender);
         if (data.length == 0) revert InvalidCallbackData();
 
-        (address initiator, uint256 minProfit, uint64 chainId, uint256 oraclePrice, uint24 feeTierCallback, bool isSushiSwap, bool isAMMPool) = abi.decode(
+        (address initiator, uint256 minProfit, uint64 chainId, , uint24 feeTierCallback, bool isSushiSwap, bool isAMMPool) = abi.decode(
             data,
             (address, uint256, uint64, uint256, uint24, bool, bool)
         );
-        require(!isSushiSwap && !isAMMPool, "Invalid protocol for Uniswap callback");
-        require(feeTier == feeTierCallback, "Fee tier mismatch");
-        require(hasRole(OPERATOR_ROLE, initiator), "Invalid initiator");
+        if (isSushiSwap || isAMMPool) revert InvalidOperation("Invalid protocol");
+        if (feeTier != feeTierCallback) revert InvalidFeeTier(feeTier);
+        if (!hasRole(OPERATOR_ROLE, initiator)) revert UnauthorizedCaller(initiator);
 
         bool isTokenAIn = amount0Delta > 0;
-        address tokenIn = isTokenAIn ? tokenA : tokenB;
-        address tokenOut = isTokenAIn ? tokenB : tokenA;
+        address tokenIn = isTokenAIn ? TOKEN_A : TOKEN_B;
+        address tokenOut = isTokenAIn ? TOKEN_B : TOKEN_A;
         uint256 amountIn = uint256(isTokenAIn ? amount0Delta : amount1Delta);
 
         uint256 exchangeFee = IExternalExchange(externalExchange).getDynamicFee(tokenOut, tokenIn);
@@ -798,55 +820,55 @@ contract FlashSwapArbitrage is
         if (totalFee > MAX_FEE_BASIS_POINTS) revert InvalidFee(totalFee);
 
         uint256 amountOut = _executeTrade(tokenOut, tokenIn, amountIn, chainId);
-        if (amountOut < amountIn + minProfit)
-            revert InsufficientRepayment(amountOut, amountIn + minProfit);
+        if (amountOut < amountIn + minProfit) revert InsufficientRepayment(amountOut, amountIn + minProfit);
 
         IERC20(tokenIn).safeTransfer(uniswapPool, amountIn);
         uint256 profit = amountOut - amountIn;
         emit FlashSwapCompleted(initiator, amountIn, amountOut, profit, chainId);
     }
 
-    /// @notice SushiSwap flash swap callback
+    function sushiSwap(bytes memory data) external payable {
+    }
+
+    /// @notice SushiSwap callback
     function sushiSwapCall(
         address sender,
         uint256 amount0,
         uint256 amount1,
-        bytes calldata data
+        bytes memory data
     ) external {
-        require(msg.sender == sushiSwapPair, "Unauthorized");
-        require(sender == address(this), "Invalid sender");
+        if (msg.sender != SUSHI_SWAP_PAIR) revert UnauthorizedCaller(msg.sender);
+        if (sender != address(this)) revert InvalidOperation("Invalid sender");
         if (amount0 == 0 && amount1 == 0) revert InvalidBorrowedAmount(amount0, amount1);
-        if (amount0 > 0 && amount1 > 0) revert InvalidBorrowedAmount(amount0, amount1);
         if (data.length == 0) revert InvalidCallbackData();
 
-        (address initiator, uint256 minProfit, uint64 chainId, uint256 oraclePrice, uint24 _feeTier, bool isSushiSwap, bool isAMMPool) = abi.decode(
+        (address initiator, uint256 minProfit, uint64 chainId, uint256 price, uint24 feeTier, bool isSushiSwap, bool isAMMPool) = abi.decode(
             data,
             (address, uint256, uint64, uint256, uint24, bool, bool)
         );
-        require(isSushiSwap && !isAMMPool, "Invalid protocol for SushiSwap callback");
-        require(hasRole(OPERATOR_ROLE, initiator), "Invalid initiator");
+        if (!isSushiSwap || isAMMPool) revert InvalidOperation("Invalid protocol");
+        if (!hasRole(OPERATOR_ROLE, initiator)) revert UnauthorizedCaller(initiator);
 
-        bool isTokenAOut = amount0 > 0;
-        address tokenOut = isTokenAOut ? tokenA : tokenB;
-        address tokenIn = isTokenAOut ? tokenB : tokenA;
-        uint256 amountOut = amount0 > 0 ? amount0 : amount1;
+        bool isTokenAOut = amount0 == 0;
+        address tokenOut = isTokenAOut ? TOKEN_A : TOKEN_B;
+        address tokenIn = isTokenAOut ? TOKEN_B : TOKEN_A;
+        uint256 amountOut = isTokenAOut ? amount1 : amount0;
 
-        (uint112 reserve0, uint112 reserve1, ) = ISushiSwapPair(sushiSwapPair).getReserves();
-        uint256 reserveIn = tokenIn == ISushiSwapPair(sushiSwapPair).token0() ? reserve0 : reserve1;
-        uint256 reserveOut = tokenIn == ISushiSwapPair(sushiSwapPair).token0() ? reserve1 : reserve0;
+        (uint112 reserve0, uint112 reserve1, ) = ISushiSwapPair(SUSHI_SWAP_PAIR).getReserves();
+        uint256 reserveIn = tokenIn == ISushiSwapPair(SUSHI_SWAP_PAIR).token0() ? reserve0 : reserve1;
+        uint256 reserveOut = tokenIn == ISushiSwapPair(SUSHI_SWAP_PAIR).token0() ? reserve1 : reserve0;
         if (reserveOut <= amountOut) revert DivisionByZero();
         uint256 amountInWithFee = (amountOut * reserveIn) / (reserveOut - amountOut);
-        amountInWithFee = (amountInWithFee * 1000) / 997; // SushiSwap 0.3% fee
+        amountInWithFee = (amountInWithFee * 1000) / 997; // Apply 0.3% fee
 
         uint256 exchangeFee = IExternalExchange(externalExchange).getDynamicFee(tokenOut, tokenIn);
-        uint256 totalFee = 300 + exchangeFee; // SushiSwap base fee (0.3%)
+        uint256 totalFee = 300 + exchangeFee; // SushiSwap fee (0.3%) + external fee
         if (totalFee > MAX_FEE_BASIS_POINTS) revert InvalidFee(totalFee);
 
         uint256 amountReceived = _executeTrade(tokenOut, tokenIn, amountOut, chainId);
-        if (amountReceived < amountInWithFee + minProfit)
-            revert InsufficientRepayment(amountReceived, amountInWithFee + minProfit);
+        if (amountReceived < amountInWithFee + minProfit) revert InsufficientRepayment(amountReceived, amountInWithFee + minProfit);
 
-        IERC20(tokenIn).safeTransfer(sushiSwapPair, amountInWithFee);
+        IERC20(tokenIn).safeTransfer(SUSHI_SWAP_PAIR, amountInWithFee);
         uint256 profit = amountReceived - amountInWithFee;
         emit FlashSwapCompleted(initiator, amountInWithFee, amountReceived, profit, chainId);
     }
@@ -855,57 +877,46 @@ contract FlashSwapArbitrage is
     function proposeBatch(
         address[] calldata targets,
         uint256[] calldata values,
-        bytes[] calldata calldatas,
+        bytes[] memory calldatas,
         string memory description
     ) external onlyRole(GOVERNOR_ROLE) returns (uint256[] memory proposalIds) {
-        require(
-            targets.length == values.length && targets.length == calldatas.length,
-            "Batch size mismatch"
-        );
+        if (
+            targets.length != values.length ||
+            targets.length != calldatas.length
+        ) revert BatchSizeMismatch(targets.length, values.length);
+
         proposalIds = new uint256[](targets.length);
         for (uint256 i = 0; i < targets.length; i++) {
-            proposalIds[i] = governor.propose(
-                _singleArray(targets[i]),
-                _singleArray(values[i]),
-                _singleArray(calldatas[i]),
+            address[] memory singleTarget = new address[](1);
+            singleTarget[0] = targets[i];
+            uint256[] memory singleValue = new uint256[](1);
+            singleValue[0] = values[i];
+            bytes[] memory singleCalldata = new bytes[](1);
+            singleCalldata[0] = calldatas[i];
+            proposalIds[i] = GovernorUpgradeable(governor).propose(
+                singleTarget,
+                singleValue,
+                singleCalldata,
                 string(abi.encodePacked(description, " #", i))
             );
         }
         emit BatchProposalCreated(proposalIds);
     }
 
-    function _singleArray(uint256 value) private pure returns (uint256[] memory) {
-        uint256[] memory arr = new uint256[](1);
-        arr[0] = value;
-        return arr;
-    }
-
-    function _singleArray(address value) private pure returns (address[] memory) {
-        address[] memory arr = new address[](1);
-        arr[0] = value;
-        return arr;
-    }
-
-    function _singleArray(bytes memory value) private pure returns (bytes[] memory) {
-        bytes[] memory arr = new bytes[](1);
-        arr[0] = value;
-        return arr;
-    }
-
     /// @notice Updates cross-chain AMM pool
     function updateCrossChainPool(uint64 chainId, address pool) external onlyRole(GOVERNOR_ROLE) {
-        require(chainId != 0, "Invalid chain ID");
-        require(pool != address(0), "Invalid pool address");
+        if (chainId == 0) revert InvalidChainId(chainId);
+        if (pool == address(0)) revert InvalidOperation("Invalid pool");
         crossChainAMMPools[chainId] = pool;
         emit CrossChainPoolUpdated(chainId, pool);
     }
 
     /// @notice Updates price feeds
     function updatePriceOracles(address[] calldata feeds) external onlyRole(GOVERNOR_ROLE) {
-        require(feeds.length > 0, "Invalid oracle array");
+        if (feeds.length == 0) revert InvalidOracleArray();
         delete priceFeeds;
         for (uint256 i = 0; i < feeds.length; i++) {
-            require(feeds[i] != address(0), "Invalid oracle address");
+            if (feeds[i] == address(0)) revert InvalidOperation("Invalid oracle");
             priceFeeds.push(AggregatorV3Interface(feeds[i]));
         }
         emit PriceFeedsUpdated(feeds.length);
@@ -913,98 +924,98 @@ contract FlashSwapArbitrage is
 
     /// @notice Updates retry oracle
     function updateRetryOracle(address _retryOracle) external onlyRole(GOVERNOR_ROLE) {
-        require(_retryOracle != address(0), "Invalid retry oracle address");
+        if (_retryOracle == address(0)) revert InvalidOperation("Invalid oracle");
         retryOracle = ICrossChainRetryOracle(_retryOracle);
         emit RetryOracleUpdated(_retryOracle);
     }
 
     /// @notice Updates external exchange address
     function updateExternalExchange(address _externalExchange) external onlyRole(GOVERNOR_ROLE) {
-        require(_externalExchange != address(0), "Invalid exchange address");
+        if (_externalExchange == address(0)) revert InvalidExchangeAddress(_externalExchange);
         externalExchange = _externalExchange;
         emit ExternalExchangeUpdated(_externalExchange);
     }
 
     /// @notice Updates supported token
     function updateSupportedToken(address token, bool supported) external onlyRole(GOVERNOR_ROLE) {
-        require(token != address(0), "Invalid token address");
+        if (token == address(0)) revert InvalidOperation("Invalid token");
         supportedTokens[token] = supported;
         emit SupportedTokenUpdated(token, supported);
     }
 
     /// @notice Updates minimum health factor
     function updateMinHealthFactor(address user, uint256 _minHealthFactor) external onlyRole(GOVERNOR_ROLE) {
-        require(user != address(0), "Invalid user address");
-        require(_minHealthFactor >= MIN_HEALTH_FACTOR, "Health factor too low");
+        if (user == address(0)) revert InvalidOperation("Invalid user");
+        if (_minHealthFactor < MIN_HEALTH_FACTOR) revert InvalidOperation("Low health factor");
         minHealthFactor[user] = _minHealthFactor;
         emit MinHealthFactorUpdated(user, _minHealthFactor);
     }
 
     /// @notice Updates governor
     function updateGovernor(address _governor) external onlyRole(GOVERNOR_ROLE) {
-        require(_governor != address(0), "Invalid governor address");
-        governor = GovernorUpgradeable(_governor);
+        if (_governor == address(0)) revert InvalidGovernorAddress(_governor);
         _grantRole(GOVERNOR_ROLE, _governor);
         _revokeRole(GOVERNOR_ROLE, msg.sender);
+        governor = payable(_governor);
         emit GovernorUpdated(_governor);
     }
 
     /// @notice Updates private mempool
     function updatePrivateMempool(address _mempool) external onlyRole(GOVERNOR_ROLE) {
-        require(_mempool != address(0), "Invalid mempool address");
+        if (_mempool == address(0)) revert InvalidPrivateMempool(_mempool);
         privateMempool = _mempool;
         emit PrivateMempoolUpdated(_mempool);
     }
 
     /// @notice Updates keeper registry
     function updateKeeperRegistry(address _registry) external onlyRole(GOVERNOR_ROLE) {
-        require(_registry != address(0), "Invalid keeper registry address");
-        keeperRegistry = _registry;
+        if (_registry == address(0)) revert InvalidKeeperRegistry(_registry);
         _grantRole(KEEPER_ROLE, _registry);
+        keeperRegistry = _registry;
         emit KeeperRegistryUpdated(_registry);
     }
 
     /// @notice Updates LINK token
     function updateLinkToken(address _token) external onlyRole(GOVERNOR_ROLE) {
-        require(_token != address(0), "Invalid LINK token address");
+        if (_token == address(0)) revert InvalidLinkToken(_token);
         linkToken = LinkTokenInterface(_token);
         emit LinkTokenUpdated(_token);
     }
 
     /// @notice Updates minimum profit threshold
     function updateMinProfitThreshold(uint256 _threshold) external onlyRole(GOVERNOR_ROLE) {
-        require(_threshold != 0, "Invalid threshold");
+        if (_threshold == 0) revert InvalidOperation("Invalid threshold");
         minProfitThreshold = _threshold;
         emit MinProfitThresholdUpdated(_threshold);
     }
 
     /// @notice Updates health factor threshold
     function updateHealthFactorThreshold(uint256 _threshold) external onlyRole(GOVERNOR_ROLE) {
-        require(_threshold >= MIN_HEALTH_FACTOR, "Invalid threshold");
+        if (_threshold < MIN_HEALTH_FACTOR) revert InvalidOperation("Invalid threshold");
         healthFactorThreshold = _threshold;
         emit HealthFactorThresholdUpdated(_threshold);
     }
 
     /// @notice Updates dynamic liquidation bonus threshold
     function updateDynamicBonusThreshold(uint256 _threshold) external onlyRole(GOVERNOR_ROLE) {
-        require(_threshold <= MIN_HEALTH_FACTOR, "Invalid threshold");
+        if (_threshold > MIN_HEALTH_FACTOR) revert InvalidOperation("Invalid threshold");
         dynamicBonusThreshold = _threshold;
         emit DynamicBonusThresholdUpdated(_threshold);
     }
 
     /// @notice Updates Uniswap fee tiers
     function updateFeeTiers(uint256[] calldata _feeTiers) external onlyRole(GOVERNOR_ROLE) {
-        require(_feeTiers.length > 0, "Invalid fee tiers");
+        if (_feeTiers.length == 0) revert InvalidOperation("Invalid fee tiers");
         delete uniswapFeeTiers;
         for (uint256 i = 0; i < _feeTiers.length; i++) {
-            require(_feeTiers[i] == 500 || _feeTiers[i] == 3000 || _feeTiers[i] == 10000, "Invalid fee tier");
+            if (_feeTiers[i] != 500 && _feeTiers[i] != 3000 && _feeTiers[i] != 10000) revert InvalidFeeTier(_feeTiers[i]);
             uniswapFeeTiers.push(_feeTiers[i]);
         }
         emit FeeTiersUpdated(_feeTiers);
     }
 
     /// @notice Gets price from multiple Chainlink feeds
-    function getOraclePrice(address _asset, address token) internal view returns (uint256 price, uint256 timestamp) {
+    function getOraclePrice(address _asset, address /* token */) internal view returns (uint256 price, uint256 timestamp) {
         uint256 validPrices = 0;
         uint256 totalPrice = 0;
         uint256 latestTimestamp = 0;
@@ -1024,13 +1035,10 @@ contract FlashSwapArbitrage is
                         latestTimestamp = _timestamp;
                     }
                 }
-            } catch {
-                continue;
-            }
+            } catch {}
         }
 
-        if (validPrices == 0) revert NoValidOraclePrice(_asset);
-        require(validPrices >= 2, "Insufficient valid prices");
+        if (validPrices < 2) revert NoValidOraclePrice(_asset);
         return (totalPrice / validPrices, latestTimestamp);
     }
 
@@ -1045,51 +1053,51 @@ contract FlashSwapArbitrage is
     ) external nonReentrant whenNotPaused onlyRole(OPERATOR_ROLE) {
         if (amountIn == 0) revert InvalidBorrowedAmount(amountIn, 0);
         if (chainId != 0 && crossChainAMMPools[chainId] == address(0)) revert CrossChainNotConfigured(chainId);
-        if (useSushiSwap && useAMMPool) revert InvalidOperation("Cannot use both SushiSwap and AMM pool");
+        if (useSushiSwap && useAMMPool) revert InvalidOperation("Cannot use both");
 
         if (!useSushiSwap && !useAMMPool) {
-            bool validFeeTier = false;
+            bool validFee = false;
             for (uint256 i = 0; i < uniswapFeeTiers.length; i++) {
-                if (uniswapFeeTiers[i] == feeTier) {
-                    validFeeTier = true;
+                if (uniswapFeeTiers[i] == uint256(feeTier)) {
+                    validFee = true;
                     break;
                 }
             }
-            require(validFeeTier, "Invalid fee tier");
+            if (!validFee) revert InvalidFeeTier(feeTier);
         }
 
-        bytes32 txId = keccak256(abi.encodePacked(msg.sender, chainId, amountIn, amountOutMin, feeTier, useSushiSwap, useAMMPool, block.timestamp));
+        bytes32 txId = keccak256(abi.encode(msg.sender, chainId, amountIn, amountOutMin, feeTier, useSushiSwap, useAMMPool, block.timestamp));
         if (retryTimestamps[txId] > MAX_RETRIES) revert MaxRetriesExceeded(txId);
 
         if (chainId != 0) {
             ICrossChainRetryOracle.NetworkStatus memory status = retryOracle.getNetworkStatus(chainId);
-            if (!status.bridgeOperational || status.retryRecommended) {
+            if (!status.bridgeOperational) revert RetryOracleError(chainId);
+            if (status.retryRecommended) {
                 retryTimestamps[txId]++;
                 emit RetryAttempted(txId, retryTimestamps[txId]);
-                uint256 retryDelay = status.randomRetryDelay;
-                require(block.timestamp >= status.lastUpdated + retryDelay, "Retry delay not met");
+                if (block.timestamp < status.lastUpdated + status.randomRetryDelay) revert InvalidOperation("retry delay");
             }
         }
 
-        if (gasReserve < MIN_GAS_RESERVE) revert InsufficientGasReserve(gasReserve, MIN_GAS_RESERVE);
-        if (linkReserve < MIN_LINK_RESERVE) revert InsufficientLinkReserve(linkReserve, MIN_LINK_RESERVE);
+        if (reserves.gasReserve < MIN_GAS_RESERVE) revert InsufficientGasReserve(reserves.gasReserve, MIN_GAS_RESERVE);
+        if (reserves.linkReserve < MIN_LINK_RESERVE) revert InsufficientLinkReserve(reserves.linkReserve, MIN_LINK_RESERVE);
 
-        address pool = useSushiSwap ? sushiSwapPair : useAMMPool ? ammPool : IUniswapV3Factory(uniswapV3Factory).getPool(tokenA, tokenB, feeTier);
-        (uint256 price, ) = useSushiSwap ? _getSushiSwapPrice(sushiSwapPair, tokenA) : useAMMPool ? _getAMMPoolPrice(ammPool, tokenA) : _getUniswapV3Price(pool, tokenA);
+        address pool = useSushiSwap ? SUSHI_SWAP_PAIR : useAMMPool ? AMM_POOL : IUniswapV3Factory(UNISWAP_V3_FACTORY).getPool(TOKEN_A, TOKEN_B, feeTier);
+        (uint256 price, ) = useSushiSwap ? _getSushiSwapPrice(SUSHI_SWAP_PAIR, TOKEN_A) : useAMMPool ? _getAMMPoolPrice(AMM_POOL, TOKEN_A) : _getUniswapV3Price(pool, TOKEN_A);
         if (price == 0) revert NoValidOraclePrice(pool);
 
         bytes memory data = abi.encode(msg.sender, amountOutMin, chainId, price, feeTier, useSushiSwap, useAMMPool);
         if (useSushiSwap) {
             _submitSushiSwapFlashSwap(amountIn, data);
         } else if (useAMMPool) {
-            _submitAMMPoolSwap(tokenA, tokenB, amountIn, data, chainId);
-        } else {
-            _submitUniswapV3Swap(tokenA, tokenB, amountIn, data, feeTier);
-        }
+            _submitAMMPoolSwap(TOKEN_A, TOKEN_B, amountIn, data, chainId);
+            } else {
+                _submitUniswapV3Swap(TOKEN_A, TOKEN_B, amountIn, data, feeTier);
+            }
         emit FlashSwapInitiated(msg.sender, amountIn, amountOutMin, chainId, feeTier, useSushiSwap, useAMMPool);
     }
 
-    /// @notice Executes a trade on the external exchange
+    /// @notice Executes a trade on external exchange
     function _executeTrade(
         address tokenIn,
         address tokenOut,
@@ -1103,7 +1111,6 @@ contract FlashSwapArbitrage is
         amountOut = IExternalExchange(externalExchange).swapTokens(tokenIn, tokenOut, amountIn, chainId);
         IERC20(tokenIn).safeApprove(externalExchange, 0);
         if (amountOut == 0) revert TradeFailed(amountOut, 1);
-        return amountOut;
     }
 
     /// @notice Triggers liquidation for an undercollateralized position
@@ -1115,9 +1122,9 @@ contract FlashSwapArbitrage is
     ) external nonReentrant whenNotPaused {
         if (!hasRole(KEEPER_ROLE, msg.sender) && !hasRole(OPERATOR_ROLE, msg.sender)) revert UnauthorizedCaller(msg.sender);
 
-        require(supportedTokens[collateralAsset] && supportedTokens[debtAsset], "Unsupported tokens");
-        (, , , , , uint256 healthFactor) = IAavePool(lendingProtocol).getUserAccountData(user);
-        uint256 minHF = minHealthFactor[user] > 0 ? minHealthFactor[user] : healthFactorThreshold;
+        if (!supportedTokens[collateralAsset] || !supportedTokens[debtAsset]) revert InvalidOperation("Invalid tokens");
+        (, , , , , uint256 healthFactor) = IAavePool(LENDING_PROTOCOL).getUserAccountData(user);
+        uint256 minHF = minHealthFactor[user] != 0 ? minHealthFactor[user] : healthFactorThreshold;
         if (healthFactor >= minHF) revert LiquidationNotRequired(user);
 
         (uint256 price, ) = getOraclePrice(collateralAsset, debtAsset);
@@ -1126,188 +1133,277 @@ contract FlashSwapArbitrage is
         _executeFlashLoanLiquidation(user, collateralAsset, debtAsset, receiveAToken);
     }
 
-    /// @notice Triggers batch liquidations
-    function triggerBatchLiquidation(
-        address[] calldata users,
-        address[] calldata collateralAssets,
-        address[] calldata debtAssets,
-        bool[] calldata receiveATokens
-    ) external nonReentrant whenNotPaused onlyRole(KEEPER_ROLE) {
-        if (
-            users.length != collateralAssets.length ||
-            users.length != debtAssets.length ||
-            users.length != receiveATokens.length
-        ) revert BatchSizeMismatch(users.length, collateralAssets.length);
+        /// @notice Triggers batch liquidations
+        function triggerBatchLiquidation(
+            address[] calldata users,
+            address[] calldata collateralAssets,
+            address[] calldata debtAssets,
+            bool[] calldata receiveATokens
+        ) external nonReentrant whenNotPaused onlyRole(KEEPER_ROLE) {
+            if (
+                users.length != collateralAssets.length ||
+                users.length != debtAssets.length ||
+                users.length != receiveATokens.length
+            ) revert BatchSizeMismatch(users.length, collateralAssets.length);
 
-        uint256 totalDebtCovered = 0;
-        for (uint256 i = 0; i < users.length; i++) {
-            if (!supportedTokens[collateralAssets[i]] || !supportedTokens[debtAssets[i]]) continue;
-            (, , , , , uint256 healthFactor) = IAavePool(lendingProtocol).getUserAccountData(users[i]);
-            uint256 minHF = minHealthFactor[users[i]] > 0 ? minHealthFactor[users[i]] : healthFactorThreshold;
-            if (healthFactor >= minHF) continue;
+            uint256 totalDebtCovered = 0;
+            for (uint256 i = 0; i < users.length; i++) {
+                if (!supportedTokens[collateralAssets[i]] || !supportedTokens[debtAssets[i]]) continue;
+                (, , , , , uint256 healthFactor) = IAavePool(LENDING_PROTOCOL).getUserAccountData(users[i]);
+                uint256 minHF = minHealthFactor[users[i]] != 0 ? minHealthFactor[users[i]] : healthFactorThreshold;
+                if (healthFactor >= minHF) continue;
 
-            (uint256 price, ) = getOraclePrice(collateralAssets[i], debtAssets[i]);
-            if (price == 0) continue;
+                (uint256 price, ) = getOraclePrice(collateralAssets[i], debtAssets[i]);
+                if (price == 0) continue;
 
-            try this._executeFlashLoanLiquidation(users[i], collateralAssets[i], debtAssets[i], receiveATokens[i]) {
-                (, uint256 debtCovered, , , , ) = IAavePool(lendingProtocol).getUserAccountData(users[i]);
-                totalDebtCovered += debtCovered;
-            } catch {
-                continue;
+                try IAavePool(LENDING_PROTOCOL).flashLoanSimple(
+                    address(this),
+                    debtAssets[i],
+                    0, // debtToCover will be set in _executeFlashLoanLiquidation
+                    abi.encode(users[i], collateralAssets[i], debtAssets[i], 0, userLiquidationBonuses[users[i]] > 0 ? userLiquidationBonuses[users[i]] : minLiquidationBonus, receiveATokens[i]),
+                    0
+                ) {
+                    (, uint256 debtCovered, , , , ) = IAavePool(LENDING_PROTOCOL).getUserAccountData(users[i]);
+                    totalDebtCovered += debtCovered;
+                } catch {
+                    // Log failure but continue with the next user
+                    continue;
+                }
             }
+            emit BatchLiquidationTriggered(users.length, totalDebtCovered);
         }
-        emit BatchLiquidationTriggered(users.length, totalDebtCovered);
-    }
 
-    /// @notice Swaps collateral to maintain health factor
-    function swapCollateral(
-        address user,
-        address fromAsset,
-        address toAsset,
-        uint256 amount
-    ) external nonReentrant whenNotPaused {
-        if (!hasRole(KEEPER_ROLE, msg.sender) && !hasRole(OPERATOR_ROLE, msg.sender)) revert UnauthorizedCaller(msg.sender);
 
-        require(supportedTokens[fromAsset] && supportedTokens[toAsset], "Unsupported tokens");
-        (, , , , , uint256 healthFactor) = IAavePool(lendingProtocol).getUserAccountData(user);
-        uint256 minHF = minHealthFactor[user] > 0 ? minHealthFactor[user] : healthFactorThreshold;
-        if (healthFactor >= minHF) revert HealthFactorBelowThreshold(healthFactor, minHF);
+        /// @notice Swaps collateral to maintain health factor
+        function swapCollateral(
+            address user,
+            address fromAsset,
+            address toAsset,
+            uint256 amount
+        ) external nonReentrant whenNotPaused {
+            if (!hasRole(KEEPER_ROLE, msg.sender) && !hasRole(OPERATOR_ROLE, msg.sender)) revert UnauthorizedCaller(msg.sender);
 
-        (uint256 price, ) = getOraclePrice(fromAsset, toAsset);
-        if (price == 0) revert NoValidOraclePrice(fromAsset);
+            if (!supportedTokens[fromAsset] || !supportedTokens[toAsset]) revert InvalidOperation("Invalid tokens");
+            (, ,,, , uint256 healthFactor) = IAavePool(LENDING_PROTOCOL).getUserAccountData(user);
+            uint256 minHF = minHealthFactor[user] != 0 ? minHealthFactor[user] : healthFactorThreshold;
+            if (healthFactor >= minHF) revert HealthFactorBelowThreshold(healthFactor, minHF);
 
-        _executeCollateralSwap(user, fromAsset, toAsset, amount);
-    }
+            (uint256 price, ) = getOraclePrice(fromAsset, toAsset);
+            if (price == 0) revert NoValidOraclePrice(fromAsset);
 
-    /// @notice Swaps collateral in batch
-    function swapBatchCollateral(
-        address[] calldata users,
-        address[] calldata fromAssets,
-        address[] calldata toAssets,
-        uint256[] calldata amounts
-    ) external nonReentrant whenNotPaused onlyRole(KEEPER_ROLE) {
-        if (
-            users.length != fromAssets.length ||
-            users.length != toAssets.length ||
-            users.length != amounts.length
-        ) revert BatchSizeMismatch(users.length, fromAssets.length);
+            _executeCollateralSwap(user, fromAsset, toAsset, amount);
+        }
 
-        uint256 totalAmount = 0;
-        for (uint256 i = 0; i < users.length; i++) {
-            if (!supportedTokens[fromAssets[i]] || !supportedTokens[toAssets[i]]) continue;
-            (, , , , , uint256 healthFactor) = IAavePool(lendingProtocol).getUserAccountData(users[i]);
-            uint256 minHF = minHealthFactor[users[i]] > 0 ? minHealthFactor[users[i]] : healthFactorThreshold;
-            if (healthFactor >= minHF) continue;
+    
+        /// @notice Swaps collateral in batch
+        function swapBatchCollateral(
+            address[] calldata users,
+            address[] calldata fromAssets,
+            address[] calldata toAssets,
+            uint256[] calldata amounts
+        ) external nonReentrant whenNotPaused onlyRole(KEEPER_ROLE) {
+            if (
+                users.length != fromAssets.length ||
+                users.length != toAssets.length ||
+                users.length != amounts.length
+            ) revert BatchSizeMismatch(users.length, fromAssets.length);
 
-            (uint256 price, ) = getOraclePrice(fromAssets[i], toAssets[i]);
-            if (price == 0) continue;
+            uint256 totalAmount = 0;
+            for (uint256 i = 0; i < users.length; i++) {
+                if (!supportedTokens[fromAssets[i]] || !supportedTokens[toAssets[i]]) continue;
+                (, ,,, , uint256 healthFactor) = IAavePool(LENDING_PROTOCOL).getUserAccountData(users[i]);
+                uint256 minHF = minHealthFactor[users[i]] != 0 ? minHealthFactor[users[i]] : healthFactorThreshold;
+                if (healthFactor >= minHF) continue;
 
-            try this._executeCollateralSwap(users[i], fromAssets[i], toAssets[i], amounts[i]) {
+                (uint256 price, ) = getOraclePrice(fromAssets[i], toAssets[i]);
+                if (price == 0) continue;
+
+                _executeCollateralSwap(users[i], fromAssets[i], toAssets[i], amounts[i]);
                 totalAmount += amounts[i];
-            } catch {
-                continue;
+            }
+            emit BatchCollateralSwapped(users.length, totalAmount);
+        }
+
+        /// @notice Claims Aave rewards
+        function claimRewards(address[] calldata assets, uint256 amount, address to) external onlyRole(GOVERNOR_ROLE) {
+            uint256 claimed = IAaveIncentivesController(AAVE_INCENTIVES_CONTROLLER).claimRewards(assets, amount, to);
+            emit RewardsClaimed(to, claimed);
+        }
+
+        /// @notice Handles cross-chain messages via CCIP
+        function _ccipReceive(Client.Any2EVMMessage memory message) internal override nonReentrant whenNotPaused {
+            uint64 sourceChainId = uint64(message.sourceChainSelector);
+            ICrossChainRetryOracle.NetworkStatus memory status = retryOracle.getNetworkStatus(sourceChainId);
+            if (!status.bridgeOperational) revert RetryOracleError(sourceChainId);
+
+            (bytes memory data, address tokenIn, address tokenOut, uint256 amountIn, uint256 minProfit, bytes32 txId) = abi.decode(
+                message.data,
+                (bytes, address, address, uint256, uint256, bytes32)
+            );
+
+            if (retryTimestamps[txId] > MAX_RETRIES) revert MaxRetriesExceeded(txId);
+            if ((tokenIn != TOKEN_A || tokenOut != TOKEN_B) && (tokenIn != TOKEN_B || tokenOut != TOKEN_A))
+                revert InvalidTokenPair(tokenIn, tokenOut);
+
+            uint256 amountOut = _executeTrade(tokenIn, tokenOut, amountIn, sourceChainId);
+            if (amountOut < minProfit) {
+                retryTimestamps[txId]++;
+                emit RetryAttempted(txId, retryTimestamps[txId]);
+                revert InsufficientProfit(amountOut, minProfit);
+            }
+
+            retryTimestamps[txId] = 0;
+            emit CrossChainMessageReceived(sourceChainId, message.messageId);
+        }
+
+        /// @notice Withdraws accumulated profits
+        function withdrawProfit(
+            address token,
+            address recipient,
+            uint256 amount
+        ) external nonReentrant whenNotPaused onlyRole(GOVERNOR_ROLE) {
+            if (recipient == address(0)) revert InvalidExchangeAddress(recipient);
+            uint256 balance = IERC20(token).balanceOf(address(this));
+            if (balance < amount) revert InsufficientBalance(token, balance, amount);
+
+            IERC20(token).safeTransfer(recipient, amount);
+            emit ProfitWithdrawn(token, recipient, amount);
+        }
+
+        /// @notice Emergency recovers tokens
+        function emergencyRecover(address token, address recipient) external nonReentrant onlyRole(GOVERNOR_ROLE) {
+            if (recipient == address(0)) revert InvalidExchangeAddress(recipient);
+            uint256 balance = IERC20(token).balanceOf(address(this));
+            if (balance > 0) {
+                IERC20(token).safeTransfer(recipient, balance);
+                emit AssetsRecovered(token, balance, recipient);
             }
         }
-        emit BatchCollateralSwapped(users.length, totalAmount);
-    }
 
-    /// @notice Claims Aave rewards
-    function claimRewards(address[] calldata assets, uint256 amount, address to) external onlyRole(GOVERNOR_ROLE) {
-        uint256 claimed = IAaveIncentivesController(aaveIncentivesController).claimRewards(assets, amount, to);
-        emit RewardsClaimed(to, claimed);
-    }
-
-    /// @notice Handles cross-chain messages via CCIP
-    function _ccipReceive(Client.Any2EVMMessage calldata message) internal override nonReentrant whenNotPaused {
-        uint64 sourceChainId = uint64(message.sourceChainSelector);
-        ICrossChainRetryOracle.NetworkStatus memory status = retryOracle.getNetworkStatus(sourceChainId);
-        if (!status.bridgeOperational) revert RetryOracleError(sourceChainId);
-
-        (bytes memory data, address tokenIn, address tokenOut, uint256 amountIn, uint256 minProfit, bytes32 txId) = abi.decode(
-            message.data,
-            (bytes, address, address, uint256, uint256, bytes32)
-        );
-
-        if (retryTimestamps[txId] > MAX_RETRIES) revert MaxRetriesExceeded(txId);
-        if ((tokenIn != tokenA || tokenOut != tokenB) && (tokenIn != tokenB || tokenOut != tokenA))
-            revert InvalidTokenPair(tokenIn, tokenOut);
-
-        uint256 amountOut = _executeTrade(tokenIn, tokenOut, amountIn, sourceChainId);
-        if (amountOut < minProfit) {
-            retryTimestamps[txId]++;
-            emit RetryAttempted(txId, retryTimestamps[txId]);
-            revert InsufficientProfit(amountOut, minProfit);
+        function revokeApproval(address token) external nonReentrant onlyRole(GOVERNOR_ROLE) {
+            if (token == address(0)) revert InvalidOperation("Invalid token");
+            IERC20(token).safeApprove(UNISWAP_V3_SWAP_ROUTER, 0);
+            IERC20(token).safeApprove(SUSHI_SWAP_ROUTER, 0);
+            IERC20(token).safeApprove(SUSHI_SWAP_PAIR, 0);
+            IERC20(token).safeApprove(externalExchange, 0);
+            IERC20(token).safeApprove(LENDING_PROTOCOL, 0);
+            IERC20(token).safeApprove(AMM_POOL, 0);
+            uint64[] memory chainIds = retryOracle.activeChainIds();
+            for (uint256 i = 0; i < chainIds.length; i++) {
+                address crossChainPool = crossChainAMMPools[chainIds[i]];
+                if (crossChainPool != address(0)) {
+                    IERC20(token).safeApprove(crossChainPool, 0);
+                }
+            }
+            revert InvalidOperation("Approvals revoked");
         }
 
-        retryTimestamps[txId] = 0;
-        emit CrossChainMessageReceived(sourceChainId, message.messageId);
-    }
-
-    /// @notice Withdraws accumulated profits
-    function withdrawProfit(
-        address token,
-        address recipient,
-        uint256 amount
-    ) external nonReentrant whenNotPaused onlyRole(GOVERNOR_ROLE) {
-        if (recipient == address(0)) revert InvalidExchangeAddress(recipient);
-        uint256 balance = IERC20(token).balanceOf(address(this));
-        if (balance < amount) revert InsufficientBalance(token, balance, amount);
-
-        IERC20(token).safeTransfer(recipient, amount);
-        emit ProfitWithdrawn(token, recipient, amount);
-    }
-
-    /// @notice Emergency recovers tokens
-    function emergencyRecover(address token, address recipient) external nonReentrant onlyRole(GOVERNOR_ROLE) {
-        if (recipient == address(0)) revert InvalidExchangeAddress(recipient);
-        uint256 balance = IERC20(token).balanceOf(address(this));
-        if (balance > 0) {
-            IERC20(token).safeTransfer(recipient, balance);
-            emit AssetsRecovered(token, balance, recipient);
+        /// @notice Pauses the contract in case of emergency
+        function pause() external onlyRole(GOVERNOR_ROLE) {
+            _pause();
         }
-    }
 
-    /// @notice Revokes token approvals
-    function revokeApproval(address token) external nonReentrant onlyRole(GOVERNOR_ROLE) {
-        require(token != address(0), "Invalid token address");
-        IERC20(token).safeApprove(uniswapV3SwapRouter, 0);
-        IERC20(token).safeApprove(sushiSwapRouter, 0);
-        IERC20(token).safeApprove(sushiSwapPair, 0);
-        IERC20(token).safeApprove(externalExchange, 0);
-        IERC20(token).safeApprove(lendingProtocol, 0);
-        IERC20(token).safeApprove(ammPool, 0);
-        uint64[] memory chainIds = retryOracle.activeChainIds();
-        for (uint256 i = 0; i < chainIds.length; i++) {
-            address pool = crossChainAMMPools[chainIds[i]];
-            if (pool != address(0)) {
-                IERC20(token).safeApprove(pool, 0);
+        /// @notice Unpauses the contract
+        function unpause() external onlyRole(GOVERNOR_ROLE) {
+            _unpause();
+        }
+
+        /// @notice Gets the current reserves for gas and LINK
+        function getReserves() external view returns (uint256 gasReserve, uint256 linkReserve) {
+            return (reserves.gasReserve, reserves.linkReserve);
+        }
+
+        /// @notice Gets the supported fee tiers for Uniswap V3
+        function getFeeTiers() external view returns (uint256[] memory) {
+            return uniswapFeeTiers;
+        }
+
+        /// @notice Gets the current price and timestamp for a token pair from AMM pool
+        function getAMMPoolPrice(address tokenIn) external view returns (uint256 price, uint256 timestamp) {
+            return _getAMMPoolPrice(AMM_POOL, tokenIn);
+        }
+
+        /// @notice Gets the current price and timestamp for a token pair from SushiSwap
+        function getSushiSwapPrice(address tokenIn) external view returns (uint256 price, uint256 timestamp) {
+            return _getSushiSwapPrice(SUSHI_SWAP_PAIR, tokenIn);
+        }
+
+        /// @notice Gets the current price and timestamp for a token pair from Uniswap V3
+        function getUniswapV3Price(address tokenIn) external view returns (uint256 price, uint256 timestamp) {
+            (address pool, ) = _selectBestUniswapV3Pool(tokenIn, tokenIn == TOKEN_A ? TOKEN_B : TOKEN_A);
+            return _getUniswapV3Price(pool, tokenIn);
+        }
+
+        /// @notice Gets the liquidation bonus for a user
+        function getUserLiquidationBonus(address user) external view returns (uint256) {
+            return userLiquidationBonuses[user] > 0 ? userLiquidationBonuses[user] : minLiquidationBonus;
+        }
+
+        /// @notice Checks if a token is supported
+        function isTokenSupported(address token) external view returns (bool) {
+            return supportedTokens[token];
+        }
+
+        /// @notice Gets the minimum health factor for a user
+        function getMinHealthFactor(address user) external view returns (uint256) {
+            return minHealthFactor[user] > 0 ? minHealthFactor[user] : healthFactorThreshold;
+        }
+
+        /// @notice Gets the cross-chain AMM pool address for a chain ID
+        function getCrossChainPool(uint64 chainId) external view returns (address) {
+            return crossChainAMMPools[chainId];
+        }
+
+        /// @notice Estimates profit for an arbitrage opportunity
+        function estimateArbitrageProfit(
+            uint256 amountIn,
+            uint64 chainId,
+            bool useSushiSwap,
+            bool useAMMPool,
+            uint24 feeTier
+        ) external view returns (uint256 estimatedProfit) {
+            if (amountIn == 0) revert InvalidBorrowedAmount(amountIn, 0);
+            if (chainId != 0 && crossChainAMMPools[chainId] == address(0)) revert CrossChainNotConfigured(chainId);
+            if (useSushiSwap && useAMMPool) revert InvalidOperation("Cannot use both");
+
+            address tokenIn = TOKEN_A;
+            address tokenOut = TOKEN_B;
+            uint256 amountOut;
+
+            if (useSushiSwap) {
+                address[] memory path = new address[](2);
+                path[0] = tokenIn;
+                path[1] = tokenOut;
+                uint256[] memory amounts = ISushiSwapRouter(SUSHI_SWAP_ROUTER).getAmountsOut(amountIn, path);
+                amountOut = amounts[amounts.length - 1];
+            } else if (useAMMPool) {
+                (uint64 reserveA, uint64 reserveB) = IAMMPool(AMM_POOL).getReserves();
+                address ammToken0 = IAMMPool(AMM_POOL).token0();
+                uint256 reserveIn = tokenIn == ammToken0 ? reserveA : reserveB;
+                uint256 reserveOut = tokenIn == ammToken0 ? reserveB : reserveA;
+                if (reserveOut == 0) revert DivisionByZero();
+                uint256 fee = IAMMPool(AMM_POOL).getDynamicFee(uint16(chainId));
+                amountOut = (amountIn * reserveOut * (MAX_FEE_BASIS_POINTS - fee)) / (reserveIn * MAX_FEE_BASIS_POINTS + amountIn * (MAX_FEE_BASIS_POINTS - fee));
+            } else {
+                (address pool, ) = _selectBestUniswapV3Pool(tokenIn, tokenOut);
+                (uint256 price, ) = _getUniswapV3Price(pool, tokenIn);
+                amountOut = (amountIn * price * (MAX_FEE_BASIS_POINTS - feeTier)) / (PRICE_PRECISION * MAX_FEE_BASIS_POINTS);
+            }
+
+            uint256 externalAmountOut = IExternalExchange(externalExchange).swapTokens(tokenOut, tokenIn, amountOut, chainId);
+            if (externalAmountOut > amountIn) {
+                estimatedProfit = externalAmountOut - amountIn;
             }
         }
-    }
 
-    /// @notice Pauses the contract
-    function pause() external nonReentrant onlyRole(GOVERNOR_ROLE) {
-        _pause();
-    }
+        /// @notice Fallback function to prevent direct calls
+        receive() external payable {
+            reserves.gasReserve += msg.value;
+            emit GasReserveUpdated(reserves.gasReserve);
+        }
 
-    /// @notice Unpauses the contract
-    function unpause() external nonReentrant onlyRole(GOVERNOR_ROLE) {
-        _unpause();
+        /// @notice Fallback function to revert invalid calls
+        fallback() external payable {
+            revert InvalidOperation("Invalid call");
+        }
     }
-
-    /// @notice Gets active chain IDs
-    function activeChainIds() external view returns (uint64[] memory) {
-        return retryOracle.activeChainIds();
-    }
-
-    /// @notice Receives Ether for gas funding
-    receive() external payable {
-        gasReserve += msg.value;
-        emit GasReserveUpdated(gasReserve);
-    }
-
-    // Fallback function for safety
-    fallback() external payable {
-        revert("Invalid call");
-    }
-}

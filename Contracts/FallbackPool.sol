@@ -21,12 +21,12 @@ contract FallbackPool is ReentrancyGuard {
     struct FallbackReserves {
         uint256 reserveA;
         uint256 reserveB;
-        uint256 totalLiquidity;
+        uint128 totalLiquidity;
     }
 
     // State variables
     FallbackReserves public fallbackReserves;
-    mapping(address => uint256) public fallbackLiquidityBalance;
+    mapping(address => uint128) public fallbackLiquidityBalance;
     mapping(uint256 => bool) public inFallbackPool;
 
     // Custom errors
@@ -35,12 +35,16 @@ contract FallbackPool is ReentrancyGuard {
     error PositionNotInFallback(uint256 positionId);
     error InsufficientReserve(uint256 amountOut, uint256 reserve);
     error InvalidToken(address token);
+    error LiquidityOverflow();
+    error TotalLiquidityOverflow();
+    error UserLiquidityBalanceOverflow();
 
     // Events
     event FallbackPoolEntered(uint256 indexed positionId, uint256 liquidity);
     event FallbackPoolExited(uint256 indexed positionId, uint256 liquidity);
 
-    // Constructor
+    /// @notice Constructor to initialize the pool address
+    /// @param _pool The address of the AMMPool contract
     constructor(address _pool) {
         if (_pool == address(0)) revert Unauthorized();
         pool = AMMPool(_pool);
@@ -67,26 +71,32 @@ contract FallbackPool is ReentrancyGuard {
     /// @param positionId The ID of the position to check
     function checkAndMoveToFallback(uint256 positionId) external onlyPool {
         if (inFallbackPool[positionId]) return;
-        
-        (address owner, int24 tickLower, int24 tickUpper, uint256 liquidity,,) = pool.getPosition(positionId);
+
+        (address owner, int24 tickLower, int24 tickUpper, uint128 liquidity,,) = pool.getPosition(positionId);
         if (liquidity == 0) revert InsufficientLiquidity(liquidity);
-        if (liquidity > type(uint128).max) revert InsufficientLiquidity(liquidity);
-        
-        int24 currentTick = pool.getcurrentTick();
+
+        int24 currentTick = pool.getCurrentTick();
         if (currentTick < tickLower || currentTick >= tickUpper) {
             inFallbackPool[positionId] = true;
-            
-            uint256 totalLiquidity = pool.totalLiquidity();
+
+            uint256 totalLiquidity = pool.getLiquidity();
             (uint64 reserveA, uint64 reserveB) = pool.getReserves();
-            
+
             uint256 amountA = (liquidity * reserveA) / totalLiquidity;
             uint256 amountB = (liquidity * reserveB) / totalLiquidity;
-            
+
+            // Check for uint128 overflow
+            if (liquidity > type(uint128).max) revert LiquidityOverflow();
+            if (fallbackReserves.totalLiquidity + liquidity < fallbackReserves.totalLiquidity)
+                revert TotalLiquidityOverflow();
+            if (fallbackLiquidityBalance[owner] + liquidity < fallbackLiquidityBalance[owner])
+                revert UserLiquidityBalanceOverflow();
+
             fallbackReserves.reserveA += amountA;
             fallbackReserves.reserveB += amountB;
             fallbackReserves.totalLiquidity += liquidity;
             fallbackLiquidityBalance[owner] += liquidity;
-            
+
             emit FallbackPoolEntered(positionId, liquidity);
         }
     }
@@ -95,6 +105,9 @@ contract FallbackPool is ReentrancyGuard {
     /// @param positionId The ID of the position to exit
     function exitFallbackPool(uint256 positionId) external nonReentrant onlyPositionOwner(positionId) {
         _exitFallbackPool(positionId);
+
+        (address owner, , , uint128 liquidity,,) = pool.getPosition(positionId);
+        if (liquidity == 0) revert InsufficientLiquidity(liquidity);
     }
 
     /// @notice Internal function to exit the fallback pool for a position
@@ -107,22 +120,22 @@ contract FallbackPool is ReentrancyGuard {
     /// @param positionId The ID of the position to exit
     function _exitFallbackPool(uint256 positionId) internal {
         if (!inFallbackPool[positionId]) revert PositionNotInFallback(positionId);
-        
-        (address owner, , , uint256 liquidity,,) = pool.getPosition(positionId);
+
+        (address owner, , , uint128 liquidity,,) = pool.getPosition(positionId);
         if (liquidity == 0) revert InsufficientLiquidity(liquidity);
-        
+
         uint256 amountA = (liquidity * fallbackReserves.reserveA) / fallbackReserves.totalLiquidity;
         uint256 amountB = (liquidity * fallbackReserves.reserveB) / fallbackReserves.totalLiquidity;
-        
+
         inFallbackPool[positionId] = false;
         fallbackReserves.reserveA -= amountA;
         fallbackReserves.reserveB -= amountB;
         fallbackReserves.totalLiquidity -= liquidity;
         fallbackLiquidityBalance[owner] -= liquidity;
-        
+
         IERC20Upgradeable(pool.tokenA()).safeTransfer(owner, amountA);
         IERC20Upgradeable(pool.tokenB()).safeTransfer(owner, amountB);
-        
+
         emit FallbackPoolExited(positionId, liquidity);
     }
 
@@ -130,15 +143,15 @@ contract FallbackPool is ReentrancyGuard {
     /// @param positionId The ID of the position
     /// @param tokensOwed0 Amount of token0 to compound
     /// @param tokensOwed1 Amount of token1 to compound
-    function compoundFallbackFeesInternal(uint256 positionId, uint256 tokensOwed0, uint256 tokensOwed1) 
-        external 
-        onlyPositionAdjuster 
+    function compoundFallbackFeesInternal(uint256 positionId, uint256 tokensOwed0, uint256 tokensOwed1)
+        external
+        onlyPositionAdjuster
     {
         if (!inFallbackPool[positionId]) revert PositionNotInFallback(positionId);
-        
-        (address owner, , , uint256 liquidity,,) = pool.getPosition(positionId);
+
+        (address owner, , , uint128 liquidity,,) = pool.getPosition(positionId);
         if (liquidity == 0) revert InsufficientLiquidity(liquidity);
-        
+
         // Calculate additional liquidity from fees
         uint256 additionalLiquidity;
         if (tokensOwed0 > 0 && tokensOwed1 > 0) {
@@ -148,12 +161,22 @@ contract FallbackPool is ReentrancyGuard {
         } else if (tokensOwed1 > 0) {
             additionalLiquidity = tokensOwed1;
         }
-        
+
         if (additionalLiquidity > 0) {
+            // Check for uint128 overflow
+            if (additionalLiquidity > type(uint128).max) revert LiquidityOverflow();
+            uint128 additionalLiquidity128 = uint128(additionalLiquidity);
+
+            // Check for totalLiquidity and user balance overflow
+            if (fallbackReserves.totalLiquidity + additionalLiquidity128 < fallbackReserves.totalLiquidity)
+                revert TotalLiquidityOverflow();
+            if (fallbackLiquidityBalance[owner] + additionalLiquidity128 < fallbackLiquidityBalance[owner])
+                revert UserLiquidityBalanceOverflow();
+
             fallbackReserves.reserveA += tokensOwed0;
             fallbackReserves.reserveB += tokensOwed1;
-            fallbackReserves.totalLiquidity += additionalLiquidity;
-            fallbackLiquidityBalance[owner] += additionalLiquidity;
+            fallbackReserves.totalLiquidity += additionalLiquidity128;
+            fallbackLiquidityBalance[owner] += additionalLiquidity128;
         }
     }
 
@@ -164,28 +187,23 @@ contract FallbackPool is ReentrancyGuard {
     function swapFallbackPool(bool isTokenAInput, uint256 amountIn) external onlyPool returns (uint256 amountOut) {
         // Determine input token
         address inputToken = isTokenAInput ? pool.tokenA() : pool.tokenB();
-        
+
         // Get current tick and convert to sqrtPriceX96
-        int24 currentTick = pool.getcurrentTick();
+        int24 currentTick = pool.getCurrentTick();
         uint160 sqrtPriceX96 = TickMath.getSqrtRatioAtTick(currentTick);
-        
+
         // Calculate output amount using TickMathLibrary
-        amountOut = TickMathLibrary.calculateAmountOut(
-            pool,
-            sqrtPriceX96,
-            inputToken,
-            amountIn
-        );
-        
+        amountOut = TickMathLibrary.calculateAmountOut(pool, sqrtPriceX96, inputToken, amountIn);
+
         // Additional reserve check for safety
         (uint256 reserveIn, uint256 reserveOut) = isTokenAInput
             ? (fallbackReserves.reserveA, fallbackReserves.reserveB)
             : (fallbackReserves.reserveB, fallbackReserves.reserveA);
         if (amountOut > reserveOut) revert InsufficientReserve(amountOut, reserveOut);
-        
+
         // Update reserves
         updateFallbackReserves(isTokenAInput, amountIn, amountOut);
-        
+
         return amountOut;
     }
 
@@ -193,7 +211,7 @@ contract FallbackPool is ReentrancyGuard {
     /// @param isTokenAInput True if tokenA is the input token
     /// @param amountIn The input amount
     /// @param amountOut The output amount
-    function updateFallbackReserves(bool isTokenAInput, uint256 amountIn, uint256 amountOut) internal {
+    function updateFallbackReserves(bool isTokenAInput, uint256 amountIn, uint256 amountOut) public onlyPool {
         if (isTokenAInput) {
             fallbackReserves.reserveA += amountIn;
             fallbackReserves.reserveB -= amountOut;
@@ -212,15 +230,15 @@ contract FallbackPool is ReentrancyGuard {
         IERC20Upgradeable(token).safeTransfer(recipient, amount);
     }
 
-    function getFallbackReserves() 
-        external 
-        view 
-        returns (uint256 reserveA, uint256 reserveB, uint256 totalLiquidity) 
+    /// @notice Retrieves the current reserves and total liquidity of the fallback pool
+    /// @return reserveA The reserve amount of tokenA
+    /// @return reserveB The reserve amount of tokenB
+    /// @return totalLiquidity The total liquidity in the fallback pool
+    function getFallbackReserves()
+        external
+        view
+        returns (uint256 reserveA, uint256 reserveB, uint128 totalLiquidity)
     {
-        return (
-            fallbackReserves.reserveA,
-            fallbackReserves.reserveB,
-            fallbackReserves.totalLiquidity
-        );
+        return (fallbackReserves.reserveA, fallbackReserves.reserveB, fallbackReserves.totalLiquidity);
     }
 }

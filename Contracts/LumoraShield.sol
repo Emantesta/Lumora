@@ -4,7 +4,7 @@ pragma solidity ^0.8.24;
 import {Initializable} from "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
 import {UUPSUpgradeable} from "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
 import {ERC721Upgradeable} from "@openzeppelin/contracts-upgradeable/token/ERC721/ERC721Upgradeable.sol";
-import {ReentrancyGuardUpgradeable} from "@openzeppelin/contracts-upgradeable/security/ReentrancyGuardUpgradeable.sol";
+import {ReentrancyGuardUpgradeable} from "@openzeppelin/contracts-upgradeable/utils/ReentrancyGuardUpgradeable.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {AggregatorV3Interface} from "@chainlink/contracts/src/v0.8/shared/interfaces/AggregatorV3Interface.sol";
@@ -969,9 +969,11 @@ contract LumoraShield is Initializable, UUPSUpgradeable, ERC721Upgradeable, Reen
     /// @param tokenId The policy NFT ID.
     /// @param auth The authorized address.
     /// @return The previous owner's address.
-    function _update(address to, uint256 tokenId, address auth) internal returns (address) {
+    function _update(address to, uint256 tokenId, address auth) internal virtual override returns (address) {
         if (to == address(0)) revert InvalidAddress(to, "Cannot transfer to zero address");
         address previousOwner = super._update(to, tokenId, auth);
+        
+        // Update policy ownership based on tokenId
         if (policies[tokenId].user != address(0)) {
             policies[tokenId].user = to;
         } else if (impermanentLossPolicies[tokenId].user != address(0)) {
@@ -979,6 +981,7 @@ contract LumoraShield is Initializable, UUPSUpgradeable, ERC721Upgradeable, Reen
         } else if (parametricPolicies[tokenId].user != address(0)) {
             parametricPolicies[tokenId].user = to;
         }
+        
         return previousOwner;
     }
 

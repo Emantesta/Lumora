@@ -1,14 +1,14 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.24;
 
-import "@chainlink/contracts/src/v0.8/automation/interfaces/KeeperCompatibleInterface.sol";
-import "@openzeppelin/contracts-upgradeable/security/ReentrancyGuardUpgradeable.sol";
-import "./Interfaces.sol";
-import "./external/uniswap/v3/TickMath.sol";
+import {KeeperCompatibleInterface} from "@chainlink/contracts/src/v0.8/automation/interfaces/KeeperCompatibleInterface.sol";
+import {ReentrancyGuardUpgradeable} from "@openzeppelin/contracts-upgradeable/security/ReentrancyGuardUpgradeable.sol";
+import {IAMMPool, IPositionManager, IPriceOracle} from "./Interfaces.sol";
+import {TickMath} from "./external/uniswap/v3/TickMath.sol";
 import {UD60x18, ud} from "@prb/math/src/UD60x18.sol";
 
 contract PositionAdjuster is KeeperCompatibleInterface, ReentrancyGuardUpgradeable {
-    AMMPool public immutable pool;
+    IAMMPool public immutable pool;
     IPositionManager public immutable positionManager;
     address public priceOracle;
     address[] public fallbackPriceOracles;
@@ -83,7 +83,7 @@ contract PositionAdjuster is KeeperCompatibleInterface, ReentrancyGuardUpgradeab
 
     error InvalidStrategyType();
     error Unauthorized();
-    error InvalidChainId(uint16 chainId);
+    error InvalidChainId(uint64 chainId);
     error MaxRetriesExceeded(uint256 messageId);
     error MessageNotFailed(uint256 messageId);
     error RetryNotReady(uint256 messageId, uint256 nextRetryTimestamp);
@@ -99,7 +99,7 @@ contract PositionAdjuster is KeeperCompatibleInterface, ReentrancyGuardUpgradeab
     error InvalidAddress(address addr, string message);
 
     constructor(address _pool, address _positionManager, address _priceOracle, address[] memory _fallbackPriceOracles) {
-        pool = AMMPool(_pool);
+        pool = IAMMPool(_pool);
         positionManager = IPositionManager(_positionManager);
         priceOracle = _priceOracle;
         fallbackPriceOracles = _fallbackPriceOracles;
@@ -208,7 +208,7 @@ contract PositionAdjuster is KeeperCompatibleInterface, ReentrancyGuardUpgradeab
     int24 newTickLower,
     int24 newTickUpper,
     uint256 newLiquidity,
-    uint16 dstChainId,
+    uint64 dstChainId,
     uint8 bridgeType,
     bytes calldata adapterParams
 ) external payable nonReentrant {
@@ -270,7 +270,7 @@ contract PositionAdjuster is KeeperCompatibleInterface, ReentrancyGuardUpgradeab
     int24[] calldata newTickLowers,
     int24[] calldata newTickUppers,
     uint256[] calldata newLiquidities,
-    uint16 dstChainId,
+    uint64 dstChainId,
     uint8 bridgeType,
     bytes calldata adapterParams
 ) external payable nonReentrant {

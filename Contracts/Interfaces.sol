@@ -12,30 +12,45 @@ interface IPriceOracle {
     function emergencyOverrideActive(address asset) external view returns (bool);
 }
 
+interface IChainlinkOracle {
+    function decimals() external view returns (uint8);
+    function latestRoundData()
+        external
+        view
+        returns (
+            uint80 roundId,
+            int256 answer,
+            uint256 startedAt,
+            uint256 updatedAt,
+            uint80 answeredInRound
+        );
+}
+
 interface IAMMPool {
     struct FailedMessage {
         uint16 dstChainId;
-        bytes sender;
+        string dstAxelarChain;
+        bytes payload;
+        bytes adapterParams;
+        uint256 retries;
         uint256 timestamp;
         uint8 messengerType;
-        uint256 retries;
         uint256 nextRetryTimestamp;
-        bytes payload;
     }
 
     function positions(uint256 positionId) external view returns (
         address owner,
         int24 tickLower,
         int24 tickUpper,
-        uint256 liquidity,
+        uint128 liquidity,
         uint256 feeGrowthInside0LastX128,
         uint256 feeGrowthInside1LastX128,
-        uint256 tokensOwed0,
-        uint256 tokensOwed1
+        uint128 tokensOwed0,
+        uint128 tokensOwed1
     );
-    
-    function getcurrentTick() external view returns (int24);
-    
+
+    function getCurrentTick() external view returns (int24);
+    function getOraclePrice() external view returns (uint256);
     function tokenA() external view returns (address);
     function tokenB() external view returns (address);
     function positionCounter() external view returns (uint256);
@@ -66,7 +81,7 @@ interface IAMMPool {
     function emaVol() external view returns (uint256);
     function getReserves() external view returns (uint64 reserveA, uint64 reserveB);
     function TICK_SPACING() external view returns (uint24);
-    event PositionCreated(uint256 indexed positionId, address indexed owner, int24 tickLower, int24 tickUpper, uint256 liquidity);
+    event PositionCreated(uint256 indexed positionId, address indexed owner, int24 tickLower, int24 tickUpper, uint128 liquidity);
     event VolatilityThresholdUpdated(uint256 newThreshold);
     function getVolatilityThreshold() external view returns (uint256);
     function volatilityThreshold() external view returns (uint256);
@@ -84,8 +99,8 @@ interface IAMMPool {
     function tokenBridge() external view returns (address);
     function tokenBridgeType(address token) external view returns (uint8);
     function failedMessageCount() external view returns (uint256);
-    function setFailedMessage(uint256 messageId, FailedMessage memory message) external;
-    function getFailedMessage(uint256 messageId) external view returns (FailedMessage memory);
+    function setFailedMessage(uint256 messageId, ICommonStructs.FailedMessage memory message) external;
+    function getFailedMessage(uint256 messageId) external view returns (ICommonStructs.FailedMessage memory);
     function deleteFailedMessage(uint256 messageId) external;
     function updateFailedMessage(uint256 messageId, uint256 retries, uint256 nextRetryTimestamp) external;
     function incrementFailedMessageCount() external;
@@ -130,7 +145,7 @@ interface IAMMPool {
     function emitFailedMessageStored(
         uint256 messageId,
         uint16 dstChainId,
-        bytes memory sender,
+        string memory dstAxelarChain,
         uint256 timestamp,
         uint8 messengerType
     ) external;
@@ -143,7 +158,7 @@ interface IAMMPool {
     function emitFailedMessageRetryScheduled(uint256 messageId, uint256 nextRetryTimestamp) external;
     function emitBatchMessagesSent(uint16[] memory dstChainIds, uint8 messengerType, uint256 totalFee) external;
     function emitBatchRetryProcessed(uint256[] memory messageIds, uint256 successfulRetries, uint256 failedRetries) external;
-} // Ensure closing brace for IAMMPool
+}
 
 interface IPositionManager {
     function mintPosition(uint256 positionId, address recipient) external;
@@ -162,13 +177,13 @@ interface IPositionManager {
         uint8 bridgeType,
         bytes calldata adapterParams
     ) external payable;
-} // Ensure closing brace for IPositionManager
+}
 
 interface IPositionAdjuster {
     function adjustPosition(uint256 positionId, int24 newTickLower, int24 newTickUpper) external;
     function exitFallbackPool(uint256 positionId) external;
     function adjust(uint256 positionId, int24 tickLower, int24 tickUpper, uint256 liquidity) external;
-} // Ensure closing brace for IPositionAdjuster
+}
 
 interface ICommonStructs {
     struct InitParams {
@@ -192,11 +207,22 @@ interface ICommonStructs {
         address owner;
         int24 tickLower;
         int24 tickUpper;
-        uint256 liquidity;
+        uint128 liquidity;
         uint256 feeGrowthInside0LastX128;
         uint256 feeGrowthInside1LastX128;
-        uint256 tokensOwed0;
-        uint256 tokensOwed1;
+        uint128 tokensOwed0;
+        uint128 tokensOwed1;
+    }
+
+    struct FailedMessage {
+        uint16 dstChainId;
+        string dstAxelarChain;
+        bytes payload;
+        bytes adapterParams;
+        uint256 retries;
+        uint256 timestamp;
+        uint8 messengerType;
+        uint256 nextRetryTimestamp;
     }
 }
 
@@ -277,15 +303,16 @@ interface ICrossChainMessenger {
     function sendMessage(
         uint16 dstChainId,
         string calldata dstAxelarChain,
-        bytes calldata dstAddress,
+        bytes calldata destination,
         bytes calldata payload,
         bytes calldata adapterParams,
         address payable refundAddress
     ) external payable;
+
     function estimateFees(
         uint16 dstChainId,
         string calldata dstAxelarChain,
-        address user,
+        address destination,
         bytes calldata payload,
         bytes calldata adapterParams
     ) external view returns (uint256 nativeFee, uint256 zroFee);

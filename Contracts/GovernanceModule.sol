@@ -50,10 +50,10 @@ contract GovernanceModule is ReentrancyGuard {
     event GovernanceProposalExecuted(uint256 indexed proposalId);
     event AmplificationFactorUpdated(uint256 newA);
     event PositionAdjusterUpdated(address indexed newAdjuster);
-    event FeesUpdated(uint16 indexed chainId, uint256 baseFee, uint256 maxFee, uint256 lpFeeShare, uint256 treasuryFeeShare);
+    event FeesUpdated(uint64 indexed chainId, uint256 baseFee, uint256 maxFee, uint256 lpFeeShare, uint256 treasuryFeeShare);
     event PositionManagerUpdated(address indexed newPositionManager);
     event VolatilityThresholdUpdated(uint256 newThreshold);
-    event TrustedRemotePoolAdded(uint16 indexed chainId, bytes poolAddress);
+    event TrustedRemotePoolAdded(uint64 indexed chainId, bytes poolAddress);
     event TokenBridgeUpdated(address indexed newTokenBridge);
     event TokenBridgeTypeUpdated(address indexed token, uint8 bridgeType);
     event TargetReserveRatioUpdated(uint256 newRatio);
@@ -61,8 +61,8 @@ contract GovernanceModule is ReentrancyGuard {
     event EmaPeriodUpdated(uint256 newPeriod);
     event CrossChainMessengerUpdated(uint8 indexed messengerType, address indexed newMessenger);
     event AxelarGasServiceUpdated(address indexed newGasService);
-    event ChainIdMappingUpdated(uint16 chainId, string axelarChain);
-    event WormholeTrustedSenderUpdated(uint16 chainId, bytes32 senderAddress);
+    event ChainIdMappingUpdated(uint64 chainId, string axelarChain);
+    event WormholeTrustedSenderUpdated(uint64 chainId, bytes32 senderAddress);
     event GovernanceUpdated(address indexed newGovernance);
 
     // Constructor
@@ -130,21 +130,7 @@ contract GovernanceModule is ReentrancyGuard {
         onlyGovernance 
         nonReentrant 
     {
-        (uint64 reserveA, uint64 reserveB) = pool.getReserves();
-        uint256 targetRatio = pool.targetReserveRatio();
-        uint256 currentRatio = reserveA == 0 ? 0 : (reserveB * 1e18) / reserveA;
-        
-        if (currentRatio > targetRatio) {
-            uint256 excessB = reserveB - ((reserveA * targetRatio) / 1e18);
-            IERC20Upgradeable(pool.tokenB()).safeTransfer(pool.treasury(), excessB);
-            pool.updateCrossChainReserves(0, excessB);
-        } else if (currentRatio < targetRatio) {
-            uint256 neededB = ((reserveA * targetRatio) / 1e18) - reserveB;
-            IERC20Upgradeable(pool.tokenB()).safeTransferFrom(pool.treasury(), address(pool), neededB);
-            pool.updateCrossChainReserves(0, neededB);
-        }
-        
-        emit pool.ReservesRebalanced(chainId, reserveA, reserveB, 0);
+        pool.rebalanceReserves(chainId);
     }
 
     /// @notice Updates the amplification factor for dynamic curves

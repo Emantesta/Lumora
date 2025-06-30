@@ -18,7 +18,7 @@ library DynamicFeeLibrary {
 
     // Struct to encapsulate AMMPool state
     struct State {
-        mapping(uint16 => FeeConfig) chainFees;
+        mapping(uint64 => FeeConfig) chainFees; // Changed from uint16 to uint64
         uint256 emaVolatility;
         uint256 emaPeriod;
         uint256 volatilityThreshold;
@@ -44,7 +44,7 @@ library DynamicFeeLibrary {
     /// @param state The AMMPool state
     /// @param chainId The chain ID
     /// @return fee The calculated fee
-    function getDynamicFee(State storage state, uint16 chainId) 
+    function getDynamicFee(State storage state, uint64 chainId) 
         internal 
         view 
         returns (uint256 fee) 
@@ -131,5 +131,5 @@ library DynamicFeeLibrary {
         if (actualPrice > expectedPrice + state.priceDeviationThreshold || 
             actualPrice < expectedPrice - state.priceDeviationThreshold) 
             revert InvalidPrice(expectedPrice, actualPrice);
-    }
+    } 
 }

@@ -1,14 +1,14 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.24;
 
-import "./AMMPool.sol";
-import "@openzeppelin/contracts-upgradeable/utils/AddressUpgradeable.sol";
-import "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
-import "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
-import "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
-import "@openzeppelin/contracts-upgradeable/security/ReentrancyGuardUpgradeable.sol";
-import "@openzeppelin/contracts-upgradeable/token/ERC20/IERC20Upgradeable.sol";
-import {ICommonStructs} from "./Interfaces.sol";
+import {AMMPool} from "./AMMPool.sol";
+import {AddressUpgradeable} from "@openzeppelin/contracts-upgradeable/utils/AddressUpgradeable.sol";
+import {OwnableUpgradeable} from "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
+import {Initializable} from "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
+import {UUPSUpgradeable} from "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
+import {ReentrancyGuardUpgradeable} from "@openzeppelin/contracts-upgradeable/security/ReentrancyGuardUpgradeable.sol";
+import {IERC20Upgradeable} from "@openzeppelin/contracts-upgradeable/token/ERC20/IERC20Upgradeable.sol";
+import {ICommonStructs, IChainlinkOracle, ICrossChainMessenger, IPriceOracle} from "./Interfaces.sol";
 
 /// @title PoolFactory - An upgradeable factory for deploying AMM pools with CREATE2
 /// @notice Creates and manages AMM pools with deterministic addresses, cross-chain support, and enhanced governance
@@ -285,19 +285,19 @@ contract PoolFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable, Reen
         uint16 chainId,
         bytes32 salt
     );
-    event BatchPoolsCreated(uint256 poolCount, uint16 chainId);
+    event BatchPoolsCreated(uint256 poolCount, uint64 chainId);
     event PauseToggled(bool paused);
-    event ChainPaused(uint16 indexed chainId, address indexed caller);
-    event ChainUnpaused(uint16 indexed chainId, address indexed caller);
+    event ChainPaused(uint64 indexed chainId, address indexed caller);
+    event ChainUnpaused(uint64 indexed chainId, address indexed caller);
     event TreasuryUpdated(address indexed newTreasury);
     event TokenBridgeUpdated(address indexed newTokenBridge);
     event CrossChainMessengerUpdated(uint8 indexed messengerType, address indexed newMessenger);
     event AxelarGasServiceUpdated(address indexed newGasService);
-    event ChainIdMappingUpdated(uint16 chainId, string axelarChain);
-    event WormholeTrustedSenderUpdated(uint16 chainId, bytes32 senderAddress);
+    event ChainIdMappingUpdated(uint64 chainId, string axelarChain);
+    event WormholeTrustedSenderUpdated(uint64 chainId, bytes32 senderAddress);
     event DefaultTimelockUpdated(uint256 newTimelock);
     event DefaultTargetReserveRatioUpdated(uint256 newRatio);
-    event TrustedRemoteFactoryAdded(uint16 indexed chainId, bytes factoryAddress);
+    event TrustedRemoteFactoryAdded(uint64 indexed chainId, bytes factoryAddress);
     event GovernanceProposalCreated(
         uint256 indexed proposalId,
         address target,
@@ -312,15 +312,15 @@ contract PoolFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable, Reen
     event Voted(uint256 indexed proposalId, address indexed voter, bool inFavor, uint256 votingPower);
     event BatchVoted(address indexed voter, uint256[] proposalIds, bool[] inFavor, uint256 votingPower);
     event VotingClosed(uint256 indexed proposalId);
-    event FailedMessageStored(uint256 indexed messageId, uint16 dstChainId, bytes payload, uint8 messengerType);
-    event FailedMessageRetried(uint256 indexed messageId, uint16 dstChainId, uint256 retries, uint8 messengerType);
+    event FailedMessageStored(uint256 indexed messageId, uint64 dstChainId, bytes payload, uint8 messengerType);
+    event FailedMessageRetried(uint256 indexed messageId, uint64 dstChainId, uint256 retries, uint8 messengerType);
     event FailedMessageRecovered(uint256 indexed messageId, address indexed recipient);
-    event CrossChainSyncSent(uint16 indexed chainId, bytes payload, uint8 messengerType);
-    event CrossChainPoolUpdated(uint16 indexed srcChainId, address tokenA, address tokenB, address pool);
+    event CrossChainSyncSent(uint64 indexed chainId, bytes payload, uint8 messengerType);
+    event CrossChainPoolUpdated(uint64 indexed srcChainId, address tokenA, address tokenB, address pool);
     event VotingParametersUpdated(uint256 votingPeriod, uint256 minimumProposalPower, uint256 quorumThreshold);
     event GovernanceTokenUpdated(address indexed newGovernanceToken);
-    event OracleRelayerUpdated(uint16 indexed chainId, address oracle, address relayer);
-    event TimelockUpdated(uint16 indexed chainId, uint256 timelock);
+    event OracleRelayerUpdated(uint64 indexed chainId, address oracle, address relayer);
+    event TimelockUpdated(uint64 indexed chainId, uint256 timelock);
     event VoteDelegated(address indexed delegator, address indexed delegate, uint256 expiry);
     event DelegationRevoked(address indexed delegator, address indexed delegate);
     event MinTimelockUpdated(uint256 minTimelock);
@@ -340,7 +340,7 @@ contract PoolFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable, Reen
     event GovernanceTokenSupplyUpdated(uint256 newSupply);
     event OracleOverrideToggled(bool enabled);
     event CircuitBreakerToggled(bool enabled);
-    event FallbackOraclesUpdated(uint16 indexed chainId, address[] oracles);
+    event FallbackOraclesUpdated(uint64 indexed chainId, address[] oracles);
     event ProposalCooldownUpdated(uint256 newCooldown);
     event ProposalFeeUpdated(uint256 newFee);
     event EmergencyFlagProposed(uint256 indexed proposalId, bool oracleOverride, bool circuitBreaker, uint256 proposedAt);
@@ -640,7 +640,7 @@ function initialize(
         address tokenA,
         address tokenB,
         address primaryPriceOracle,
-        uint16 chainId,
+        uint64 chainId,
         bytes calldata adapterParams,
         bytes32 customSalt
     ) external payable whenNotPaused whenChainNotPaused(chainId) whenCircuitBreakerNotTriggered nonReentrant returns (address pool) {
@@ -654,7 +654,7 @@ function initialize(
     function batchCreatePools(
         address[2][] calldata tokens,
         address[] calldata primaryPriceOracles,
-        uint16[] calldata chainIds,
+        uint64[] calldata chainIds,
         bytes[] calldata adapterParams,
         bytes32[] calldata customSalts
     ) external payable whenNotPaused whenCircuitBreakerNotTriggered nonReentrant returns (address[] memory pools) {
@@ -691,7 +691,7 @@ function initialize(
     function predictPoolAddress(
         address tokenA,
         address tokenB,
-        uint16 chainId,
+        uint64 chainId,
         bytes32 customSalt
     ) external view returns (address pool) {
         (address token0, address token1) = tokenA < tokenB ? (tokenA, tokenB) : (tokenB, tokenA);
@@ -714,7 +714,7 @@ function initialize(
 
     /// @notice Gets the estimated cross-chain fee
     function getEstimatedCrossChainFee(
-        uint16 dstChainId,
+        uint64 dstChainId,
         bytes calldata payload,
         bytes calldata adapterParams
     ) public view returns (uint256 nativeFee, uint256 zroFee) {
@@ -797,7 +797,7 @@ function initialize(
 
     /// @notice Synchronizes pool data with a remote chain
     function syncCrossChainPools(
-        uint16 chainId,
+        uint64 chainId,
         bytes calldata adapterParams,
         uint64 nonce
     ) external payable whenCircuitBreakerNotTriggered nonReentrant {
@@ -863,7 +863,7 @@ function initialize(
 
     /// @notice Receives cross-chain pool updates
     function receiveCrossChainPoolUpdate(
-        uint16 srcChainId,
+        uint64 srcChainId,
         bytes calldata srcAddress,
         bytes calldata payload
     ) external whenCircuitBreakerNotTriggered nonReentrant {
@@ -1096,7 +1096,7 @@ function initialize(
 }
 
     /// @notice Selects an existing oracle/relayer pair
-    function selectOracleRelayer(uint16 chainId, uint256 index) external onlyGovernance {
+    function selectOracleRelayer(uint64 chainId, uint256 index) external onlyGovernance {
         if (index >= chainOracles[chainId].length || index >= chainRelayers[chainId].length)
             revert InvalidOracleRelayer(address(0), address(0));
         selectedOracle[chainId] = chainOracles[chainId][index];
@@ -1105,7 +1105,7 @@ function initialize(
     }
 
     /// @notice Updates timelock for a chain
-    function updateTimelock(uint16 chainId, uint256 timelock) external onlyGovernance {
+    function updateTimelock(uint64 chainId, uint256 timelock) external onlyGovernance {
         if (timelock < minTimelock || timelock > maxTimelock) revert InvalidTimelock(timelock, minTimelock, maxTimelock);
         timelocks[chainId] = timelock;
         emit TimelockUpdated(chainId, timelock);
@@ -1134,14 +1134,14 @@ function initialize(
     }
 
     /// @notice Updates chain ID to Axelar chain mapping
-    function updateChainIdMapping(uint16 chainId, string calldata axelarChain) external onlyGovernance {
+    function updateChainIdMapping(uint64 chainId, string calldata axelarChain) external onlyGovernance {
         chainIdToAxelarChain[chainId] = axelarChain;
         axelarChainToChainId[axelarChain] = chainId;
         emit ChainIdMappingUpdated(chainId, axelarChain);
     }
 
     /// @notice Updates wormhole trusted sender
-    function updateWormholeTrustedSender(uint16 chainId, bytes32 senderAddress) external onlyGovernance {
+    function updateWormholeTrustedSender(uint64 chainId, bytes32 senderAddress) external onlyGovernance {
         wormholeTrustedSenders[chainId] = senderAddress;
         emit WormholeTrustedSenderUpdated(chainId, senderAddress);
     }
@@ -1168,14 +1168,14 @@ function initialize(
     }
 
     /// @notice Pauses a specific chain
-    function pauseChain(uint16 chainId) external onlyGovernance {
+    function pauseChain(uint64 chainId) external onlyGovernance {
         if (chainPaused[chainId]) revert ChainPausedError(chainId);
         chainPaused[chainId] = true;
         emit ChainPaused(chainId, msg.sender);
     }
 
     /// @notice Unpauses a specific chain
-    function unpauseChain(uint16 chainId) external onlyGovernance {
+    function unpauseChain(uint64 chainId) external onlyGovernance {
         if (!chainPaused[chainId]) revert UnauthorizedCaller(msg.sender);
         chainPaused[chainId] = false;
         emit ChainUnpaused(chainId, msg.sender);
@@ -1204,14 +1204,14 @@ function initialize(
     }
 
     /// @notice Adds a trusted remote factory for a chain
-    function addTrustedRemoteFactory(uint16 chainId, bytes calldata factoryAddress) external onlyGovernance {
+    function addTrustedRemoteFactory(uint64 chainId, bytes calldata factoryAddress) external onlyGovernance {
         if (factoryAddress.length == 0) revert InvalidAddress(address(0), "Invalid factory address");
         trustedRemoteFactories[chainId] = factoryAddress;
         emit TrustedRemoteFactoryAdded(chainId, factoryAddress);
     }
 
     /// @notice Removes a trusted remote factory for a chain
-    function removeTrustedRemoteFactory(uint16 chainId) external onlyGovernance {
+    function removeTrustedRemoteFactory(uint64 chainId) external onlyGovernance {
         if (trustedRemoteFactories[chainId].length == 0) revert InvalidAddress(address(0), "No factory set");
         delete trustedRemoteFactories[chainId];
         emit TrustedRemoteFactoryAdded(chainId, bytes(""));
@@ -1267,7 +1267,7 @@ function initialize(
     }
 
     /// @notice Updates fallback oracles for a chain
-    function updateFallbackOracles(uint16 chainId, address[] calldata oracles) external onlyGovernance {
+    function updateFallbackOracles(uint64 chainId, address[] calldata oracles) external onlyGovernance {
         for (uint256 i = 0; i < oracles.length; i++) {
             if (oracles[i] == address(0)) revert InvalidOracle(oracles[i], "Invalid oracle address");
             try IChainlinkOracle(oracles[i]).latestRoundData() returns (
@@ -1347,7 +1347,7 @@ function initialize(
     }
 
     /// @notice Internal function to validate oracles with automatic failover
-    function _validateOracles(address primaryPriceOracle, uint16 chainId, address tokenA, address tokenB) internal returns (address validatedOracle) {
+    function _validateOracles(address primaryPriceOracle, uint64 chainId, address tokenA, address tokenB) internal returns (address validatedOracle) {
     if (primaryPriceOracle == address(0)) revert InvalidOracle(primaryPriceOracle, "Zero address");
     if (!oracleOverride && selectedOracle[chainId] != address(0) && primaryPriceOracle != selectedOracle[chainId])
         revert InvalidOracle(primaryPriceOracle, "Not selected oracle");
@@ -1408,7 +1408,7 @@ function _createSinglePool(
     address tokenA,
     address tokenB,
     address primaryPriceOracle,
-    uint16 chainId,
+    uint64 chainId,
     bytes calldata adapterParams,
     bytes32 customSalt
 ) internal returns (address pool) {

@@ -40,11 +40,11 @@ contract PositionManager is
     address public crossChainMessenger;
     string public baseURI;
     uint8 public messengerType; // 0 = LayerZero, 1 = Axelar, 2 = Wormhole
-    mapping(uint16 => bytes) public trustedRemoteManagers;
-    mapping(uint16 => string) public chainIdToAxelarChain;
+    mapping(uint64 => bytes) public trustedRemoteManagers;
+    mapping(uint64 => string) public chainIdToAxelarChain;
     mapping(uint256 => Position) public positionData;
     mapping(uint256 => bool) public isCrossChainPosition;
-    mapping(uint16 => uint64) public nonces;
+    mapping(uint64 => uint64) public nonces;
     uint256 public failedMessageCount;
     mapping(uint8 => address) public tokenBridges; // Mapping of bridgeType to bridge address
     mapping(uint256 => FeeTracking) public feeTracking; // Tracks fees per position
@@ -56,7 +56,7 @@ contract PositionManager is
         address pool;
         int24 tickLower;
         int24 tickUpper;
-        uint256 liquidity;
+        uint128 liquidity;
         uint16 sourceChainId;
         address tokenA;
         address tokenB;
@@ -123,7 +123,7 @@ contract PositionManager is
     event FailedMessageStored(uint256 indexed messageId, uint16 dstChainId, bytes payload);
     event FailedMessageRetried(uint256 indexed messageId, bytes16 dstChainId, uint256 retries);
     event FailedMessageRetryScheduled(uint256 indexed messageId, uint256 nextRetryTimestamp);
-    event TrustedRemoteManagerUpdated(uint16 indexed chainId, bytes managerAddress);
+    event TrustedRemoteManagerUpdated(uint64 indexed chainId, bytes managerAddress);
     event CrossChainMessengerUpdated(address indexed newMessenger, uint8 messengerType);
     event TokenBridgeUpdated(uint8 indexed bridgeType, address indexed newBridge);
     event BaseURIUpdated(string newBaseURI);
@@ -186,7 +186,7 @@ contract PositionManager is
             address owner,
             int24 tickLower,
             int24 tickUpper,
-            uint256 liquidity,
+            uint128 liquidity,
             ,,
             ,
         ) = IAMMPool(ammPool).positions(positionId);
@@ -227,7 +227,7 @@ contract PositionManager is
                 address owner,
                 int24 tickLower,
                 int24 tickUpper,
-                uint256 liquidity,
+                uint128 liquidity,
                 ,,
                 ,
             ) = IAMMPool(ammPool).positions(positionId);
@@ -289,7 +289,7 @@ contract PositionManager is
 
     function batchTransferToPool(uint256[] calldata tokenIds) external nonReentrant whenNotPaused {
         uint256 length = tokenIds.length;
-        if (length == 0 || length > MAX_TOKEN_SIZE) revert InvalidBatchSize(length);
+        if (length == 0 || length > MAX_BATCH_SIZE) revert InvalidBatchSize(length);
 
         for (uint256 i = 0; i < length; i++) {
             uint256 tokenId = tokenIds[i];
@@ -326,7 +326,7 @@ contract PositionManager is
 
     function collectAndBridgeFees(
         uint256 tokenId,
-        uint16 dstChainId,
+        uint64 dstChainId,
         uint8 bridgeType,
         bytes calldata adapterParams
     ) external payable nonReentrant onlyTokenOwner(tokenId) whenNotPausedCrossChain {
@@ -403,7 +403,7 @@ contract PositionManager is
 
     function batchBridgeFees(
         uint256[] calldata tokenIds,
-        uint16 dstChainId,
+        uint64 dstChainId,
         uint8 bridgeType,
         bytes calldata adapterParams
     ) external payable nonReentrant whenNotPausedCrossChain {
@@ -462,36 +462,36 @@ contract PositionManager is
         }
 
         try ICrossChainMessenger(crossChainMessenger).sendMessage{value: nativeFee}(
-            dstChainId,
-            dstAxelarChain,
-            destinationAddress,
-            payload,
-            adapterParams,
-            payable(msg.sender)
-        ) {
-            if (msg.value > nativeFee) {
-                payable(msg.sender).transfer(msg.value - nativeFee);
-            }
-            nonces[dstChainId]++;
-            emit BatchFeesBridged(msg.sender, tokenIds, total0, total1, dstChainId, bridgeType, nonce);
-        } catch {
-            uint256 messageId = failedMessageCount++;
-            failedMessages[messageId] = FailedMessage(
-                dstChainId = dstChainId,
-                dstAxelarChain = dstAxelarChain,
-                payload = payload,
-                adapterParams = adapterParams,
-                retries = 0,
-                timestamp = block.timestamp,
-                nextRetryTimestamp = block.timestamp + RETRY_DELAY
-            );
-            emit FailedMessageStored(messageId, dstChainId, payload);
-            emit FailedMessageRetryScheduled(messageId, block.timestamp + RETRY_DELAY);
+        dstChainId,
+        dstAxelarChain,
+        destinationAddress,
+        payload,
+        adapterParams,
+        payable(msg.sender)
+    ) {
+        if (msg.value > nativeFee) {
+            payable(msg.sender).transfer(msg.value - nativeFee);
         }
+        nonces[dstChainId]++;
+        emit BatchFeesBridged(msg.sender, tokenIds, total0, total1, dstChainId, bridgeType, nonce);
+    } catch {
+        uint256 messageId = failedMessageCount++;
+        failedMessages[messageId] = FailedMessage({
+            dstChainId: dstChainId,
+            dstAxelarChain: dstAxelarChain,
+            payload: payload,
+            adapterParams: adapterParams,
+            retries: 0,
+            timestamp: block.timestamp,
+            nextRetryTimestamp: block.timestamp + RETRY_DELAY
+        });
+        emit FailedMessageStored(messageId, dstChainId, payload);
+        emit FailedMessageRetryScheduled(messageId, block.timestamp + RETRY_DELAY);
+    }
     }
 
     function bridgeAggregatedFees(
-        uint16 dstChainId,
+        uint64 dstChainId,
         uint8 bridgeType,
         bytes calldata adapterParams
     ) external payable nonReentrant whenNotPausedCrossChain {
@@ -567,7 +567,7 @@ contract PositionManager is
 
     function transferPositionCrossChain(
         uint256 tokenId,
-        uint16 dstChainId,
+        uint64 dstChainId,
         bytes calldata adapterParams
     ) external payable nonReentrant onlyTokenOwner(tokenId) whenNotPausedCrossChain {
         if (!_exists(tokenId)) revert InvalidTokenId(tokenId);
@@ -652,7 +652,7 @@ contract PositionManager is
 
     function batchTransferPositionsCrossChain(
         uint256[] calldata tokenIds,
-        uint16 dstChainId,
+        uint64 dstChainId,
         bytes calldata adapterParams
     ) external payable nonReentrant whenNotPausedCrossChain {
         uint256 length = tokenIds.length;
@@ -750,7 +750,7 @@ contract PositionManager is
     }
 
     function receiveCrossChainPosition(
-        uint16 srcChainId,
+        uint64 srcChainId,
         bytes calldata srcAddress,
         bytes calldata payload
     ) external nonReentrant whenNotPausedCrossChain {
@@ -886,7 +886,7 @@ contract PositionManager is
 
     // --- Governance Functions ---
 
-    function updateTrustedRemoteManager(uint16 chainId, bytes calldata managerAddress) external onlyOwner whenNotPaused {
+    function updateTrustedRemoteManager(uint64 chainId, bytes calldata managerAddress) external onlyOwner whenNotPaused {
         if (chainId == 0) revert InvalidChainId(chainId);
         trustedRemoteManagers[chainId] = managerAddress;
         emit TrustedRemoteManagerUpdated(chainId, managerAddress);
@@ -912,7 +912,7 @@ contract PositionManager is
         emit BaseURIUpdated(newBaseURI);
     }
 
-    function updateChainId(uint16 chainId, string memory axelarChain) external onlyOwner whenNotPaused {
+    function updateChainId(uint64 chainId, string memory axelarChain) external onlyOwner whenNotPaused {
         if (chainId == 0) revert InvalidChainId(chainId);
         chainIdToAxelarChain[chainId] = axelarChain;
     }
@@ -927,7 +927,7 @@ contract PositionManager is
 
     // --- Helper Functions ---
 
-    function _getNonce(uint16 dstChainId) internal returns (uint64) {
+    function _getNonce(uint64 dstChainId) internal returns (uint64) {
         if (messengerType == 0) {
             return ILayerZeroEndpoint(crossChainMessenger).getInboundNonce(dstChainId, trustedRemoteManagers[dstChainId]);
         } else if (messengerType == 1) {
@@ -969,4 +969,5 @@ contract PositionManager is
 
     // --- Storage Gap ---
     uint256[50] private __gap;
-}
+    
+    } 

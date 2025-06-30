@@ -5,14 +5,8 @@ import {ReentrancyGuard} from "@openzeppelin/contracts/security/ReentrancyGuard.
 import {IERC20Upgradeable} from "@openzeppelin/contracts-upgradeable/token/ERC20/IERC20Upgradeable.sol";
 import {SafeERC20Upgradeable} from "@openzeppelin/contracts-upgradeable/token/ERC20/utils/SafeERC20Upgradeable.sol";
 import {AMMPool} from "./AMMPool.sol";
-import {ICrossChainModule} from "./Interfaces.sol";
+import {ICrossChainModule, IPositionManager, ILayerZeroEndpoint, IAxelarGateway, IWormhole, ICrossChainMessenger, ITokenBridge, ICommonStructs} from "./Interfaces.sol";
 import {TickMath} from "@uniswap/v3-core/contracts/libraries/TickMath.sol";
-import {IPositionManager} from "./Interfaces.sol";
-import {ILayerZeroEndpoint} from "./Interfaces.sol";
-import {IAxelarGateway} from "./Interfaces.sol";
-import {IWormhole} from "./Interfaces.sol";
-import {ICrossChainMessenger} from "./Interfaces.sol";
-import {ITokenBridge} from "./Interfaces.sol";
 
 // Interface for CrossChainRetryOracle
 interface ICrossChainRetryOracle {
@@ -29,15 +23,22 @@ interface ICrossChainRetryOracle {
         int256 lastTokenPrice;
     }
 
-    function getNetworkStatus(uint64 chainId) external view returns (NetworkStatus memory);
-    function requestNetworkStatusUpdate(uint64 chainId, bytes32 jobId, uint256 fee) external returns (bytes32);
+    function getNetworkStatus(uint16 chainId) external view returns (NetworkStatus memory);
+    function requestNetworkStatusUpdate(uint16 chainId, bytes32 jobId, uint256 fee) external returns (bytes32);
 }
 
-/// @title CrossChainModule - Handles cross-chain messaging and token bridging for AMM pool
+/// @title CrossChainModule
 /// @notice Manages cross-chain liquidity addition, token bridging, message validation, and retry mechanisms with oracle integration
 /// @dev Interacts with AMMPool for state access and token bridging, secured with access control, uses CrossChainRetryOracle for retry decisions
 contract CrossChainModule is ReentrancyGuard {
     using SafeERC20Upgradeable for IERC20Upgradeable;
+
+    // Constants
+    uint256 private constant PRICE_DENOMINATOR = 1e18;
+    uint256 private constant MAX_BATCH_SIZE_LIMIT = 100;
+    uint256 private constant MIN_GAS_PER_MESSAGE = 100_000;
+    uint8 private constant HIGH_CONGESTION_LEVEL = 8;
+    uint256 private constant TIMELOCK_DIVISOR = 4;
 
     // Reference to main AMMPool contract
     AMMPool public immutable pool;
@@ -51,24 +52,7 @@ contract CrossChainModule is ReentrancyGuard {
     // LINK token address for oracle requests
     address public immutable linkToken;
 
-    // Constructor: Initializes pool and oracle references
-    constructor(
-        address _pool,
-        address _retryOracle,
-        bytes32 _oracleJobId,
-        address _linkToken
-    ) {
-        if (_pool == address(0)) revert InvalidAddress(_pool, "Invalid pool address");
-        if (_retryOracle == address(0)) revert InvalidAddress(_retryOracle, "Invalid oracle address");
-        if (_oracleJobId == bytes32(0)) revert InvalidAddress(address(0), "Invalid job ID");
-        if (_linkToken == address(0)) revert InvalidAddress(_linkToken, "Invalid LINK token address");
-        pool = AMMPool(_pool);
-        retryOracle = ICrossChainRetryOracle(_retryOracle);
-        oracleJobId = _oracleJobId;
-        linkToken = _linkToken;
-    }
-
-    // --- Errors (cross-chain related) ---
+    // --- Errors ---
     error Unauthorized();
     error InvalidChainId(uint16 chainId);
     error InvalidAxelarChain(string axelarChain);
@@ -92,33 +76,58 @@ contract CrossChainModule is ReentrancyGuard {
     error InvalidBridgeType(uint8 bridgeType);
     error InvalidMessage();
     error InvalidTickRange(int24 tickLower, int24 tickUpper);
-    error OracleNotConfigured(uint64 chainId);
-    error RetryNotRecommended(uint64 chainId);
+    error OracleNotConfigured(uint16 chainId);
+    error RetryNotRecommended(uint16 chainId);
     error InsufficientLinkBalance(uint256 balance, uint256 required);
     error OracleRequestFailed(bytes32 requestId);
+    error ZeroPrice();
+    error ZeroReserve();
+    error NoMessengerConfigured();
 
-    // --- Events (cross-chain related, emitted via AMMPool) ---
-    // Note: Events are emitted through AMMPool to maintain compatibility
-    // - CrossChainLiquiditySent
-    // - CrossChainLiquidityReceived
-    // - CrossChainSwap
-    // - FailedMessageStored
-    // - FailedMessageRetried
-    // - FailedMessageRetryScheduled
-    // - BatchMessagesSent
-    // - BatchRetryProcessed
+    /// @notice Initializes the contract with pool and oracle references
+    /// @param _pool Address of the AMMPool contract
+    /// @param _retryOracle Address of the CrossChainRetryOracle contract
+    /// @param _oracleJobId Chainlink job ID for network status updates
+    /// @param _linkToken Address of the LINK token
+    constructor(
+        address _pool,
+        address _retryOracle,
+        bytes32 _oracleJobId,
+        address _linkToken
+    ) {
+        if (_pool == address(0)) revert InvalidAddress(_pool, "Invalid pool address");
+        if (_retryOracle == address(0)) revert InvalidAddress(_retryOracle, "Invalid oracle address");
+        if (_oracleJobId == bytes32(0)) revert InvalidAddress(address(0), "Invalid job ID");
+        if (_linkToken == address(0)) revert InvalidAddress(_linkToken, "Invalid LINK token address");
+        pool = AMMPool(_pool);
+        retryOracle = ICrossChainRetryOracle(_retryOracle);
+        oracleJobId = _oracleJobId;
+        linkToken = _linkToken;
+
+        // Approve token bridge for maximum allowance
+        address tokenBridge = pool.tokenBridge();
+        if (tokenBridge != address(0)) {
+            IERC20Upgradeable(pool.tokenA()).safeApprove(tokenBridge, type(uint256).max);
+            IERC20Upgradeable(pool.tokenB()).safeApprove(tokenBridge, type(uint256).max);
+        }
+    }
 
     // --- Modifiers ---
+
+    /// @notice Restricts access to the AMMPool contract
     modifier onlyPool() {
         if (msg.sender != address(pool)) revert Unauthorized();
         _;
     }
 
+    /// @notice Ensures the contract is not paused
     modifier whenNotPaused() {
         if (pool.paused()) revert AMMPool.ContractPaused();
         _;
     }
 
+    /// @notice Ensures the specified chain is not paused
+    /// @param chainId The chain ID to check
     modifier whenChainNotPaused(uint16 chainId) {
         if (pool.chainPaused(chainId)) revert ChainPausedError(chainId);
         _;
@@ -141,6 +150,7 @@ contract CrossChainModule is ReentrancyGuard {
     ) external payable nonReentrant onlyPool whenNotPaused whenChainNotPaused(dstChainId) {
         if (amountA == 0 || amountB == 0) revert InvalidAmount(amountA, amountB);
         if (pool.trustedRemotePools(dstChainId).length == 0) revert InvalidChainId(dstChainId);
+        if (adapterParams.length == 0) revert InvalidAdapterParams();
 
         // Transfer tokens to AMMPool
         IERC20Upgradeable(pool.tokenA()).safeTransferFrom(provider, address(pool), amountA);
@@ -200,6 +210,7 @@ contract CrossChainModule is ReentrancyGuard {
         if (amountA == 0 && amountB == 0) revert InvalidAmount(amountA, amountB);
         if (!_isValidTickRange(tickLower, tickUpper)) revert InvalidTickRange(tickLower, tickUpper);
         if (pool.trustedRemotePools(dstChainId).length == 0) revert InvalidChainId(dstChainId);
+        if (adapterParams.length == 0) revert InvalidAdapterParams();
 
         // Transfer tokens to AMMPool
         IERC20Upgradeable(pool.tokenA()).safeTransferFrom(provider, address(pool), amountA);
@@ -258,6 +269,7 @@ contract CrossChainModule is ReentrancyGuard {
         if (inputToken != pool.tokenA() && inputToken != pool.tokenB()) revert InvalidToken(inputToken);
         if (amountIn == 0) revert InvalidAmount(amountIn, 0);
         if (pool.trustedRemotePools(dstChainId).length == 0) revert InvalidChainId(dstChainId);
+        if (adapterParams.length == 0) revert InvalidAdapterParams();
 
         // Transfer input tokens to AMMPool
         IERC20Upgradeable(inputToken).safeTransferFrom(user, address(pool), amountIn);
@@ -279,8 +291,10 @@ contract CrossChainModule is ReentrancyGuard {
             block.timestamp + timelock
         );
 
-        // Estimate output amount (simplified; use oracle in production)
-        amountOut = amountIn * pool.lastPrice() / 1e18;
+        // Estimate output amount
+        uint256 lastPrice = pool.lastPrice();
+        if (lastPrice == 0) revert ZeroPrice();
+        amountOut = (amountIn * lastPrice) / PRICE_DENOMINATOR;
 
         _sendCrossChainMessage(dstChainId, axelarChain, destinationAddress, payload, adapterParams, nonce, timelock, 0);
         pool.emitCrossChainSwap(
@@ -310,7 +324,8 @@ contract CrossChainModule is ReentrancyGuard {
     ) external nonReentrant onlyPool whenNotPaused whenChainNotPaused(srcChainId) {
         _validateCrossChainMessage(srcChainId, srcAddress, payload, additionalParams);
 
-        (
+        // Try decoding as a liquidity message (10 components)
+        try this.decodeLiquidityPayload(payload) returns (
             address provider,
             uint256 amountA,
             uint256 amountB,
@@ -321,57 +336,117 @@ contract CrossChainModule is ReentrancyGuard {
             int24 tickUpper,
             address receivedTokenA,
             address receivedTokenB
-        ) = abi.decode(payload, (address, uint256, uint256, uint64, uint256, bool, int24, int24, address, address));
+        ) {
+            if (pool.usedNonces(srcChainId, nonce)) revert InvalidNonce(nonce, nonce);
+            if (block.timestamp < timelock) revert TimelockNotExpired(block.timestamp, timelock);
+            if (amountA == 0 && amountB == 0) revert InvalidAmount(amountA, amountB);
+            if (isConcentrated && (receivedTokenA != pool.tokenA() || receivedTokenB != pool.tokenB())) revert InvalidToken(receivedTokenA);
 
-        if (pool.usedNonces(srcChainId, nonce)) revert InvalidNonce(nonce, nonce);
-        if (block.timestamp < timelock) revert TimelockNotExpired(block.timestamp, timelock);
-        if (amountA == 0 && amountB == 0) revert InvalidAmount(amountA, amountB);
-        if (isConcentrated && (receivedTokenA != pool.tokenA() || receivedTokenB != pool.tokenB())) revert InvalidToken(receivedTokenA);
+            pool.setUsedNonces(srcChainId, nonce, true);
 
-        pool.setUsedNonces(srcChainId, nonce, true);
+            _receiveBridgedTokens(pool.tokenA(), amountA);
+            _receiveBridgedTokens(pool.tokenB(), amountB);
 
-        _receiveBridgedTokens(pool.tokenA(), amountA);
-        _receiveBridgedTokens(pool.tokenB(), amountB);
-
-        uint256 liquidity;
-        uint256 positionId;
-        if (isConcentrated) {
-            if (!_isValidTickRange(tickLower, tickUpper)) revert InvalidTickRange(tickLower, tickUpper);
-            liquidity = pool.getLiquidityForAmounts(tickLower, tickUpper, amountA, amountB);
-            if (liquidity > type(uint128).max) revert InvalidAmount(liquidity, type(uint128).max);
-            positionId = pool.positionCounter();
-            AMMPool.Position memory position = AMMPool.Position({
-                owner: provider,
-                tickLower: tickLower,
-                tickUpper: tickUpper,
-                liquidity: liquidity,
-                feeGrowthInside0LastX128: pool.getFeeGrowthInside(tickLower, tickUpper, 0),
-                feeGrowthInside1LastX128: pool.getFeeGrowthInside(tickLower, tickUpper, 1),
-                tokensOwed0: 0,
-                tokensOwed1: 0
-            });
-            pool.setPosition(positionId, position);
-            pool.incrementPositionCounter();
-            pool.updateTick(tickLower, liquidity, true);
-            pool.updateTick(tickUpper, liquidity, false);
-            IPositionManager(pool.positionManager()).mintPosition(positionId, provider);
-            pool.emitPositionCreated(positionId, provider, tickLower, tickUpper, liquidity);
-            pool.checkAndMoveToFallback(positionId);
-        } else {
-            if (pool.totalLiquidity() == 0) {
-                liquidity = pool.sqrt(amountA * amountB);
+            uint256 liquidity;
+            uint256 positionId;
+            if (isConcentrated) {
+                if (!_isValidTickRange(tickLower, tickUpper)) revert InvalidTickRange(tickLower, tickUpper);
+                // Call the wrapper function in AMMPool
+                liquidity = pool.getLiquidityForAmounts(tickLower, tickUpper, amountA, amountB, pool.getCurrentTick());
+                if (liquidity > type(uint128).max) revert InvalidAmount(liquidity, type(uint128).max);
+                positionId = pool.positionCounter();
+                
+                // Destructure the tuple returned by getFeeGrowthInside
+                (uint128 feesOwed0, uint128 feesOwed1) = pool.getFeeGrowthInside(tickLower, tickUpper, positionId);
+                
+                AMMPool.Position memory position = AMMPool.Position({
+                    owner: provider,
+                    tickLower: tickLower,
+                    tickUpper: tickUpper,
+                    liquidity: uint128(liquidity),
+                    feeGrowthInside0LastX128: feesOwed0,
+                    feeGrowthInside1LastX128: feesOwed1,
+                    tokensOwed0: 0,
+                    tokensOwed1: 0
+                });
+                pool.setPosition(positionId, position);
+                pool.incrementPositionCounter();
+                pool.updateTick(tickLower, liquidity, true);
+                pool.updateTick(tickUpper, liquidity, false);
+                IPositionManager(pool.positionManager()).mintPosition(positionId, provider);
+                pool.emitPositionCreated(positionId, provider, tickLower, tickUpper, uint128(liquidity));
+                pool.checkAndMoveToFallback(positionId);
             } else {
-                liquidity = (amountA * pool.totalLiquidity()) / pool.getReserves().reserveA;
-                uint256 liquidityB = (amountB * pool.totalLiquidity()) / pool.getReserves().reserveB;
-                liquidity = liquidity < liquidityB ? liquidity : liquidityB;
+                // Fetch reserves as a tuple, not a struct
+                (uint64 reserveA, uint64 reserveB) = pool.getReserves();
+                if (reserveA == 0 || reserveB == 0) revert ZeroReserve();
+                if (pool.totalLiquidity() == 0) {
+                    liquidity = _sqrt(amountA * amountB);
+                } else {
+                    liquidity = (amountA * pool.totalLiquidity()) / reserveA;
+                    uint256 liquidityB = (amountB * pool.totalLiquidity()) / reserveB;
+                    liquidity = liquidity < liquidityB ? liquidity : liquidityB;
+                }
+                pool.updateLiquidityBalance(provider, liquidity, true);
+                pool.incrementTotalLiquidity(liquidity);
+                pool.updateCrossChainReserves(amountA, amountB);
             }
-            pool.updateLiquidityBalance(provider, liquidity, true);
-            pool.incrementTotalLiquidity(liquidity);
-            pool.updateCrossChainReserves(amountA, amountB);
-        }
 
-        pool.updateVolatility();
-        pool.emitCrossChainLiquidityReceived(provider, amountA, amountB, srcChainId, nonce, _getMessengerType());
+            pool.updateVolatility();
+            pool.emitCrossChainLiquidityReceived(provider, amountA, amountB, srcChainId, nonce, _getMessengerType());
+        } catch {
+            // Try decoding as a swap message (6 components)
+            (
+                address user,
+                address inputToken,
+                uint256 amountIn,
+                uint256 minAmountOut,
+                uint64 nonce,
+                uint256 timelock
+            ) = abi.decode(payload, (address, address, uint256, uint256, uint64, uint256));
+
+            if (pool.usedNonces(srcChainId, nonce)) revert InvalidNonce(nonce, nonce);
+            if (block.timestamp < timelock) revert TimelockNotExpired(block.timestamp, timelock);
+            if (inputToken != pool.tokenA() && inputToken != pool.tokenB()) revert InvalidToken(inputToken);
+            if (amountIn == 0) revert InvalidAmount(amountIn, 0);
+
+            pool.setUsedNonces(srcChainId, nonce, true);
+
+            _receiveBridgedTokens(inputToken, amountIn);
+
+            // Perform the swap
+            uint256 amountOut = pool.swap(inputToken, amountIn, minAmountOut, user);
+            pool.emitCrossChainSwap(
+                user,
+                inputToken,
+                amountIn,
+                amountOut,
+                srcChainId,
+                nonce,
+                timelock,
+                _getMessengerType()
+            );
+        }
+    }
+
+    // Helper function to decode liquidity payload
+    function decodeLiquidityPayload(bytes calldata payload)
+        external
+        pure
+        returns (
+            address provider,
+            uint256 amountA,
+            uint256 amountB,
+            uint64 nonce,
+            uint256 timelock,
+            bool isConcentrated,
+            int24 tickLower,
+            int24 tickUpper,
+            address receivedTokenA,
+            address receivedTokenB
+        )
+    {
+        return abi.decode(payload, (address, uint256, uint256, uint64, uint256, bool, int24, int24, address, address));
     }
 
     /// @notice Sends batched cross-chain messages
@@ -393,7 +468,7 @@ contract CrossChainModule is ReentrancyGuard {
     /// @notice Retries a single failed cross-chain message
     /// @param messageId The ID of the failed message
     function retryFailedMessage(uint256 messageId) external payable nonReentrant onlyPool {
-        AMMPool.FailedMessage memory message = pool.getFailedMessage(messageId);
+        ICommonStructs.FailedMessage memory message = pool.getFailedMessage(messageId);
         if (message.retries >= pool.MAX_RETRIES()) revert MaxRetriesExceeded(messageId);
         if (message.timestamp == 0) revert MessageNotFailed(messageId);
         if (block.timestamp < message.nextRetryTimestamp) revert RetryNotReady(messageId, message.nextRetryTimestamp);
@@ -448,7 +523,9 @@ contract CrossChainModule is ReentrancyGuard {
     /// @notice Retries multiple failed cross-chain messages in a batch
     /// @param messageIds Array of failed message IDs
     function retryFailedMessagesBatch(uint256[] calldata messageIds) external payable nonReentrant onlyPool {
-        if (messageIds.length == 0 || messageIds.length > pool.MAX_BATCH_SIZE()) revert InvalidBatchSize(messageIds.length);
+        if (messageIds.length == 0 || messageIds.length > pool.MAX_BATCH_SIZE() || messageIds.length > MAX_BATCH_SIZE_LIMIT) {
+            revert InvalidBatchSize(messageIds.length);
+        }
 
         uint256 totalNativeFee;
         uint256 successfulRetries;
@@ -457,7 +534,7 @@ contract CrossChainModule is ReentrancyGuard {
 
         // Estimate total fees and check oracle status
         for (uint256 i = 0; i < messageIds.length; i++) {
-            AMMPool.FailedMessage memory message = pool.getFailedMessage(messageIds[i]);
+            ICommonStructs.FailedMessage memory message = pool.getFailedMessage(messageIds[i]);
             if (message.retries >= pool.MAX_RETRIES() || message.timestamp == 0 || block.timestamp < message.nextRetryTimestamp) continue;
 
             // Consult oracle for retry recommendation
@@ -479,14 +556,14 @@ contract CrossChainModule is ReentrancyGuard {
 
         if (msg.value < totalNativeFee) revert InsufficientFee(msg.value, totalNativeFee);
 
-        uint256 gasPerMessage = gasleft() / messageIds.length;
+        uint256 gasPerMessage = MIN_GAS_PER_MESSAGE;
         uint256 refundAmount = msg.value;
 
         // Process retries
         for (uint256 i = 0; i < messageIds.length; i++) {
             if (gasleft() < gasPerMessage) revert InsufficientGasForBatch(gasPerMessage, gasleft());
 
-            AMMPool.FailedMessage memory message = pool.getFailedMessage(messageIds[i]);
+            ICommonStructs.FailedMessage memory message = pool.getFailedMessage(messageIds[i]);
             if (message.retries >= pool.MAX_RETRIES() || message.timestamp == 0 || block.timestamp < message.nextRetryTimestamp) {
                 failedRetries++;
                 continue;
@@ -555,7 +632,7 @@ contract CrossChainModule is ReentrancyGuard {
     /// @param chainId The target chain ID
     /// @param fee The LINK fee for the request
     /// @return requestId The Chainlink request ID
-    function requestOracleNetworkStatusUpdate(uint64 chainId, uint256 fee) external onlyPool returns (bytes32 requestId) {
+    function requestOracleNetworkStatusUpdate(uint16 chainId, uint256 fee) external onlyPool returns (bytes32 requestId) {
         uint256 linkBalance = IERC20Upgradeable(linkToken).balanceOf(address(this));
         if (linkBalance < fee) revert InsufficientLinkBalance(linkBalance, fee);
 
@@ -578,7 +655,6 @@ contract CrossChainModule is ReentrancyGuard {
         if (bridgeType == 0) revert InvalidBridgeType(bridgeType);
 
         address tokenBridge = pool.tokenBridge();
-        IERC20Upgradeable(token).safeApprove(tokenBridge, amount);
         if (bridgeType == 1) {
             ITokenBridge(tokenBridge).burn(token, amount, recipient, dstChainId);
         } else if (bridgeType == 2) {
@@ -624,6 +700,7 @@ contract CrossChainModule is ReentrancyGuard {
         uint256 timelock,
         uint8 messengerType
     ) internal {
+        if (adapterParams.length == 0) revert InvalidAdapterParams();
         address messenger = pool.crossChainMessengers(messengerType);
         if (messenger == address(0)) revert MessengerNotSet(messengerType);
 
@@ -655,7 +732,7 @@ contract CrossChainModule is ReentrancyGuard {
             uint256 messageId = pool.failedMessageCount();
             pool.setFailedMessage(
                 messageId,
-                AMMPool.FailedMessage({
+                ICommonStructs.FailedMessage({
                     dstChainId: dstChainId,
                     dstAxelarChain: axelarChain,
                     payload: payload,
@@ -667,7 +744,7 @@ contract CrossChainModule is ReentrancyGuard {
                 })
             );
             pool.incrementFailedMessageCount();
-            pool.emitFailedMessageStored(messageId, dstChainId, abi.encodePacked(msg.sender), block.timestamp, messengerType);
+            pool.emitFailedMessageStored(messageId, dstChainId, axelarChain, block.timestamp, messengerType);
         }
     }
 
@@ -712,7 +789,10 @@ contract CrossChainModule is ReentrancyGuard {
         } else if (messengerType == 2) {
             // Wormhole
             (uint16 emitterChainId, bytes32 emitterAddress, uint64 sequence, bytes memory wormholePayload) = IWormhole(messenger).parseAndVerifyVM(additionalParams);
-            if (emitterChainId != srcChainId || emitterAddress != pool.wormholeTrustedSenders(srcChainId) || keccak256(wormholePayload) != keccak256(payload)) {
+            if (emitterChainId != srcChainId || emitterAddress != pool.wormholeTrustedSenders(srcChainId)) {
+                revert InvalidWormholeVAA();
+            }
+            if (keccak256(wormholePayload) != keccak256(payload)) {
                 revert InvalidWormholeVAA();
             }
         } else {
@@ -720,7 +800,7 @@ contract CrossChainModule is ReentrancyGuard {
         }
     }
 
-    /// @notice Internal function to process batched cross-chain messages
+    /// @notice Processes batched cross-chain messages
     /// @param dstChainIds Array of destination chain IDs
     /// @param dstAxelarChains Array of destination Axelar chain names
     /// @param payloads Array of message payloads
@@ -736,7 +816,7 @@ contract CrossChainModule is ReentrancyGuard {
         uint8 messengerType
     ) internal {
         uint256 batchSize = dstChainIds.length;
-        if (batchSize == 0 || batchSize > pool.MAX_BATCH_SIZE()) revert InvalidBatchSize(batchSize);
+        if (batchSize == 0 || batchSize > pool.MAX_BATCH_SIZE() || batchSize > MAX_BATCH_SIZE_LIMIT) revert InvalidBatchSize(batchSize);
         if (
             batchSize != dstAxelarChains.length ||
             batchSize != payloads.length ||
@@ -753,6 +833,7 @@ contract CrossChainModule is ReentrancyGuard {
             if (bytes(dstAxelarChains[i]).length == 0) revert InvalidAxelarChain(dstAxelarChains[i]);
             if (payloads[i].length == 0) revert InvalidMessage();
             if (pool.chainPaused(dstChainIds[i])) revert ChainPausedError(dstChainIds[i]);
+            if (adapterParams[i].length == 0) revert InvalidAdapterParams();
             if (keccak256(bytes(pool.chainIdToAxelarChain(dstChainIds[i]))) != keccak256(bytes(dstAxelarChains[i]))) {
                 revert InvalidAxelarChain(dstAxelarChains[i]);
             }
@@ -769,7 +850,7 @@ contract CrossChainModule is ReentrancyGuard {
 
         if (msg.value < totalNativeFee) revert InsufficientFee(msg.value, totalNativeFee);
 
-        uint256 gasPerMessage = gasleft() / batchSize;
+        uint256 gasPerMessage = MIN_GAS_PER_MESSAGE;
         uint256 refundAmount = msg.value;
 
         for (uint256 i = 0; i < batchSize; ++i) {
@@ -802,7 +883,7 @@ contract CrossChainModule is ReentrancyGuard {
                 uint256 messageId = pool.failedMessageCount();
                 pool.setFailedMessage(
                     messageId,
-                    AMMPool.FailedMessage({
+                    ICommonStructs.FailedMessage({
                         dstChainId: dstChainIds[i],
                         dstAxelarChain: dstAxelarChains[i],
                         payload: modifiedPayload,
@@ -817,7 +898,7 @@ contract CrossChainModule is ReentrancyGuard {
                 pool.emitFailedMessageStored(
                     messageId,
                     dstChainIds[i],
-                    abi.encodePacked(msg.sender),
+                    dstAxelarChains[i],
                     block.timestamp,
                     messengerType
                 );
@@ -856,29 +937,38 @@ contract CrossChainModule is ReentrancyGuard {
         if (timelock < pool.MIN_TIMELOCK() || timelock > pool.MAX_TIMELOCK()) {
             timelock = pool.MIN_TIMELOCK();
         }
+        if (timelock == 0) revert InvalidAmount(timelock, 0);
         if (pool.emaVolatility() > pool.getVolatilityThreshold()) {
             timelock += timelock / 2;
             if (timelock > pool.MAX_TIMELOCK()) timelock = pool.MAX_TIMELOCK();
         }
 
         // Adjust timelock based on oracle network status
-        try retryOracle.getNetworkStatus(uint64(chainId)) returns (ICrossChainRetryOracle.NetworkStatus memory status) {
-            if (status.congestionLevel >= 8) {
-                timelock += timelock / 4; // Increase timelock by 25% for high congestion
+        try retryOracle.getNetworkStatus(chainId) returns (ICrossChainRetryOracle.NetworkStatus memory status) {
+            if (status.congestionLevel >= HIGH_CONGESTION_LEVEL) {
+                timelock += timelock / TIMELOCK_DIVISOR; // Increase timelock by 25% for high congestion
                 if (timelock > pool.MAX_TIMELOCK()) timelock = pool.MAX_TIMELOCK();
             }
         } catch {
-            // Fallback to default timelock if oracle query fails
+            // Fallback to default timelock without emitting event, as OracleQueryFailed is not defined in IAMMPool
         }
     }
 
-    /// @notice Gets the default messenger type
-    /// @return messengerType The messenger type
-    function _getMessengerType() internal view returns (uint8 messengerType) {
-        if (pool.crossChainMessengers(0) != address(0)) return 0; // LayerZero
-        if (pool.crossChainMessengers(1) != address(0)) return 1; // Axelar
-        if (pool.crossChainMessengers(2) != address(0)) return 2; // Wormhole
-        revert MessengerNotSet(0);
+    /// @notice Computes the square root of a uint256 using the Babylonian method
+    /// @param y The number to compute the square root of
+    /// @return z The square root of y
+    function _sqrt(uint256 y) internal pure returns (uint256 z) {
+        if (y > 3) {
+            z = y;
+            uint256 x = y / 2 + 1;
+            while (x < z) {
+                z = x;
+                x = (y / x + x) / 2;
+            }
+        } else if (y != 0) {
+            z = 1;
+        }
+        // else z = 0 (default)
     }
 
     /// @notice Validates tick range for concentrated liquidity
@@ -894,14 +984,58 @@ contract CrossChainModule is ReentrancyGuard {
             tickUpper <= TickMath.MAX_TICK;
     }
 
+    function _isInRange(int24 currentTick, int24 tickLower, int24 tickUpper) internal pure returns (bool) {
+        return currentTick >= tickLower && currentTick < tickUpper;
+    }
+
     /// @notice Retrieves network status from the oracle
     /// @param chainId The target chain ID
     /// @return status The network status
-    function _getOracleNetworkStatus(uint64 chainId) internal view returns (ICrossChainRetryOracle.NetworkStatus memory status) {
+    function _getOracleNetworkStatus(uint16 chainId) internal view returns (ICrossChainRetryOracle.NetworkStatus memory status) {
         try retryOracle.getNetworkStatus(chainId) returns (ICrossChainRetryOracle.NetworkStatus memory _status) {
             status = _status;
         } catch {
             revert OracleNotConfigured(chainId);
         }
+    }
+
+    /// @notice Gets the default messenger type
+    /// @return messengerType The messenger type (0 for LayerZero, 1 for Axelar, 2 for Wormhole)
+    function _getMessengerType() internal view returns (uint8 messengerType) {
+        // Check available messengers in priority order: LayerZero (0), Axelar (1), Wormhole (2)
+        if (pool.crossChainMessengers(0) != address(0)) {
+            return 0; // LayerZero
+        } else if (pool.crossChainMessengers(1) != address(0)) {
+            return 1; // Axelar
+        } else if (pool.crossChainMessengers(2) != address(0)) {
+            return 2; // Wormhole
+        } else {
+            revert NoMessengerConfigured();
+        }
+    }
+
+    /// @notice Estimates cross-chain message fees
+    /// @param dstChainId The destination chain ID
+    /// @param payload The message payload
+    /// @param adapterParams Adapter parameters
+    /// @return nativeFee The estimated native fee
+    /// @return zroFee The estimated ZRO fee
+    function getEstimatedCrossChainFee(
+        uint16 dstChainId,
+        bytes calldata payload,
+        bytes calldata adapterParams
+    ) external view returns (uint256 nativeFee, uint256 zroFee) {
+        uint8 messengerType = _getMessengerType();
+        address messenger = pool.crossChainMessengers(messengerType);
+        if (messenger == address(0)) revert MessengerNotSet(messengerType);
+
+        string memory axelarChain = pool.chainIdToAxelarChain(dstChainId);
+        return ICrossChainMessenger(messenger).estimateFees(
+            dstChainId,
+            axelarChain,
+            address(pool),
+            payload,
+            adapterParams
+        );
     }
 }
