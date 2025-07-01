@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.24;
+pragma solidity 0.8.24;
 
 import "@openzeppelin/contracts-upgradeable@5.0.2/proxy/utils/Initializable.sol";
 import "@openzeppelin/contracts-upgradeable@5.0.2/proxy/utils/UUPSUpgradeable.sol";
@@ -81,7 +81,7 @@ interface IOrderBook {
         address tokenB,
         uint64 expiryTimestamp,
         bool useConcentratedLiquidity
-    ) external;
+    ) external returns (uint256);
     function placePerpetualOrder(
         address tokenA,
         address tokenB,
@@ -103,8 +103,8 @@ interface IOrderBook {
         bool useConcentratedLiquidity,
         uint16 dstChainId,
         bytes calldata adapterParams
-    ) external payable;
-    function placeOrderWithSignature(SignedOrder calldata signedOrder) external;
+    ) external payable returns (uint256);
+    function placeOrderWithSignature(SignedOrder calldata signedOrder) external returns (uint256);
     function applyFunding(uint256 orderId) external;
     function liquidatePosition(uint256 orderId) external;
     function setLiquidityRange(uint256 amountA, uint256 amountB) external;
@@ -146,11 +146,13 @@ error ProposalFailed(string reason);
 error InvalidObservationInterval();
 error ObservationLimitExceeded();
 error InvalidObservationCount();
+error FundingRateTooHigh();
+error StorageLimitExceeded();
 
 // @title CryptoOptions - Upgradeable options trading contract for DEX with OrderBook integration
 // @notice Supports standard, barrier, binary, perpetual, stop-loss, Asian, and Lookback options with cross-chain and AMM integration
 // @dev Integrates with OrderBook for trade execution, pricing, and liquidity provision
-// @custom:version 1.5.0
+// @custom:version 1.5.1
 contract CryptoOptions is Initializable, UUPSUpgradeable, OwnableUpgradeable, ReentrancyGuardUpgradeable, PausableUpgradeable {
     // @notice Enum for option types
     enum OptionType {
@@ -170,31 +172,31 @@ contract CryptoOptions is Initializable, UUPSUpgradeable, OwnableUpgradeable, Re
         address buyer; // Option owner
         address underlyingToken; // e.g., wBTC, ETH
         address quoteToken; // Quote token (e.g., USDC)
-        uint96 strikePrice; // in USDC (6 decimals)
-        uint96 premium; // in USDC
+        uint96 strikePrice; // in 18 decimals
+        uint96 premium; // in USDC (6 decimals)
         uint64 expiry; // timestamp (0 for perpetual options)
-        uint128 amount; // underlying token amount (e.g., 0.1 BTC in wei)
+        uint128 amount; // underlying token amount (18 decimals)
         bool isCall; // true for call, false for put
         bool isAmerican; // true for American-style (ignored for perpetual/binary)
         bool exercised; // true if exercised
         uint32 chainId; // for non-Cosmos chains
         string cosmosChainId; // for Cosmos chains
         OptionType optionType; // Option type
-        uint96 barrierPrice; // Barrier price for barrier options (0 if not applicable)
-        uint96 payout; // Fixed payout for binary options (0 if not applicable)
-        uint64 lastFundingPayment; // Last funding rate payment timestamp for perpetual options
-        uint96 fundingRateBps; // Funding rate in basis points for perpetual options
-        uint256 orderBookId; // OrderBook order ID for perpetual options
-        uint96 triggerPrice; // Trigger price for stop-loss orders (0 if not applicable)
-        uint64 observationInterval; // Interval for price observations (Asian options)
-        uint8 observationCount; // Number of price observations (Asian options)
-        uint96 maxPrice; // Max price observed (Lookback options)
-        uint96 minPrice; // Min price observed (Lookback options)
+        uint96 barrierPrice; // Barrier price for barrier options (18 decimals)
+        uint96 payout; // Fixed payout for binary options (6 decimals)
+        uint64 lastFundingPayment; // Last funding rate payment timestamp
+        uint96 fundingRateBps; // Funding rate in basis points
+        uint256 orderBookId; // OrderBook order ID
+        uint96 triggerPrice; // Trigger price for stop-loss (18 decimals)
+        uint64 observationInterval; // Interval for price observations
+        uint8 observationCount; // Number of price observations
+        uint96 maxPrice; // Max price observed (18 decimals)
+        uint96 minPrice; // Min price observed (18 decimals)
     }
 
     // State variables
     mapping(uint256 => Option) public options;
-    mapping(uint256 => mapping(uint256 => uint96)) public priceObservations; // optionId => observationIndex => price
+    mapping(uint256 => mapping(uint256 => uint96)) public priceObservations; // optionId => observationIndex => price (18 decimals)
     mapping(uint256 => mapping(uint256 => uint64)) public observationTimestamps; // optionId => observationIndex => timestamp
     uint256 public optionCounter;
     IERC20 public usdc;
@@ -204,12 +206,13 @@ contract CryptoOptions is Initializable, UUPSUpgradeable, OwnableUpgradeable, Re
     mapping(address => AggregatorV3Interface) public chainlinkOracles;
     mapping(address => uint256[]) public userOptions;
     mapping(address => bool) public kycVerified;
-    uint256 public constant FEE_BPS = 5; // Default 0.05% fee (5 basis points)
+    uint256 public feeBps = 5; // Default 0.05% fee (5 basis points)
     uint256 public constant BPS_DENOMINATOR = 10000; // Basis points
-    uint256 public constant TIMEOUT = 1 hours; // Timeout for in-flight messages
-    uint256 public constant FUNDING_INTERVAL = 8 hours; // Funding rate payment interval
-    uint256 public constant MAX_OBSERVATIONS = 30; // Max price observations for Asian options
-    uint256 public constant MIN_OBSERVATION_INTERVAL = 1 hours; // Minimum interval for price observations
+    uint256 public timeout = 1 hours; // Timeout for in-flight messages
+    uint256 public fundingInterval = 8 hours; // Funding rate payment interval
+    uint256 public constant MAX_OBSERVATIONS = 100; // Max price observations per option
+    uint256 public constant MIN_OBSERVATION_INTERVAL = 1 hours; // Minimum interval
+    uint256 public constant MAX_FUNDING_RATE_BPS = 1000; // Max 10% funding rate
     uint256 public collectedFundingFees;
 
     // Events
@@ -248,6 +251,9 @@ contract CryptoOptions is Initializable, UUPSUpgradeable, OwnableUpgradeable, Re
     event ParameterProposed(string paramName, uint256 value);
     event PriceObservationRecorded(uint256 indexed optionId, uint256 index, uint96 price, uint64 timestamp);
     event LookbackPriceUpdated(uint256 indexed optionId, uint96 maxPrice, uint96 minPrice);
+    event FeeBpsUpdated(uint256 newFeeBps);
+    event TimeoutUpdated(uint256 newTimeout);
+    event FundingIntervalUpdated(uint256 newFundingInterval);
 
     // @custom:oz-upgrades-unsafe-allow constructor
     constructor() {
@@ -275,27 +281,27 @@ contract CryptoOptions is Initializable, UUPSUpgradeable, OwnableUpgradeable, Re
     }
 
     // @notice Authorize upgrades
-    // @dev Only callable by owner
+    // @param newImplementation New implementation address
     function _authorizeUpgrade(address newImplementation) internal override onlyOwner {}
 
     // @notice Create a new option
-    // @param _underlyingToken Underlying token address
-    // @param _quoteToken Quote token address
-    // @param _strikePrice Strike price in USDC (6 decimals)
-    // @param _premium Premium in USDC
+    // @param _underlyingToken Underlying token address (e.g., wBTC, ETH)
+    // @param _quoteToken Quote token address (e.g., USDC)
+    // @param _strikePrice Strike price (18 decimals)
+    // @param _premium Premium (USDC, 6 decimals)
     // @param _expiry Expiry timestamp (0 for perpetual)
-    // @param _amount Underlying token amount
+    // @param _amount Underlying token amount (18 decimals)
     // @param _isCall True for call, false for put
     // @param _isAmerican True for American-style
     // @param _chainId Chain ID for non-Cosmos chains
     // @param _cosmosChainId Cosmos chain ID
     // @param _optionType Type of option
-    // @param _barrierPrice Barrier price for barrier options
-    // @param _payout Payout for binary options
-    // @param _fundingRateBps Funding rate for perpetual options
+    // @param _barrierPrice Barrier price (18 decimals)
+    // @param _payout Payout for binary options (6 decimals)
+    // @param _fundingRateBps Funding rate in basis points
     // @param _leverage Leverage for perpetual options
     // @param _margin Margin for perpetual options
-    // @param _triggerPrice Trigger price for stop-loss orders
+    // @param _triggerPrice Trigger price for stop-loss (18 decimals)
     // @param _observationInterval Observation interval for Asian options
     // @param _observationCount Number of observations for Asian options
     // @return optionId The ID of the created option
@@ -320,6 +326,7 @@ contract CryptoOptions is Initializable, UUPSUpgradeable, OwnableUpgradeable, Re
         uint64 _observationInterval,
         uint8 _observationCount
     ) public nonReentrant whenNotPaused returns (uint256) {
+        if (!kycVerified[msg.sender]) revert Unauthorized();
         if (_optionType != OptionType.Perpetual && _expiry <= block.timestamp) revert InvalidExpiry();
         if (_amount == 0) revert InvalidAmount();
         if (_premium == 0) revert InvalidPremium();
@@ -327,49 +334,39 @@ contract CryptoOptions is Initializable, UUPSUpgradeable, OwnableUpgradeable, Re
             if (_barrierPrice == 0) revert InvalidBarrier();
         }
         if (_optionType == OptionType.Binary && _payout == 0) revert InvalidPremium();
-        if (_optionType == OptionType.Perpetual && (_fundingRateBps == 0 || _leverage == 0 || _margin == 0)) revert InvalidPremium();
+        if (_optionType == OptionType.Perpetual) {
+            if (_fundingRateBps == 0 || _leverage == 0 || _margin == 0) revert InvalidPremium();
+            if (_fundingRateBps > MAX_FUNDING_RATE_BPS) revert FundingRateTooHigh();
+        }
         if (_optionType == OptionType.AsianAveragePrice || _optionType == OptionType.AsianAverageStrike) {
             if (_observationInterval < MIN_OBSERVATION_INTERVAL) revert InvalidObservationInterval();
             if (_observationCount == 0 || _observationCount > MAX_OBSERVATIONS) revert InvalidObservationCount();
         }
-        if (!kycVerified[msg.sender] && _chainId == block.chainid && bytes(_cosmosChainId).length == 0) revert Unauthorized();
 
-        // Calculate dynamic fee
         uint256 fee = getDynamicFee(_premium);
         uint256 netPremium = _premium - fee;
         if (!usdc.transferFrom(msg.sender, address(this), _premium)) revert TransferFailed();
 
-        // Create option
         uint256 optionId = optionCounter++;
         uint256 orderBookId;
 
-        // Place order in OrderBook for perpetual options or stop-loss orders
         if (_optionType == OptionType.Perpetual) {
-            try orderBook.placePerpetualOrder(_underlyingToken, _quoteToken, _amount, _isCall, _leverage, _margin) returns (uint256 id) {
-                orderBookId = id;
-            } catch Error(string memory reason) {
-                revert OrderBookError(reason);
-            }
+            orderBookId = orderBook.placePerpetualOrder(_underlyingToken, _quoteToken, _amount, _isCall, _leverage, _margin);
         } else if (_triggerPrice > 0) {
-            try orderBook.placeOrder(
+            orderBookId = orderBook.placeOrder(
                 _isCall,
-                false, // Limit order
-                true, // Stop-loss
+                false,
+                true,
                 _strikePrice,
                 _triggerPrice,
                 uint96(_amount),
                 _underlyingToken,
                 _quoteToken,
                 _expiry,
-                false // No concentrated liquidity
-            ) {
-                orderBookId = optionId; // Use optionId as proxy for orderBookId
-            } catch Error(string memory reason) {
-                revert OrderBookError(reason);
-            }
+                false
+            );
         }
 
-        // Initialize max/min prices for Lookback options
         uint96 maxPrice = 0;
         uint96 minPrice = type(uint96).max;
         if (_optionType == OptionType.LookbackFixedStrike || _optionType == OptionType.LookbackFloatingStrike) {
@@ -406,7 +403,6 @@ contract CryptoOptions is Initializable, UUPSUpgradeable, OwnableUpgradeable, Re
             minPrice: minPrice
         });
 
-        // Record initial price observation for Asian options
         if (_optionType == OptionType.AsianAveragePrice || _optionType == OptionType.AsianAverageStrike) {
             (uint256 price, bool isValid) = getAssetPrice(_underlyingToken, _quoteToken);
             if (isValid) {
@@ -447,9 +443,9 @@ contract CryptoOptions is Initializable, UUPSUpgradeable, OwnableUpgradeable, Re
     // @notice Create an option using a signed order
     // @param _signedOrder Signed order data from OrderBook
     // @param _optionType Type of option
-    // @param _barrierPrice Barrier price for barrier options
-    // @param _payout Payout for binary options
-    // @param _fundingRateBps Funding rate for perpetual options
+    // @param _barrierPrice Barrier price (18 decimals)
+    // @param _payout Payout for binary options (6 decimals)
+    // @param _fundingRateBps Funding rate in basis points
     // @param _leverage Leverage for perpetual options
     // @param _margin Margin for perpetual options
     // @param _observationInterval Observation interval for Asian options
@@ -466,63 +462,62 @@ contract CryptoOptions is Initializable, UUPSUpgradeable, OwnableUpgradeable, Re
         uint64 _observationInterval,
         uint8 _observationCount
     ) public nonReentrant whenNotPaused returns (uint256) {
+        if (!kycVerified[msg.sender]) revert Unauthorized();
         if (_signedOrder.user != msg.sender) revert Unauthorized();
         if (_signedOrder.amount == 0) revert InvalidAmount();
-        if (_optionType == OptionType.Perpetual && (_fundingRateBps == 0 || _leverage == 0 || _margin == 0)) revert InvalidPremium();
+        if (_optionType == OptionType.Perpetual) {
+            if (_fundingRateBps == 0 || _leverage == 0 || _margin == 0) revert InvalidPremium();
+            if (_fundingRateBps > MAX_FUNDING_RATE_BPS) revert FundingRateTooHigh();
+        }
         if (_optionType == OptionType.AsianAveragePrice || _optionType == OptionType.AsianAverageStrike) {
             if (_observationInterval < MIN_OBSERVATION_INTERVAL) revert InvalidObservationInterval();
             if (_observationCount == 0 || _observationCount > MAX_OBSERVATIONS) revert InvalidObservationCount();
         }
 
-        // Transfer premium
         uint256 fee = getDynamicFee(uint256(_signedOrder.amount));
         uint256 netPremium = uint256(_signedOrder.amount) - fee;
         if (!usdc.transferFrom(msg.sender, address(this), _signedOrder.amount)) revert TransferFailed();
 
-        try orderBook.placeOrderWithSignature(_signedOrder) {
-            uint256 optionId = createOption(
-                _signedOrder.tokenA,
-                _signedOrder.tokenB,
-                _signedOrder.price,
-                uint96(_signedOrder.amount),
-                _signedOrder.expiryTimestamp,
-                uint128(_signedOrder.amount),
-                _signedOrder.isBuy,
-                _signedOrder.isMarket,
-                uint32(block.chainid),
-                "",
-                _optionType,
-                _barrierPrice,
-                _payout,
-                _fundingRateBps,
-                _leverage,
-                _margin,
-                _signedOrder.triggerPrice,
-                _observationInterval,
-                _observationCount
-            );
-            return optionId;
-        } catch Error(string memory reason) {
-            revert OrderBookError(reason);
-        }
+        uint256 orderBookId = orderBook.placeOrderWithSignature(_signedOrder);
+        return createOption(
+            _signedOrder.tokenA,
+            _signedOrder.tokenB,
+            _signedOrder.price,
+            uint96(_signedOrder.amount),
+            _signedOrder.expiryTimestamp,
+            uint128(_signedOrder.amount),
+            _signedOrder.isBuy,
+            _signedOrder.isMarket,
+            uint32(block.chainid),
+            "",
+            _optionType,
+            _barrierPrice,
+            _payout,
+            _fundingRateBps,
+            _leverage,
+            _margin,
+            _signedOrder.triggerPrice,
+            _observationInterval,
+            _observationCount
+        );
     }
 
     // @notice Create a stop-loss option
     // @param _underlyingToken Underlying token address
     // @param _quoteToken Quote token address
-    // @param _strikePrice Strike price in USDC
-    // @param _premium Premium in USDC
+    // @param _strikePrice Strike price (18 decimals)
+    // @param _premium Premium (USDC, 6 decimals)
     // @param _expiry Expiry timestamp
-    // @param _amount Underlying token amount
+    // @param _amount Underlying token amount (18 decimals)
     // @param _isCall True for call, false for put
     // @param _isAmerican True for American-style
     // @param _chainId Chain ID
     // @param _cosmosChainId Cosmos chain ID
     // @param _optionType Type of option
-    // @param _barrierPrice Barrier price
-    // @param _payout Payout for binary options
-    // @param _fundingRateBps Funding rate for perpetual options
-    // @param _triggerPrice Trigger price for stop-loss
+    // @param _barrierPrice Barrier price (18 decimals)
+    // @param _payout Payout for binary options (6 decimals)
+    // @param _fundingRateBps Funding rate in basis points
+    // @param _triggerPrice Trigger price for stop-loss (18 decimals)
     // @param _leverage Leverage for perpetual options
     // @param _margin Margin for perpetual options
     // @param _observationInterval Observation interval for Asian options
@@ -576,19 +571,19 @@ contract CryptoOptions is Initializable, UUPSUpgradeable, OwnableUpgradeable, Re
     // @notice Create a cross-chain option with OrderBook integration
     // @param _underlyingToken Underlying token address
     // @param _quoteToken Quote token address
-    // @param _strikePrice Strike price in USDC
-    // @param _premium Premium in USDC
+    // @param _strikePrice Strike price (18 decimals)
+    // @param _premium Premium (USDC, 6 decimals)
     // @param _expiry Expiry timestamp
-    // @param _amount Underlying token amount
+    // @param _amount Underlying token amount (18 decimals)
     // @param _isCall True for call, false for put
     // @param _isAmerican True for American-style
     // @param _dstChainId Destination chain ID
     // @param _cosmosChainId Cosmos chain ID
     // @param _optionType Type of option
-    // @param _barrierPrice Barrier price
-    // @param _payout Payout for binary options
-    // @param _fundingRateBps Funding rate for perpetual options
-    // @param _triggerPrice Trigger price for stop-loss
+    // @param _barrierPrice Barrier price (18 decimals)
+    // @param _payout Payout for binary options (6 decimals)
+    // @param _fundingRateBps Funding rate in basis points
+    // @param _triggerPrice Trigger price for stop-loss (18 decimals)
     // @param _adapterParams Adapter parameters for cross-chain
     // @param _leverage Leverage for perpetual options
     // @param _margin Margin for perpetual options
@@ -616,6 +611,7 @@ contract CryptoOptions is Initializable, UUPSUpgradeable, OwnableUpgradeable, Re
         uint64 _observationInterval,
         uint8 _observationCount
     ) public payable nonReentrant whenNotPaused {
+        if (!kycVerified[msg.sender]) revert Unauthorized();
         if (_dstChainId == block.chainid && bytes(_cosmosChainId).length == 0) revert NotSameChain();
         uint256 optionId = createOption(
             _underlyingToken,
@@ -638,10 +634,11 @@ contract CryptoOptions is Initializable, UUPSUpgradeable, OwnableUpgradeable, Re
             _observationInterval,
             _observationCount
         );
-        try orderBook.placeOrderCrossChain(
+
+        uint256 orderBookId = orderBook.placeOrderCrossChain(
             _isCall,
-            true, // Market order
-            _triggerPrice > 0, // Stop-loss if triggerPrice is set
+            true,
+            _triggerPrice > 0,
             _strikePrice,
             _triggerPrice,
             uint96(_amount),
@@ -651,29 +648,32 @@ contract CryptoOptions is Initializable, UUPSUpgradeable, OwnableUpgradeable, Re
             false,
             _dstChainId,
             _adapterParams
-        ) {
-            bytes memory payload = abi.encode(
-                optionId,
-                _premium,
-                _dstChainId,
-                _cosmosChainId,
-                _optionType,
-                _barrierPrice,
-                _payout,
-                _fundingRateBps,
-                _leverage,
-                _margin,
-                _triggerPrice,
-                _observationInterval,
-                _observationCount
-            );
-            (uint256 nativeFee, ) = crossChainModule.getEstimatedCrossChainFee(_dstChainId, payload, _adapterParams);
-            if (msg.value < nativeFee) revert InsufficientFee(msg.value, nativeFee);
-            crossChainModule.receiveMessage(_dstChainId, abi.encode(address(this)), payload, _adapterParams);
-            emit CrossChainMessageSent(optionId, _dstChainId, payload, nativeFee);
-        } catch Error(string memory reason) {
-            revert OrderBookError(reason);
+        );
+
+        bytes memory payload = abi.encode(
+            optionId,
+            _premium,
+            _dstChainId,
+            _cosmosChainId,
+            _optionType,
+            _barrierPrice,
+            _payout,
+            _fundingRateBps,
+            _leverage,
+            _margin,
+            _triggerPrice,
+            _observationInterval,
+            _observationCount
+        );
+        (uint256 nativeFee, ) = crossChainModule.getEstimatedCrossChainFee(_dstChainId, payload, _adapterParams);
+        if (msg.value < nativeFee) revert InsufficientFee(msg.value, nativeFee);
+
+        crossChainModule.receiveMessage(_dstChainId, abi.encode(address(this)), payload, _adapterParams);
+        if (msg.value > nativeFee) {
+            (bool success, ) = msg.sender.call{value: msg.value - nativeFee}("");
+            if (!success) revert TransferFailed();
         }
+        emit CrossChainMessageSent(optionId, _dstChainId, payload, nativeFee);
     }
 
     // @notice Record price observation for Asian options
@@ -685,13 +685,15 @@ contract CryptoOptions is Initializable, UUPSUpgradeable, OwnableUpgradeable, Re
         if (option.exercised) revert OptionExercised();
         if (block.timestamp > option.expiry) revert OptionExpired();
 
-        uint256 currentIndex = 0;
-        for (uint256 i = 0; i < option.observationCount; i++) {
+        uint256 currentIndex;
+        uint256 count = option.observationCount;
+        for (uint256 i = 0; i < count; ) {
             if (observationTimestamps[_optionId][i] == 0) {
                 currentIndex = i;
                 break;
             }
-            if (i == option.observationCount - 1) revert ObservationLimitExceeded();
+            if (i == count - 1) revert ObservationLimitExceeded();
+            unchecked { i++; }
         }
 
         if (currentIndex > 0 && block.timestamp < observationTimestamps[_optionId][currentIndex - 1] + option.observationInterval) {
@@ -728,34 +730,28 @@ contract CryptoOptions is Initializable, UUPSUpgradeable, OwnableUpgradeable, Re
     }
 
     // @notice Provide liquidity to OrderBook AMM pool
-    // @param _tokenA Token A address
-    // @param _tokenB Token B address
-    // @param _amountA Amount of token A
-    // @param _amountB Amount of token B
+    // @param _tokenA First token address
+    // @param _tokenB Second token address
+    // @param _amountA Amount of token A (18 decimals)
+    // @param _amountB Amount of token B (18 decimals)
     function provideLiquidity(address _tokenA, address _tokenB, uint256 _amountA, uint256 _amountB) public nonReentrant whenNotPaused {
         if (_amountA == 0 || _amountB == 0) revert InvalidAmount();
         if (!IERC20(_tokenA).transferFrom(msg.sender, address(orderBook), _amountA)) revert TransferFailed();
         if (!IERC20(_tokenB).transferFrom(msg.sender, address(orderBook), _amountB)) revert TransferFailed();
-        try orderBook.setLiquidityRange(_amountA, _amountB) {
-            emit LiquidityProvided(msg.sender, _tokenA, _tokenB, _amountA, _amountB);
-        } catch Error(string memory reason) {
-            revert OrderBookError(reason);
-        }
+        orderBook.setLiquidityRange(_amountA, _amountB);
+        emit LiquidityProvided(msg.sender, _tokenA, _tokenB, _amountA, _amountB);
     }
 
     // @notice Propose parameter change via OrderBook governance
     // @param _paramName Parameter name
     // @param _value New value
     function proposeParameterChange(string memory _paramName, uint256 _value) public onlyOwner {
-        try orderBook.createProposal(
+        orderBook.createProposal(
             string(abi.encodePacked("Update CryptoOptions ", _paramName)),
             IOrderBook.ProposalType.ParameterChange,
             abi.encode(_paramName, _value)
-        ) {
-            emit ParameterProposed(_paramName, _value);
-        } catch Error(string memory reason) {
-            revert ProposalFailed(reason);
-        }
+        );
+        emit ParameterProposed(_paramName, _value);
     }
 
     // @notice Pay funding rate for perpetual options
@@ -765,7 +761,7 @@ contract CryptoOptions is Initializable, UUPSUpgradeable, OwnableUpgradeable, Re
         if (option.buyer != msg.sender) revert NotOptionOwner();
         if (option.optionType != OptionType.Perpetual) revert InvalidOptionType();
         if (option.exercised) revert OptionExercised();
-        if (block.timestamp < option.lastFundingPayment + FUNDING_INTERVAL) revert FundingRateNotPaid();
+        if (block.timestamp < option.lastFundingPayment + fundingInterval) revert FundingRateNotPaid();
 
         uint256 fundingAmount = (option.premium * option.fundingRateBps) / BPS_DENOMINATOR;
         if (!usdc.transferFrom(msg.sender, address(this), fundingAmount)) revert TransferFailed();
@@ -773,12 +769,7 @@ contract CryptoOptions is Initializable, UUPSUpgradeable, OwnableUpgradeable, Re
         option.lastFundingPayment = uint64(block.timestamp);
         collectedFundingFees += fundingAmount;
 
-        try orderBook.applyFunding(option.orderBookId) {
-            // Success
-        } catch Error(string memory reason) {
-            revert OrderBookError(reason);
-        }
-
+        orderBook.applyFunding(option.orderBookId);
         emit FundingRatePaid(_optionId, msg.sender, fundingAmount);
     }
 
@@ -790,9 +781,8 @@ contract CryptoOptions is Initializable, UUPSUpgradeable, OwnableUpgradeable, Re
         if (option.exercised) revert OptionExercised();
         if (option.optionType != OptionType.Perpetual && block.timestamp > option.expiry) revert OptionExpired();
         if (option.optionType != OptionType.Perpetual && !option.isAmerican && block.timestamp != option.expiry) revert OptionExpired();
-        if (option.optionType == OptionType.Perpetual && block.timestamp >= option.lastFundingPayment + FUNDING_INTERVAL) revert FundingRateNotPaid();
+        if (option.optionType == OptionType.Perpetual && block.timestamp >= option.lastFundingPayment + fundingInterval) revert FundingRateNotPaid();
 
-        // Check barrier conditions for barrier options
         if (option.optionType == OptionType.BarrierKnockIn || option.optionType == OptionType.BarrierKnockOut) {
             (uint256 price, bool isValid) = getAssetPrice(option.underlyingToken, option.quoteToken);
             if (!isValid) revert InvalidPrice();
@@ -800,7 +790,6 @@ contract CryptoOptions is Initializable, UUPSUpgradeable, OwnableUpgradeable, Re
             if (option.optionType == OptionType.BarrierKnockOut && price >= option.barrierPrice) revert BarrierNotMet();
         }
 
-        // Get price or calculate payoff
         uint256 price;
         bool isValid;
         if (option.optionType == OptionType.AsianAveragePrice || option.optionType == OptionType.AsianAverageStrike) {
@@ -820,56 +809,44 @@ contract CryptoOptions is Initializable, UUPSUpgradeable, OwnableUpgradeable, Re
             if (!option.isCall && price >= option.strikePrice) revert NotInTheMoney();
             profit = option.payout;
         } else if (option.optionType == OptionType.AsianAverageStrike) {
-            uint96 effectiveStrike = uint96(price); // Average price becomes the strike
+            uint96 effectiveStrike = uint96(price);
             if (option.isCall && price <= effectiveStrike) revert NotInTheMoney();
             if (!option.isCall && price >= effectiveStrike) revert NotInTheMoney();
             profit = option.isCall
-                ? (price - effectiveStrike) * option.amount / 1e6
-                : (effectiveStrike - price) * option.amount / 1e6;
+                ? (price - effectiveStrike) * option.amount / 1e18
+                : (effectiveStrike - price) * option.amount / 1e18;
         } else if (option.optionType == OptionType.LookbackFloatingStrike) {
             uint96 effectiveStrike = option.isCall ? option.minPrice : option.maxPrice;
             if (option.isCall && price <= effectiveStrike) revert NotInTheMoney();
             if (!option.isCall && price >= effectiveStrike) revert NotInTheMoney();
             profit = option.isCall
-                ? (price - effectiveStrike) * option.amount / 1e6
-                : (effectiveStrike - price) * option.amount / 1e6;
+                ? (price - effectiveStrike) * option.amount / 1e18
+                : (effectiveStrike - price) * option.amount / 1e18;
         } else {
             if (option.isCall && price <= option.strikePrice) revert NotInTheMoney();
             if (!option.isCall && price >= option.strikePrice) revert NotInTheMoney();
             profit = option.isCall
-                ? (price - option.strikePrice) * option.amount / 1e6
-                : (option.strikePrice - price) * option.amount / 1e6;
+                ? (price - option.strikePrice) * option.amount / 1e18
+                : (option.strikePrice - price) * option.amount / 1e18;
         }
 
-        // Execute trade via OrderBook
-        bool tradeSuccess;
         if (option.optionType == OptionType.Perpetual) {
-            try orderBook.liquidatePosition(option.orderBookId) {
-                tradeSuccess = true;
-            } catch Error(string memory reason) {
-                revert OrderBookError(reason);
-            }
+            orderBook.liquidatePosition(option.orderBookId);
         } else {
-            try orderBook.placeOrder(
+            orderBook.placeOrder(
                 option.isCall,
-                true, // Market order
-                option.triggerPrice > 0, // Stop-loss if triggerPrice is set
+                true,
+                option.triggerPrice > 0,
                 option.strikePrice,
                 option.triggerPrice,
                 uint96(option.amount),
                 option.underlyingToken,
                 option.quoteToken,
-                0, // No expiry for market order
-                false // No concentrated liquidity
-            ) {
-                tradeSuccess = true;
-            } catch Error(string memory reason) {
-                revert OrderBookError(reason);
-            }
+                0,
+                false
+            );
         }
-        if (!tradeSuccess) revert TransferFailed();
 
-        // Settle profit
         if (bytes(option.cosmosChainId).length > 0 || option.chainId != block.chainid) {
             bytes memory adapterParams = new bytes(0);
             (uint256 nativeFee, ) = crossChainModule.getEstimatedCrossChainFee(uint16(option.chainId), "", adapterParams);
@@ -884,6 +861,10 @@ contract CryptoOptions is Initializable, UUPSUpgradeable, OwnableUpgradeable, Re
                 adapterParams
             );
             if (amountOut < profit) revert TransferFailed();
+            if (msg.value > nativeFee) {
+                (bool success, ) = msg.sender.call{value: msg.value - nativeFee}("");
+                if (!success) revert TransferFailed();
+            }
         } else {
             if (!usdc.transfer(msg.sender, profit)) revert TransferFailed();
         }
@@ -904,11 +885,7 @@ contract CryptoOptions is Initializable, UUPSUpgradeable, OwnableUpgradeable, Re
         option.exercised = true;
 
         if (option.optionType == OptionType.Perpetual) {
-            try orderBook.liquidatePosition(option.orderBookId) {
-                // Success
-            } catch Error(string memory reason) {
-                revert OrderBookError(reason);
-            }
+            orderBook.liquidatePosition(option.orderBookId);
         }
 
         if (bytes(option.cosmosChainId).length > 0 || option.chainId != block.chainid) {
@@ -925,6 +902,10 @@ contract CryptoOptions is Initializable, UUPSUpgradeable, OwnableUpgradeable, Re
                 adapterParams
             );
             if (amountOut < refund) revert TransferFailed();
+            if (msg.value > nativeFee) {
+                (bool success, ) = msg.sender.call{value: msg.value - nativeFee}("");
+                if (!success) revert TransferFailed();
+            }
         } else {
             if (!usdc.transfer(msg.sender, refund)) revert TransferFailed();
         }
@@ -942,78 +923,89 @@ contract CryptoOptions is Initializable, UUPSUpgradeable, OwnableUpgradeable, Re
         bytes calldata _additionalParams
     ) external nonReentrant whenNotPaused {
         if (msg.sender != address(crossChainModule)) revert Unauthorized();
+        (uint256 optionId, , , , , , , , , , , , ) = abi.decode(
+            _payload,
+            (uint256, uint96, uint16, string, OptionType, uint96, uint96, uint96, uint256, uint256, uint96, uint64, uint8)
+        );
         crossChainModule.receiveMessage(_srcChainId, _srcAddress, _payload, _additionalParams);
-        emit CrossChainMessageReceived(0, _srcChainId, _payload);
+        emit CrossChainMessageReceived(optionId, _srcChainId, _payload);
     }
 
     // @notice Get dynamic fee based on OrderBook fee tiers
-    // @param _premium Premium amount
-    // @return fee The calculated fee
+    // @param _premium Premium amount (6 decimals)
+    // @return fee The calculated fee (6 decimals)
     function getDynamicFee(uint256 _premium) public view returns (uint256) {
         IOrderBook.FeeTier[] memory tiers = orderBook.getFeeTiers();
         if (tiers.length == 0) revert InvalidFeeTier();
-        uint256 feeRate = tiers[0].feeRateBps; // Default to first tier
-        for (uint256 i = 1; i < tiers.length; i++) {
+        uint256 feeRate = tiers[0].feeRateBps;
+        uint256 len = tiers.length;
+        for (uint256 i = 1; i < len; ) {
             if (_premium >= tiers[i].orderSizeThreshold) {
                 feeRate = tiers[i].feeRateBps;
             }
+            unchecked { i++; }
         }
         return (_premium * feeRate) / BPS_DENOMINATOR;
     }
 
     // @notice Calculate average price for Asian options
     // @param _optionId Option ID
-    // @return averagePrice The calculated average price
+    // @return averagePrice The calculated average price (18 decimals)
     function calculateAveragePrice(uint256 _optionId) internal view returns (uint256) {
         Option storage option = options[_optionId];
         if (option.optionType != OptionType.AsianAveragePrice && option.optionType != OptionType.AsianAverageStrike) {
             return 0;
         }
 
-        uint256 totalPrice = 0;
-        uint256 validObservations = 0;
-        for (uint256 i = 0; i < option.observationCount; i++) {
+        uint256 totalPrice;
+        uint256 validObservations;
+        uint256 count = option.observationCount;
+        for (uint256 i = 0; i < count; ) {
             if (observationTimestamps[_optionId][i] > 0) {
                 totalPrice += priceObservations[_optionId][i];
                 validObservations++;
             }
+            unchecked { i++; }
         }
-        if (validObservations == 0) return 0;
-        return totalPrice / validObservations;
+        return validObservations == 0 ? 0 : totalPrice / validObservations;
     }
 
     // @notice Get asset price from OrderBook, Chainlink, or Band
-    // @param _token Underlying token
+    // @param _underlyingToken Underlying token
     // @param _quoteToken Quote token
-    // @return price The asset price
+    // @return price The asset price (18 decimals)
     // @return isValid Whether the price is valid
-    function getAssetPrice(address _token, address _quoteToken) internal view returns (uint256 price, bool isValid) {
-        try orderBook.getAggregatedPrice(_token, _quoteToken) returns (uint256 obPrice) {
-            if (obPrice > 0) return (obPrice, true);
-        } catch {
-            // Fallback to Chainlink or Band
+    function getAssetPrice(address _underlyingToken, address _quoteToken) internal view returns (uint256 price, bool isValid) {
+        uint256 obPrice = orderBook.getAggregatedPrice(_underlyingToken, _quoteToken);
+        if (obPrice > 0 && obPrice < type(uint96).max) {
+            return (obPrice * 1e12, true); // Normalize to 18 decimals (assuming 6 decimals)
         }
 
-        AggregatorV3Interface oracle = chainlinkOracles[_token];
+        AggregatorV3Interface oracle = chainlinkOracles[_underlyingToken];
         if (address(oracle) != address(0)) {
             (, int256 answer, , uint256 updatedAt, ) = oracle.latestRoundData();
-            if (answer > 0 && block.timestamp <= updatedAt + 1 hours) {
-                return (uint256(answer), true);
+            if (answer > 0 && block.timestamp <= updatedAt + timeout && uint256(answer) < type(uint96).max) {
+                return (uint256(answer) * 1e10, true); // Normalize to 18 decimals (assuming 8 decimals)
             }
         }
 
-        return getBandPrice(_token);
+        (uint256 bandPrice, bool bandValid) = getBandPrice(_underlyingToken);
+        if (bandValid && bandPrice < type(uint96).max) {
+            return (bandPrice * 1e12, true); // Normalize to 18 decimals (assuming 6 decimals)
+        }
+
+        return (0, false);
     }
 
     // @notice Get price from Band Protocol
     // @param _token Token address
-    // @return price The asset price
+    // @return price The asset price (18 decimals)
     // @return isValid Whether the price is valid
     function getBandPrice(address _token) internal view returns (uint256 price, bool isValid) {
         string memory pair = getTokenPair(_token);
         if (bytes(pair).length == 0) return (0, false);
         (uint256 rate, uint256 updatedAt) = bandOracle.getReferenceData(pair);
-        if (rate > 0 && block.timestamp <= updatedAt + 1 hours) {
+        if (rate > 0 && block.timestamp <= updatedAt + timeout) {
             return (rate, true);
         }
         return (0, false);
@@ -1031,7 +1023,7 @@ contract CryptoOptions is Initializable, UUPSUpgradeable, OwnableUpgradeable, Re
 
     // @notice Deposit liquidity rewards for AMM pools
     // @param _token Token address
-    // @param _amount Amount to deposit
+    // @param _amount Amount to deposit (18 decimals)
     function depositLiquidityReward(address _token, uint256 _amount) public onlyOwner whenNotPaused {
         if (!IERC20(_token).transferFrom(msg.sender, address(this), _amount)) revert TransferFailed();
         emit LiquidityRewardDeposited(_token, _amount);
@@ -1039,7 +1031,7 @@ contract CryptoOptions is Initializable, UUPSUpgradeable, OwnableUpgradeable, Re
 
     // @notice Distribute collected funding fees to liquidity providers
     // @param _recipient Recipient address
-    // @param _amount Amount to distribute
+    // @param _amount Amount to distribute (6 decimals)
     function distributeFundingFees(address _recipient, uint256 _amount) public onlyOwner whenNotPaused {
         if (_amount > collectedFundingFees) revert InvalidAmount();
         if (!usdc.transfer(_recipient, _amount)) revert TransferFailed();
@@ -1074,6 +1066,30 @@ contract CryptoOptions is Initializable, UUPSUpgradeable, OwnableUpgradeable, Re
         if (_newCrossChainModule == address(0)) revert InvalidProtocol();
         crossChainModule = ICrossChainModule(_newCrossChainModule);
         emit CrossChainModuleUpdated(_newCrossChainModule);
+    }
+
+    // @notice Update fee in basis points
+    // @param _newFeeBps New fee in basis points
+    function updateFeeBps(uint256 _newFeeBps) public onlyOwner {
+        if (_newFeeBps > 1000) revert InvalidAmount(); // Max 10%
+        feeBps = _newFeeBps;
+        emit FeeBpsUpdated(_newFeeBps);
+    }
+
+    // @notice Update timeout for price staleness
+    // @param _newTimeout New timeout in seconds
+    function updateTimeout(uint256 _newTimeout) public onlyOwner {
+        if (_newTimeout < 30 minutes || _newTimeout > 24 hours) revert InvalidAmount();
+        timeout = _newTimeout;
+        emit TimeoutUpdated(_newTimeout);
+    }
+
+    // @notice Update funding interval for perpetual options
+    // @param _newFundingInterval New funding interval in seconds
+    function updateFundingInterval(uint256 _newFundingInterval) public onlyOwner {
+        if (_newFundingInterval < 1 hours || _newFundingInterval > 24 hours) revert InvalidAmount();
+        fundingInterval = _newFundingInterval;
+        emit FundingIntervalUpdated(_newFundingInterval);
     }
 
     // @notice Pause contract operations
