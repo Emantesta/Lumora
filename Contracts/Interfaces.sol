@@ -5,15 +5,14 @@ interface IPriceOracle {
     function getPrice(address asset) external returns (uint256);
     function getPrice(address tokenA, address tokenB) external view returns (int256);
     function getCurrentPrice(address asset) external view returns (uint256);
-    function getCurrentPairPrice(address baseToken, address quoteToken) external view returns (uint256, bool);
+    function getCurrentPairPrice(address baseToken, address quoteToken) external view returns (uint256 price, bool cachedStatus);
     function assetConfigs(address pool) external view returns (
         uint256, address, address, uint256, uint256, uint256, uint256, uint256, uint256
     );
     function emergencyOverrideActive(address asset) external view returns (bool);
     // Add functions from OrderBook.sol for compatibility
     function getSpotPrice(address tokenA, address tokenB) external view returns (uint256);
-    function getIndexPrice(address tokenA, address Devo
-    function getCurrentPairPrice(address, address) external view returns (uint256 price, bool cachedStatus);
+    function getIndexPrice(address tokenA, address tokenB) external view returns (uint256);
 }
 
 interface IChainlinkOracle {

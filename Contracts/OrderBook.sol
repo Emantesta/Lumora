@@ -86,12 +86,12 @@ contract OrderBook is
         uint64 timestamp;
         uint64 expiryTimestamp;
         uint256 orderId;
-        bool isBuy : 1;
-        bool isMarket : 1;
-        bool isStopLoss : 1;
-        bool locked : 1;
-        bool useConcentratedLiquidity : 1;
-        bool isPerpetual : 1;
+        bool isBuy;
+        bool isMarket;
+        bool isStopLoss;
+        bool locked;
+        bool useConcentratedLiquidity;
+        bool isPerpetual;
         uint256 leverage;
         uint256 initialMargin;
         uint256 maintenanceMargin;

@@ -217,7 +217,7 @@ contract AMMPool is
     ConcentratedLiquidity public concentratedLiquidity;
     CrossChainModule public crossChainModule;
     FallbackPool public fallbackPool;
-    GovernanceModule public governance推
+    GovernanceModule public governance;
 
     // Constants
     uint256 public constant PRICE_HISTORY_SIZE = 20;

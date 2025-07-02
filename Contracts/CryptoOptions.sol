@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-pragma solidity 0.8.24;
+pragma solidity ^0.8.24;
 
 import "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
 import "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
@@ -7,7 +7,7 @@ import "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
 import "@openzeppelin/contracts-upgradeable/security/ReentrancyGuardUpgradeable.sol";
 import "@openzeppelin/contracts-upgradeable/security/PausableUpgradeable.sol";
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
-import "@chainlink/contracts/src/v0.8/interfaces/AggregatorV3Interface.sol";
+import "@chainlink/contracts/src/v0.8/shared/interfaces/AggregatorV3Interface.sol";
 
 // Interface for Band Protocol (fallback oracle)
 interface IBandProtocol {
@@ -1015,9 +1015,9 @@ contract CryptoOptions is Initializable, UUPSUpgradeable, OwnableUpgradeable, Re
     // @param _token Token address
     // @return pair The price feed pair
     function getTokenPair(address _token) internal pure returns (string memory) {
-        if (_token == 0x2260FAC5E1a373473335eF271974C34F6fB7A693) return "BTC/USD";
-        if (_token == 0x2170Ed0881dB1171A4A0d5A0A0B8c4860A9fB6F7) return "ETH/USD";
-        if (_token == 0x1234567890abcdef1234567890abcdef12345678) return "BRETT/USD";
+        if (_token = "0x2260FAC5E1a373473335eF271974C34F6fB7A693") return "BTC/USD";
+        if (_token = "0x2170Ed0881dB1171A4A0d5A0A0B8c4860A9fB6F7") return "ETH/USD";
+        if (_token = "0x1234567890abcdef1234567890abcdef12345678") return "BRETT/USD";
         return "";
     }
 
