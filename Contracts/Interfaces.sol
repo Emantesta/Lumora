@@ -10,6 +10,10 @@ interface IPriceOracle {
         uint256, address, address, uint256, uint256, uint256, uint256, uint256, uint256
     );
     function emergencyOverrideActive(address asset) external view returns (bool);
+    // Add functions from OrderBook.sol for compatibility
+    function getSpotPrice(address tokenA, address tokenB) external view returns (uint256);
+    function getIndexPrice(address tokenA, address Devo
+    function getCurrentPairPrice(address, address) external view returns (uint256 price, bool cachedStatus);
 }
 
 interface IChainlinkOracle {
@@ -94,7 +98,6 @@ interface IAMMPool {
         uint256[] calldata timelocks
     ) external payable;
     function getTickSpacing() external view returns (uint24);
-
     function crossChainMessengers(uint8 messengerType) external view returns (address);
     function tokenBridge() external view returns (address);
     function tokenBridgeType(address token) external view returns (uint8);
@@ -138,6 +141,7 @@ interface IAMMPool {
         address provider,
         uint256 amountA,
         uint256 amountB,
+        uint256 amountB,
         uint16 srcChainId,
         uint64 nonce,
         uint8 messengerType
@@ -158,6 +162,15 @@ interface IAMMPool {
     function emitFailedMessageRetryScheduled(uint256 messageId, uint256 nextRetryTimestamp) external;
     function emitBatchMessagesSent(uint16[] memory dstChainIds, uint8 messengerType, uint256 totalFee) external;
     function emitBatchRetryProcessed(uint256[] memory messageIds, uint256 successfulRetries, uint256 failedRetries) external;
+    // Add functions from OrderBook.sol for compatibility
+    function token0() external view returns (address);
+    function token1() external view returns (address);
+    function treasury() external view returns (address);
+    function swap(uint256 amount0Out, uint256 amount1Out, address to, bytes calldata data) external returns (uint256);
+    function getVolatility() external view returns (uint256);
+    function adjustLiquidityRange(uint256 minPrice, uint256 maxPrice) external;
+    function getConcentratedPrice() external view returns (uint256);
+    function rebalanceReserves(uint16 chainId) external;
 }
 
 interface IPositionManager {
@@ -245,6 +258,9 @@ interface ICrossChainModule {
     function batchCrossChainMessages(uint16[] calldata dstChainIds, string[] calldata dstAxelarChains, bytes[] calldata payloads, bytes[] calldata adapterParams, uint256[] calldata timelocks) external payable;
     function retryFailedMessage(uint256 messageId) external payable;
     function retryFailedMessagesBatch(uint256[] calldata messageIds) external payable;
+    // Add functions from OrderBook.sol for compatibility
+    function sendCrossChainOrder(address targetChain, bytes memory orderData) external;
+    function receiveCrossChainOrder(bytes memory orderData) external;
 }
 
 interface ILayerZeroEndpoint {
@@ -323,4 +339,23 @@ interface ITokenBridge {
     function lock(address token, uint256 amount, address recipient, uint16 dstChainId) external;
     function mint(address token, uint256 amount, address recipient) external;
     function release(address token, uint256 amount, address recipient) external;
+}
+
+// New interfaces from OrderBook.sol
+interface IGovernanceModule {
+    // Placeholder for governance interface
+}
+
+interface IGovernanceToken {
+    function transfer(address to, uint256 amount) external returns (bool);
+    function transferFrom(address from, address to, uint256 amount) external returns (bool);
+}
+
+interface ICrossChainRetryOracle {
+    struct NetworkStatus {
+        bool bridgeOperational;
+        bool retryRecommended;
+        uint256 recommendedRetryDelay;
+    }
+    function getNetworkStatus(uint64 chainId) external view returns (NetworkStatus memory);
 }

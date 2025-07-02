@@ -6,7 +6,7 @@ import {SafeERC20Upgradeable} from "@openzeppelin/contracts-upgradeable/token/ER
 import {OwnableUpgradeable} from "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
 import {Initializable} from "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
 import {UUPSUpgradeable} from "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
-import {ReentrancyGuardUpgradeable} from "@openzeppelin/contracts-upgradeable/utils/ReentrancyGuardUpgradeable.sol";
+import {ReentrancyGuardUpgradeable} from "@openzeppelin/contracts-upgradeable/security/ReentrancyGuardUpgradeable.sol";
 import {IERC721ReceiverUpgradeable} from "@openzeppelin/contracts-upgradeable/token/ERC721/IERC721ReceiverUpgradeable.sol";
 import {FullMath} from "@uniswap/v3-core/contracts/libraries/FullMath.sol";
 import {TickMath} from "@uniswap/v3-core/contracts/libraries/TickMath.sol";
@@ -19,14 +19,84 @@ import {TickMathLibrary} from "./TickMathLibrary.sol";
 import {IAMMPool, IPositionManager, IPriceOracle, ICommonStructs} from "./Interfaces.sol";
 import {UD60x18, ud} from "@prb/math/src/UD60x18.sol";
 
+// Interface for OrderBook.sol
+interface IOrderBook {
+    function placeOrder(
+        bool isBuy,
+        bool isMarket,
+        bool isStopLoss,
+        uint96 price,
+        uint96 triggerPrice,
+        uint96 amount,
+        address tokenA,
+        address tokenB,
+        uint64 expiryTimestamp,
+        bool useConcentratedLiquidity
+    ) external;
+
+    function placePerpetualOrder(
+        address tokenA,
+        address tokenB,
+        uint256 amount,
+        bool isBuy,
+        uint256 leverage,
+        uint256 margin
+    ) external returns (uint256 orderId);
+
+    function matchOrders(uint256 minAmountOut) external;
+
+    function getAggregatedPrice(address tokenA, address tokenB) external view returns (uint256);
+
+    function getOrder(uint256 orderId) external view returns (
+        address user,
+        address tokenA,
+        address tokenB,
+        uint96 price,
+        uint96 amount,
+        uint96 triggerPrice,
+        uint64 timestamp,
+        uint64 expiryTimestamp,
+        uint256 orderId,
+        bool isBuy,
+        bool isMarket,
+        bool isStopLoss,
+        bool locked,
+        bool useConcentratedLiquidity,
+        bool isPerpetual,
+        uint256 leverage,
+        uint256 initialMargin,
+        uint256 maintenanceMargin,
+        uint256 lastFundingTimestamp,
+        int256 cumulativeFunding
+    );
+
+    function getBids() external view returns (uint256[] memory);
+    function getAsks() external view returns (uint256[] memory);
+
+    function placeOrderCrossChain(
+        bool isBuy,
+        bool isMarket,
+        bool isStopLoss,
+        uint96 price,
+        uint96 triggerPrice,
+        uint96 amount,
+        address tokenA,
+        address tokenB,
+        uint64 expiryTimestamp,
+        bool useConcentratedLiquidity,
+        uint16 dstChainId,
+        bytes calldata adapterParams
+    ) external;
+}
+
 // Uniswap V2 Callee Interface for flash swaps
 interface IUniswapV2Callee {
     function uniswapV2Call(address sender, uint256 amount0, uint256 amount1, bytes calldata data) external;
 }
 
-/// @title AMMPool - Main upgradeable AMM pool contract with modularized functionality
-/// @notice Acts as the entry point for AMM operations, delegating to specialized modules
-/// @dev Retains state and external API, uses UUPS upgradeability, and integrates with modules
+/// @title AMMPool - Main upgradeable AMM pool contract with modularized functionality and OrderBook integration
+/// @notice Acts as the entry point for AMM operations, delegating to specialized modules and the OrderBook
+/// @dev Retains state and external API, uses UUPS upgradeability, integrates with modules and OrderBook
 contract AMMPool is
     Initializable,
     OwnableUpgradeable,
@@ -61,6 +131,7 @@ contract AMMPool is
     address public governance;
     address public primaryPriceOracle;
     address[] public fallbackPriceOracles;
+    address public orderBook; // Reference to OrderBook contract
     uint256 public lpFeeShare;
     uint256 public treasuryFeeShare;
     uint256 public totalLiquidity;
@@ -146,10 +217,7 @@ contract AMMPool is
     ConcentratedLiquidity public concentratedLiquidity;
     CrossChainModule public crossChainModule;
     FallbackPool public fallbackPool;
-    GovernanceModule public governanceModule;
-
-    // CrossChainModule address
-    address public crossChainModuleAddress;
+    GovernanceModule public governance推
 
     // Constants
     uint256 public constant PRICE_HISTORY_SIZE = 20;
@@ -209,6 +277,9 @@ contract AMMPool is
     error UnauthorizedAdjuster(address caller);
     error InvalidMessage();
     error MessageNotFound(uint256 messageId);
+    error OrderBookNotSet();
+    error OrderBookInteractionFailed(string reason);
+    error InsufficientOrderBookLiquidity(uint256 amountOut);
 
     // Events
     event LiquidityAdded(address indexed provider, uint256 amountA, uint256 amountB, uint256 liquidity);
@@ -255,6 +326,10 @@ contract AMMPool is
     event FailedMessageRetryScheduled(uint256 indexed messageId, uint256 nextRetryTimestamp);
     event BatchRetryProcessed(uint256[] messageIds, uint256 successfulRetries, uint256 failedRetries);
     event PositionManagerUpdated(address indexed newPositionManager);
+    event OrderBookSet(address indexed orderBook);
+    event OrderBookSwap(address indexed user, address indexed inputToken, uint256 amountIn, uint256 amountOut, uint256 orderId);
+    event OrderBookPerpetualPlaced(uint256 indexed orderId, address indexed user, bool isBuy, uint256 leverage, uint256 margin);
+    event PositionCreated(uint256 indexed positionId, address indexed owner, int24 tickLower, int24 tickUpper, uint128 liquidity);
 
     // Modifiers
     modifier whenNotPaused() {
@@ -338,25 +413,13 @@ contract AMMPool is
         _disableInitializers();
     }
 
-    // Initialize concentratedLiquidity
-    function initialize(
-        address _tokenA,
-        address _tokenB,
-        address _positionManager,
-        address _concentratedLiquidity
-    ) external initializer {
-        tokenA = _tokenA;
-        tokenB = _tokenB;
-        positionManager = _positionManager;
-        concentratedLiquidity = ConcentratedLiquidity(_concentratedLiquidity);
-    }
-
     // Initializer
-    function initialize
-        (ICommonStructs.InitParams memory params,
+    function initialize(
+        ICommonStructs.InitParams memory params,
         address _retryOracle,
         bytes32 _oracleJobId,
-        address _linkToken
+        address _linkToken,
+        address _orderBook
     ) external initializer {
         if (params.tokenA >= params.tokenB) revert InvalidAddress(params.tokenA, "TokenA must be less than TokenB");
         if (
@@ -373,7 +436,8 @@ contract AMMPool is
             params.positionManager == address(0) ||
             _retryOracle == address(0) ||
             _oracleJobId == bytes32(0) ||
-            _linkToken == address(0)
+            _linkToken == address(0) ||
+            _orderBook == address(0)
         ) revert InvalidAddress(address(0), "Zero address not allowed");
         if (params.defaultTimelock < MIN_TIMELOCK || params.defaultTimelock > MAX_TIMELOCK)
             revert InvalidTimelock(params.defaultTimelock);
@@ -423,6 +487,7 @@ contract AMMPool is
         fallbackPriceOracles = params.fallbackPriceOracles;
         governance = params.governance;
         positionManager = params.positionManager;
+        orderBook = _orderBook;
         chainTimelocks[1] = params.defaultTimelock;
         targetReserveRatio = params.targetReserveRatio;
         lpFeeShare = 8333;
@@ -443,6 +508,7 @@ contract AMMPool is
         crossChainModuleAddress = address(crossChainModule);
 
         emit PositionManagerUpdated(params.positionManager);
+        emit OrderBookSet(_orderBook);
     }
 
     // Authorize upgrades
@@ -450,7 +516,7 @@ contract AMMPool is
 
     // --- Uniswap V2-Compliant Functions ---
 
-    /// @notice Uniswap V2-compliant swap function for aggregator compatibility
+    /// @notice Uniswap V2-compliant swap function with OrderBook integration
     /// @param amount0Out Amount of tokenA (token0) to output
     /// @param amount1Out Amount of tokenB (token1) to output
     /// @param to Recipient of output tokens
@@ -470,12 +536,8 @@ contract AMMPool is
         address outputToken = isTokenAInput ? tokenB : tokenA;
         uint256 amountOut = isTokenAInput ? amount1Out : amount0Out;
 
-        (uint256 reserveIn, uint256 reserveOut) = isTokenAInput
-            ? (uint256(reserves.reserveA), uint256(reserves.reserveB))
-            : (uint256(reserves.reserveB), uint256(reserves.reserveA));
-
         uint256 fee = _getDynamicFee(1);
-        uint256 amountIn = (amountOut * (reserveIn + amountOut)) / (reserveOut - amountOut);
+        uint256 amountIn = (amountOut * (reserves.reserveA + amountOut)) / (reserves.reserveB - amountOut);
         uint256 amountInWithFee = (amountIn * (10000 - fee)) / 10000;
         uint256 lpFee;
         uint256 treasuryFee;
@@ -484,43 +546,56 @@ contract AMMPool is
             treasuryFee = (amountIn * fee * treasuryFeeShare) / 10000;
         }
 
-        uint256 calculatedAmountOut = _swapConcentratedLiquidity(isTokenAInput, amountInWithFee);
-        bool useFallback = false;
-        if (calculatedAmountOut == 0) {
-            if (feeState.useConstantSum && feeState.emaVolatility < feeState.volatilityThreshold) {
-                calculatedAmountOut = _swapConstantSum(amountInWithFee, reserveIn, reserveOut);
-            } else {
-                calculatedAmountOut = (reserveOut * amountInWithFee) / (reserveIn + amountInWithFee);
-            }
-            if (calculatedAmountOut < amountOut || calculatedAmountOut > reserveOut) {
-                calculatedAmountOut = _swapFallbackPool(isTokenAInput, amountInWithFee);
-                if (
-                    calculatedAmountOut < amountOut ||
-                    calculatedAmountOut > (isTokenAInput ? fallbackReserves.reserveB : fallbackReserves.reserveA)
-                ) {
-                    revert InsufficientOutputAmount(calculatedAmountOut, amountOut);
+        // Attempt to match with OrderBook first
+        uint256 orderBookAmountOut = _tryOrderBookSwap(isTokenAInput, amountInWithFee, amountOut, to);
+        bool useOrderBook = orderBookAmountOut >= amountOut;
+
+        if (!useOrderBook) {
+            // Fallback to AMM logic
+            uint256 calculatedAmountOut = _swapConcentratedLiquidity(isTokenAInput, amountInWithFee);
+            bool useFallback = false;
+            if (calculatedAmountOut == 0) {
+                if (feeState.useConstantSum && feeState.emaVolatility < feeState.volatilityThreshold) {
+                    calculatedAmountOut = _swapConstantSum(amountInWithFee, reserves.reserveA, reserves.reserveB);
+                } else {
+                    calculatedAmountOut = (reserves.reserveB * amountInWithFee) / (reserves.reserveA + amountInWithFee);
                 }
-                useFallback = true;
+                if (calculatedAmountOut < amountOut || calculatedAmountOut > reserves.reserveB) {
+                    calculatedAmountOut = _swapFallbackPool(isTokenAInput, amountInWithFee);
+                    if (
+                        calculatedAmountOut < amountOut ||
+                        calculatedAmountOut > (isTokenAInput ? fallbackReserves.reserveB : fallbackReserves.reserveA)
+                    ) {
+                        revert InsufficientOutputAmount(calculatedAmountOut, amountOut);
+                    }
+                    useFallback = true;
+                }
+            }
+            if (calculatedAmountOut < amountOut) revert InsufficientOutputAmount(calculatedAmountOut, amountOut);
+
+            if (useFallback) {
+                _updateFallbackReserves(isTokenAInput, amountIn, amountOut);
+            } else {
+                _updateReserves(isTokenAInput, amountIn, amountOut);
+            }
+
+            _validatePrice(inputToken, amountIn, amountOut);
+
+            IERC20Upgradeable(inputToken).safeTransferFrom(msg.sender, address(this), amountIn);
+            IERC20Upgradeable(outputToken).safeTransfer(to, amountOut);
+            if (treasuryFee > 0) {
+                IERC20Upgradeable(inputToken).safeTransfer(treasury, treasuryFee);
+            }
+            lpFees[msg.sender][inputToken] += lpFee;
+
+            _updateVolatility();
+        } else {
+            // OrderBook handled the swap
+            lpFees[msg.sender][inputToken] += lpFee;
+            if (treasuryFee > 0) {
+                IERC20Upgradeable(inputToken).safeTransfer(treasury, treasuryFee);
             }
         }
-        if (calculatedAmountOut < amountOut) revert InsufficientOutputAmount(calculatedAmountOut, amountOut);
-
-        if (useFallback) {
-            _updateFallbackReserves(isTokenAInput, amountIn, amountOut);
-        } else {
-            _updateReserves(isTokenAInput, amountIn, amountOut);
-        }
-
-        _validatePrice(inputToken, amountIn, amountOut);
-
-        IERC20Upgradeable(inputToken).safeTransferFrom(msg.sender, address(this), amountIn);
-        IERC20Upgradeable(outputToken).safeTransfer(to, amountOut);
-        if (treasuryFee > 0) {
-            IERC20Upgradeable(inputToken).safeTransfer(treasury, treasuryFee);
-        }
-        lpFees[msg.sender][inputToken] += lpFee;
-
-        _updateVolatility();
 
         if (data.length > 0) {
             IUniswapV2Callee(to).uniswapV2Call(msg.sender, amount0Out, amount1Out, data);
@@ -551,98 +626,6 @@ contract AMMPool is
     /// @return reserveB Reserve of tokenB (token1)
     function getReserves() external view returns (uint64 reserveA, uint64 reserveB) {
         return (reserves.reserveA, reserves.reserveB);
-    }
-
-    // --- Concentrated Liquidity Functions ---
-
-    function addConcentratedLiquidity(
-        int24 tickLower,
-        int24 tickUpper,
-        uint256 amountA,
-        uint256 amountB
-    ) external whenNotPaused nonReentrant returns (uint256 positionId) {
-        return concentratedLiquidity.addConcentratedLiquidity(msg.sender, tickLower, tickUpper, amountA, amountB);
-    }
-
-    function removeConcentratedLiquidity(uint256 positionId, uint128 liquidity)
-        external
-        whenNotPaused
-        nonReentrant
-        onlyPositionOwner(positionId)
-    {
-        concentratedLiquidity.removeConcentratedLiquidity(positionId, liquidity);
-    }
-
-    function positions(uint256 positionId) external view override returns (
-        address owner,
-        int24 tickLower,
-        int24 tickUpper,
-        uint128 liquidity,
-        uint256 feeGrowthInside0LastX128,
-        uint256 feeGrowthInside1LastX128,
-        uint128 tokensOwed0,
-        uint128 tokensOwed1
-    ) {
-        Position storage position = _positions[positionId];
-        return (
-            position.owner,
-            position.tickLower,
-            position.tickUpper,
-            position.liquidity,
-            position.feeGrowthInside0LastX128,
-            position.feeGrowthInside1LastX128,
-            position.tokensOwed0,
-            position.tokensOwed1
-        );
-    }
-
-    function collectFees(uint256 positionId) external override whenNotPaused nonReentrant onlyPositionManager {
-        concentratedLiquidity.collectFees(positionId);
-    }
-
-    function collectFeesInternal(uint256 positionId) external onlyPositionAdjuster {
-        concentratedLiquidity.collectFeesInternal(positionId);
-    }
-
-    function authorizeAdjuster(uint256 positionId, address adjuster) external onlyPositionOwner(positionId) {
-        if (adjuster == address(0)) revert InvalidAddress(adjuster, "Invalid adjuster address");
-        authorizedAdjusters[positionId] = adjuster;
-        emit PositionAdjusterUpdated(adjuster);
-    }
-
-    function adjust(
-        uint256 positionId,
-        int24 tickLower,
-        int24 tickUpper,
-        uint256 liquidity
-    ) external whenNotPaused nonReentrant onlyAuthorizedAdjusters(positionId) {
-        concentratedLiquidity.adjust(positionId, tickLower, tickUpper, uint128(liquidity));
-    }
-
-    function getFeeGrowthInside(int24 tickLower, int24 tickUpper, uint256 positionId) 
-        external 
-        view 
-        returns (uint128 feesOwed0, uint128 feesOwed1) 
-    {
-        return concentratedLiquidity.getFeeGrowthInside(positionId);
-    }
-
-    // --- Fallback Pool Functions ---
-
-    function exitFallbackPool(uint256 positionId) external override whenNotPaused nonReentrant onlyPositionOwner(positionId) {
-        fallbackPool.exitFallbackPool(positionId);
-    }
-
-    function exitFallbackPoolInternal(uint256 positionId) external onlyPositionAdjuster {
-        fallbackPool.exitFallbackPoolInternal(positionId);
-    }
-
-    function compoundFallbackFeesInternal(uint256 positionId, uint256 tokensOwed0, uint256 tokensOwed1) external onlyPositionAdjuster {
-        fallbackPool.compoundFallbackFeesInternal(positionId, tokensOwed0, tokensOwed1);
-    }
-
-    function transferToken(address token, address recipient, uint256 amount) external onlyPositionAdjuster {
-        fallbackPool.transferToken(token, recipient, amount);
     }
 
     // --- Core AMM Functions ---
@@ -700,12 +683,12 @@ contract AMMPool is
         emit LiquidityRemoved(msg.sender, amountA, amountB, liquidity);
     }
 
-    function swap(address inputToken, uint256 amountIn, uint256 minAmountOut, address recipient) 
-        external 
-        whenNotPaused 
-        nonReentrant 
-        returns (uint256 amountOut) 
-    {
+    function swap(
+        address inputToken,
+        uint256 amountIn,
+        uint256 minAmountOut,
+        address recipient
+    ) external whenNotPaused nonReentrant returns (uint256 amountOut) {
         if (inputToken != tokenA && inputToken != tokenB) 
             revert TickMathLibrary.InvalidToken(inputToken);
         if (amountIn == 0) 
@@ -721,62 +704,239 @@ contract AMMPool is
         uint256 lpFee = (amountIn * fee * lpFeeShare) / 10000;
         uint256 treasuryFee = (amountIn * fee * treasuryFeeShare) / 10000;
 
-        // Track whether concentrated liquidity was used
-        bool usedConcentratedLiquidity = false;
+        // Attempt to match with OrderBook first
+        amountOut = _tryOrderBookSwap(isTokenAInput, amountInWithFee, minAmountOut, recipient);
+        bool usedOrderBook = amountOut >= minAmountOut;
 
-        // Attempt concentrated liquidity swap
-        amountOut = concentratedLiquidity.swapConcentratedLiquidity(isTokenAInput, amountInWithFee);
-        if (amountOut > 0) {
-            usedConcentratedLiquidity = true;
-            _updateReserves(isTokenAInput, amountIn, amountOut);
-        } else {
-            (uint256 reserveIn, uint256 reserveOut) = isTokenAInput
-                ? (uint256(reserves.reserveA), uint256(reserves.reserveB))
-                : (uint256(reserves.reserveB), uint256(reserves.reserveA));
-
-            if (feeState.useConstantSum && feeState.emaVolatility < feeState.volatilityThreshold) {
-                amountOut = governanceModule.swapConstantSum(amountInWithFee, reserveIn, reserveOut);
-            } else {
-                amountOut = (reserveOut * amountInWithFee) / (reserveIn + amountInWithFee);
-            }
-
-            if (amountOut >= minAmountOut && amountOut <= reserveOut) {
+        if (!usedOrderBook) {
+            // Fallback to AMM logic
+            bool usedConcentratedLiquidity = false;
+            amountOut = concentratedLiquidity.swapConcentratedLiquidity(isTokenAInput, amountInWithFee);
+            if (amountOut > 0) {
+                usedConcentratedLiquidity = true;
                 _updateReserves(isTokenAInput, amountIn, amountOut);
             } else {
-                amountOut = fallbackPool.swapFallbackPool(isTokenAInput, amountInWithFee);
-                (uint256 reserveA, uint256 reserveB,) = fallbackPool.getFallbackReserves();
-                if (amountOut < minAmountOut || amountOut > (isTokenAInput ? reserveB : reserveA)) {
-                    revert InsufficientOutputAmount(amountOut, minAmountOut);
+                (uint256 reserveIn, uint256 reserveOut) = isTokenAInput
+                    ? (uint256(reserves.reserveA), uint256(reserves.reserveB))
+                    : (uint256(reserves.reserveB), uint256(reserves.reserveA));
+
+                if (feeState.useConstantSum && feeState.emaVolatility < feeState.volatilityThreshold) {
+                    amountOut = governanceModule.swapConstantSum(amountInWithFee, reserveIn, reserveOut);
+                } else {
+                    amountOut = (reserveOut * amountInWithFee) / (reserveIn + amountInWithFee);
                 }
-                fallbackPool.updateFallbackReserves(isTokenAInput, amountIn, amountOut);
+
+                if (amountOut >= minAmountOut && amountOut <= reserveOut) {
+                    _updateReserves(isTokenAInput, amountIn, amountOut);
+                } else {
+                    amountOut = fallbackPool.swapFallbackPool(isTokenAInput, amountInWithFee);
+                    (uint256 reserveA, uint256 reserveB,) = fallbackPool.getFallbackReserves();
+                    if (amountOut < minAmountOut || amountOut > (isTokenAInput ? reserveB : reserveA)) {
+                        revert InsufficientOutputAmount(amountOut, minAmountOut);
+                    }
+                    fallbackPool.updateFallbackReserves(isTokenAInput, amountIn, amountOut);
+                }
+            }
+
+            // Validate price
+            DynamicFeeLibrary.validatePrice(feeState, this, isTokenAInput ? tokenA : tokenB, amountIn, amountOut, tokenA, tokenB);
+
+            // Update tick and price only for non-concentrated liquidity swaps
+            if (!usedConcentratedLiquidity) {
+                int24 _currentTick = feeState.currentTick;
+                uint160 sqrtPriceX96 = TickMathLibrary.tickToSqrtPriceX96(_currentTick);
+                uint160 nextSqrtPriceX96 = TickMathLibrary.calculateNextPrice(this, sqrtPriceX96, isTokenAInput, amountInWithFee);
+                feeState.currentTick = TickMathLibrary.sqrtPriceX96ToTick(nextSqrtPriceX96);
+            }
+
+            // Transfer tokens
+            address outputToken = isTokenAInput ? tokenB : tokenA;
+            IERC20Upgradeable(inputToken).safeTransferFrom(msg.sender, address(this), amountIn);
+            IERC20Upgradeable(outputToken).safeTransfer(recipient, amountOut);
+            if (treasuryFee > 0) {
+                IERC20Upgradeable(inputToken).safeTransfer(treasury, treasuryFee);
+            }
+            lpFees[recipient][inputToken] += lpFee;
+
+            // Update volatility
+            DynamicFeeLibrary.updateVolatility(feeState, this, tokenA, tokenB);
+        } else {
+            // OrderBook handled the swap
+            lpFees[recipient][inputToken] += lpFee;
+            if (treasuryFee > 0) {
+                IERC20Upgradeable(inputToken).safeTransfer(treasury, treasuryFee);
             }
         }
-
-        // Validate price
-        DynamicFeeLibrary.validatePrice(feeState, this, isTokenAInput ? tokenA : tokenB, amountIn, amountOut, tokenA, tokenB);
-
-        // Update tick and price only for non-concentrated liquidity swaps
-        if (!usedConcentratedLiquidity) {
-            int24 _currentTick = feeState.currentTick;
-            uint160 sqrtPriceX96 = TickMathLibrary.tickToSqrtPriceX96(_currentTick);
-            uint160 nextSqrtPriceX96 = TickMathLibrary.calculateNextPrice(this, sqrtPriceX96, isTokenAInput, amountInWithFee);
-            feeState.currentTick = TickMathLibrary.sqrtPriceX96ToTick(nextSqrtPriceX96);
-        }
-
-        // Transfer tokens
-        address outputToken = isTokenAInput ? tokenB : tokenA;
-        IERC20Upgradeable(inputToken).safeTransferFrom(msg.sender, address(this), amountIn);
-        IERC20Upgradeable(outputToken).safeTransfer(recipient, amountOut);
-        if (treasuryFee > 0) {
-            IERC20Upgradeable(inputToken).safeTransfer(treasury, treasuryFee);
-        }
-        lpFees[recipient][inputToken] += lpFee;
-
-        // Update volatility
-        DynamicFeeLibrary.updateVolatility(feeState, this, tokenA, tokenB);
 
         emit Swap(msg.sender, inputToken, amountIn, amountOut, fee);
         return amountOut;
+    }
+
+    // --- OrderBook Integration Functions ---
+
+    /// @notice Attempts to execute a swap through the OrderBook
+    function _tryOrderBookSwap(
+        bool isTokenAInput,
+        uint256 amountIn,
+        uint256 minAmountOut,
+        address recipient
+    ) internal returns (uint256 amountOut) {
+        if (orderBook == address(0)) return 0; // OrderBook not set
+
+        try IOrderBook(orderBook).getAggregatedPrice(tokenA, tokenB) returns (uint256 orderBookPrice) {
+            // Check if OrderBook has better price
+            uint256 ammPrice = getOraclePrice();
+            if ((isTokenAInput && orderBookPrice < ammPrice) || (!isTokenAInput && orderBookPrice > ammPrice)) {
+                // Place market order in OrderBook
+                IERC20Upgradeable(isTokenAInput ? tokenA : tokenB).safeTransferFrom(msg.sender, address(this), amountIn);
+                IERC20Upgradeable(isTokenAInput ? tokenA : tokenB).approve(orderBook, amountIn);
+
+                uint256 orderId = IOrderBook(orderBook).placeOrder(
+                    isTokenAInput, // isBuy
+                    true, // isMarket
+                    false, // isStopLoss
+                    0, // price (0 for market order)
+                    0, // triggerPrice
+                    uint96(amountIn),
+                    tokenA,
+                    tokenB,
+                    0, // expiryTimestamp (0 for immediate execution)
+                    false // useConcentratedLiquidity
+                );
+
+                // Match orders
+                IOrderBook(orderBook).matchOrders(minAmountOut);
+
+                // Retrieve order details
+                (, , , , uint96 executedAmount, , , , , , , , , , , , , , , ) = IOrderBook(orderBook).getOrder(orderId);
+                amountOut = executedAmount;
+
+                if (amountOut >= minAmountOut) {
+                    IERC20Upgradeable(isTokenAInput ? tokenB : tokenA).safeTransfer(recipient, amountOut);
+                    emit OrderBookSwap(msg.sender, isTokenAInput ? tokenA : tokenB, amountIn, amountOut, orderId);
+                } else {
+                    revert InsufficientOrderBookLiquidity(amountOut);
+                }
+            }
+        } catch {
+            // Fallback to AMM if OrderBook fails
+            return 0;
+        }
+
+        return amountOut;
+    }
+
+    /// @notice Places a perpetual order through the OrderBook
+    function placePerpetualOrder(
+        address tokenA,
+        address tokenB,
+        uint256 amount,
+        bool isBuy,
+        uint256 leverage,
+        uint256 margin
+    ) external whenNotPaused nonReentrant returns (uint256 orderId) {
+        if (orderBook == address(0)) revert OrderBookNotSet();
+        if (tokenA != this.tokenA || tokenB != this.tokenB) revert InvalidToken(tokenA);
+
+        IERC20Upgradeable usdc = IERC20Upgradeable(tokenA); // Assuming tokenA is USDC for margin
+        usdc.safeTransferFrom(msg.sender, address(this), margin);
+        usdc.approve(orderBook, margin);
+
+        try IOrderBook(orderBook).placePerpetualOrder(tokenA, tokenB, amount, isBuy, leverage, margin) returns (uint256 _orderId) {
+            orderId = _orderId;
+            emit OrderBookPerpetualPlaced(orderId, msg.sender, isBuy, leverage, margin);
+        } catch {
+            revert OrderBookInteractionFailed("Failed to place perpetual order");
+        }
+    }
+
+    // --- Concentrated Liquidity Functions ---
+
+    function addConcentratedLiquidity(
+        int24 tickLower,
+        int24 tickUpper,
+        uint256 amountA,
+        uint256 amountB
+    ) external whenNotPaused nonReentrant returns (uint256 positionId) {
+        positionId = concentratedLiquidity.addConcentratedLiquidity(msg.sender, tickLower, tickUpper, amountA, amountB);
+
+        // Optionally add to OrderBook as a limit order
+        if (orderBook != address(0)) {
+            try IOrderBook(orderBook).placeOrder(
+                true, // isBuy (assuming providing liquidity as a bid)
+                false, // isMarket
+                false, // isStopLoss
+                uint96(getOraclePrice()), // Current price
+                0, // triggerPrice
+                uint96(amountA), // amount
+                tokenA,
+                tokenB,
+                uint64(block.timestamp + 1 days), // expiry
+                true // useConcentratedLiquidity
+            ) {} catch {
+                // Continue even if OrderBook placement fails
+            }
+        }
+
+        return positionId;
+    }
+
+    function removeConcentratedLiquidity(uint256 positionId, uint128 liquidity)
+        external
+        whenNotPaused
+        nonReentrant
+        onlyPositionOwner(positionId)
+    {
+        concentratedLiquidity.removeConcentratedLiquidity(positionId, liquidity);
+    }
+
+    function collectFees(uint256 positionId) external override whenNotPaused nonReentrant onlyPositionManager {
+        concentratedLiquidity.collectFees(positionId);
+    }
+
+    function collectFeesInternal(uint256 positionId) external onlyPositionAdjuster {
+        concentratedLiquidity.collectFeesInternal(positionId);
+    }
+
+    function authorizeAdjuster(uint256 positionId, address adjuster) external onlyPositionOwner(positionId) {
+        if (adjuster == address(0)) revert InvalidAddress(adjuster, "Invalid adjuster address");
+        authorizedAdjusters[positionId] = adjuster;
+        emit PositionAdjusterUpdated(adjuster);
+    }
+
+    function adjust(
+        uint256 positionId,
+        int24 tickLower,
+        int24 tickUpper,
+        uint256 liquidity
+    ) external whenNotPaused nonReentrant onlyAuthorizedAdjusters(positionId) {
+        concentratedLiquidity.adjust(positionId, tickLower, tickUpper, uint128(liquidity));
+    }
+
+    function getFeeGrowthInside(int24 tickLower, int24 tickUpper, uint256 positionId) 
+        external 
+        view 
+        returns (uint128 feesOwed0, uint128 feesOwed1) 
+    {
+        return concentratedLiquidity.getFeeGrowthInside(positionId);
+    }
+
+    // --- Fallback Pool Functions ---
+
+    function exitFallbackPool(uint256 positionId) external override whenNotPaused nonReentrant onlyPositionOwner(positionId) {
+        fallbackPool.exitFallbackPool(positionId);
+    }
+
+    function exitFallbackPoolInternal(uint256 positionId) external onlyPositionAdjuster {
+        fallbackPool.exitFallbackPoolInternal(positionId);
+    }
+
+    function compoundFallbackFeesInternal(uint256 positionId, uint256 tokensOwed0, uint256 tokensOwed1) external onlyPositionAdjuster {
+        fallbackPool.compoundFallbackFeesInternal(positionId, tokensOwed0, tokensOwed1);
+    }
+
+    function transferToken(address token, address recipient, uint256 amount) external onlyPositionAdjuster {
+        fallbackPool.transferToken(token, recipient, amount);
     }
 
     // --- Cross-Chain Functions ---
@@ -788,6 +948,29 @@ contract AMMPool is
         bytes calldata adapterParams
     ) external payable whenNotPaused whenChainNotPaused(dstChainId) nonReentrant {
         crossChainModule.addLiquidityCrossChain{value: msg.value}(msg.sender, amountA, amountB, dstChainId, adapterParams);
+
+        // Optionally add to OrderBook on destination chain
+        if (orderBook != address(0)) {
+            bytes memory payload = abi.encode(
+                msg.sender,
+                false, // isBuy
+                false, // isMarket
+                false, // isStopLoss
+                uint96(getOraclePrice()), // price
+                0, // triggerPrice
+                uint96(amountA), // amount
+                tokenA,
+                tokenB,
+                uint64(block.timestamp + 1 days), // expiry
+                true // useConcentratedLiquidity
+            );
+            try IOrderBook(orderBook).placeOrderCrossChain(
+                false, false, false, uint96(getOraclePrice()), 0, uint96(amountA),
+                tokenA, tokenB, uint64(block.timestamp + 1 days), true, dstChainId, adapterParams
+            ) {} catch {
+                // Continue even if OrderBook cross-chain placement fails
+            }
+        }
     }
 
     function addConcentratedLiquidityCrossChain(
@@ -962,6 +1145,12 @@ contract AMMPool is
         governanceModule.updateWormholeTrustedSender(chainId, senderAddress);
     }
 
+    function setOrderBook(address newOrderBook) external onlyGovernance {
+        if (newOrderBook == address(0)) revert InvalidAddress(newOrderBook, "Invalid OrderBook address");
+        orderBook = newOrderBook;
+        emit OrderBookSet(newOrderBook);
+    }
+
     // --- Other Functions ---
 
     function claimLPFee(address token) external nonReentrant {
@@ -1072,6 +1261,29 @@ contract AMMPool is
         );
     }
 
+    function positions(uint256 positionId) external view override returns (
+        address owner,
+        int24 tickLower,
+        int24 tickUpper,
+        uint128 liquidity,
+        uint256 feeGrowthInside0LastX128,
+        uint256 feeGrowthInside1LastX128,
+        uint128 tokensOwed0,
+        uint128 tokensOwed1
+    ) {
+        Position storage position = _positions[positionId];
+        return (
+            position.owner,
+            position.tickLower,
+            position.tickUpper,
+            position.liquidity,
+            position.feeGrowthInside0LastX128,
+            position.feeGrowthInside1LastX128,
+            position.tokensOwed0,
+            position.tokensOwed1
+        );
+    }
+
     function getCrossChainReserves() external view returns (uint128 reserveA, uint128 reserveB) {
         return (reserves.crossChainReserveA, reserves.crossChainReserveB);
     }
@@ -1159,6 +1371,15 @@ contract AMMPool is
 
     function getTickSpacing() external view returns (uint24) {
         return TICK_SPACING;
+    }
+
+    function getOrderBookPrice() external view returns (uint256) {
+        if (orderBook == address(0)) return 0;
+        try IOrderBook(orderBook).getAggregatedPrice(tokenA, tokenB) returns (uint256 price) {
+            return price;
+        } catch {
+            return 0;
+        }
     }
 
     // --- Setter Functions ---
@@ -1272,6 +1493,7 @@ contract AMMPool is
     }
 
     // --- Internal Helper Functions ---
+
     function getOraclePrice() public view returns (uint256 price) {
         for (uint256 i = 0; i <= MAX_ORACLE_RETRIES; i++) {
             try IPriceOracle(primaryPriceOracle).getPrice(tokenA, tokenB) returns (int256 oraclePrice) {
@@ -1504,7 +1726,7 @@ contract AMMPool is
         uint256 totalNativeFee
     ) external onlyCrossChainModule {
         emit BatchMessagesSent(dstChainIds, messengerType, totalNativeFee);
-    }    
+    }
 
     function emitBatchRetryProcessed(
         uint256[] memory messageIds,

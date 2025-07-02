@@ -1,13 +1,13 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.24;
 
-import "@openzeppelin/contracts-upgradeable@5.0.2/proxy/utils/Initializable.sol";
-import "@openzeppelin/contracts-upgradeable@5.0.2/proxy/utils/UUPSUpgradeable.sol";
-import "@openzeppelin/contracts-upgradeable@5.0.2/access/OwnableUpgradeable.sol";
-import "@openzeppelin/contracts-upgradeable@5.0.2/security/ReentrancyGuardUpgradeable.sol";
-import "@openzeppelin/contracts-upgradeable@5.0.2/security/PausableUpgradeable.sol";
-import "@openzeppelin/contracts@5.0.2/token/ERC20/IERC20.sol";
-import "@chainlink/contracts@1.2.0/src/v0.8/interfaces/AggregatorV3Interface.sol";
+import "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
+import "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/security/ReentrancyGuardUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/security/PausableUpgradeable.sol";
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@chainlink/contracts/src/v0.8/interfaces/AggregatorV3Interface.sol";
 
 // Interface for Band Protocol (fallback oracle)
 interface IBandProtocol {

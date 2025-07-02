@@ -10,6 +10,8 @@ import "@openzeppelin/contracts-upgradeable/token/ERC20/utils/SafeERC20Upgradeab
 import "@openzeppelin/contracts-upgradeable/token/ERC20/IERC20Upgradeable.sol";
 import "@openzeppelin/contracts-upgradeable/utils/cryptography/ECDSAUpgradeable.sol";
 import "@openzeppelin/contracts-upgradeable/utils/cryptography/EIP712Upgradeable.sol";
+import {IPriceOracle, ICrossChainModule, IAMMPool, IGovernanceModule, IGovernanceToken, ICrossChainRetryOracle} from "./Interfaces.sol";
+
 
 /// @title OrderBook - Advanced DEX order book with perpetual futures, AMM, governance, and cross-chain functionality
 /// @notice Manages limit, market, stop-loss, and perpetual orders with concentrated liquidity and gasless trading
@@ -25,138 +27,7 @@ contract OrderBook is
     using SafeERC20Upgradeable for IERC20Upgradeable;
     using ECDSAUpgradeable for bytes32;
 
-    // Interfaces
-    interface IPriceOracle {
-        function getSpotPrice(address tokenA, address tokenB) external view returns (uint256);
-        function getIndexPrice(address tokenA, address tokenB) external view returns (uint256);
-        function getCurrentPairPrice(address, address) external view returns (uint256 price, bool cachedStatus);
-    }
-
-    interface ICrossChainModule {
-        function sendCrossChainOrder(address targetChain, bytes memory orderData) external;
-        function receiveCrossChainOrder(bytes memory orderData) external;
-        function batchCrossChainMessages(
-            uint16[] memory dstChainIds,
-            string[] memory dstChainNames,
-            bytes[] memory payloads,
-            bytes[] memory adapterParams,
-            uint256[] memory retryDelays
-        ) external payable;
-    }
-
-    interface IAMMPool {
-        function token0() external view returns (address);
-        function token1() external view returns (address);
-        function treasury() external view returns (address);
-        function swap(uint256 amount0Out, uint256 amount1Out, address to, bytes calldata data) external returns (uint256);
-        function getVolatility() external view returns (uint256);
-        function adjustLiquidityRange(uint256 minPrice, uint256 maxPrice) external;
-        function getConcentratedPrice() external view returns (uint256);
-        function rebalanceReserves(uint16 chainId) external;
-        function chainIdToAxelarChain(uint16 chainId) external view returns (string memory);
-    }
-
-    interface IGovernanceModule {
-        // Placeholder for governance interface
-    }
-
-    interface IGovernanceToken {
-        function transfer(address to, uint256 amount) external returns (bool);
-        function transferFrom(address from, address to, uint256 amount) external returns (bool);
-    }
-
-    interface ICrossChainRetryOracle {
-        struct NetworkStatus {
-            bool bridgeOperational;
-            bool retryRecommended;
-            uint256 recommendedRetryDelay;
-        }
-        function getNetworkStatus(uint64 chainId) external view returns (NetworkStatus memory);
-    }
-
-    /// @notice Packed structure representing an order
-    struct Order {
-        address user; // Order creator
-        address tokenA; // Base token
-        address tokenB; // Quote token
-        uint96 price; // Price per token in wei
-        uint96 amount; // Token amount
-        uint96 triggerPrice; // Trigger price for stop-loss
-        uint64 timestamp; // Creation time
-        uint64 expiryTimestamp; // Expiry time
-        uint256 orderId; // Unique global order ID
-        bool isBuy : 1; // True for buy, false for sell
-        bool isMarket : 1; // True for market order
-        bool isStopLoss : 1; // True for stop-loss order
-        bool locked : 1; // True if locked
-        bool useConcentratedLiquidity : 1; // Use AMM concentrated liquidity
-        bool isPerpetual : 1; // True for perpetual contract
-        uint256 leverage; // Leverage (e.g., 20x = 20)
-        uint256 initialMargin; // Collateral deposited
-        uint256 maintenanceMargin; // Minimum margin to avoid liquidation
-        uint256 lastFundingTimestamp; // Last funding rate application
-        int256 cumulativeFunding; // Funding payments (positive = owed, negative = received)
-    }
-
-    /// @notice Structure for fee tiers
-    struct FeeTier {
-        uint256 orderSizeThreshold; // Minimum order size in wei
-        uint256 feeRateBps; // Fee rate in basis points
-    }
-
-    /// @notice Structure for order book snapshot
-    struct Snapshot {
-        uint64 timestamp; // Snapshot time
-        uint256[] bidOrderIds; // Active bid IDs
-        uint256[] askOrderIds; // Active ask IDs
-    }
-
-    /// @notice Structure for signed order
-    struct SignedOrder {
-        address user;
-        bool isBuy;
-        bool isMarket;
-        bool isStopLoss;
-        uint96 price;
-        uint96 triggerPrice;
-        uint96 amount;
-        uint64 expiryTimestamp;
-        address tokenA;
-        address tokenB;
-        bool useConcentratedLiquidity;
-        uint256 nonce;
-        bytes signature;
-    }
-
-    /// @notice Structure for governance proposal
-    struct Proposal {
-        uint256 proposalId; // Unique ID
-        address proposer; // Creator
-        string description; // Proposal details
-        uint256 voteCount; // Total votes
-        uint64 endTime; // Voting deadline
-        bool executed; // Execution status
-        ProposalType proposalType; // Type of proposal
-        bytes data; // Encoded data for execution
-        mapping(address => bool) hasVoted; // Voter tracking
-    }
-
-    /// @notice Enum for proposal types
-    enum ProposalType {
-        ParameterChange,
-        Upgrade,
-        TreasuryAllocation,
-        Other
-    }
-
-    /// @notice Structure for trader rewards
-    struct TraderReward {
-        uint256 accumulatedFees; // Fees paid by trader
-        uint64 lastClaimTimestamp; // Last reward claim time
-        uint256 unclaimedTokens; // Unclaimed governance tokens
-    }
-
-    // Storage
+    // Storage and rest of the contract remains unchanged
     uint256[] public bidHeap; // Max-heap for bids
     uint256[] public askHeap; // Min-heap for asks
     mapping(uint256 => Order) public orders; // Order ID to Order
@@ -204,7 +75,83 @@ contract OrderBook is
     uint256 public fundingRateCapBps = 10; // Max 0.1% per hour
     uint256 public liquidationFeeBps = 50; // 0.5% liquidation fee
 
-    // Custom Errors
+    // Structs and Enums (unchanged)
+    struct Order {
+        address user;
+        address tokenA;
+        address tokenB;
+        uint96 price;
+        uint96 amount;
+        uint96 triggerPrice;
+        uint64 timestamp;
+        uint64 expiryTimestamp;
+        uint256 orderId;
+        bool isBuy : 1;
+        bool isMarket : 1;
+        bool isStopLoss : 1;
+        bool locked : 1;
+        bool useConcentratedLiquidity : 1;
+        bool isPerpetual : 1;
+        uint256 leverage;
+        uint256 initialMargin;
+        uint256 maintenanceMargin;
+        uint256 lastFundingTimestamp;
+        int256 cumulativeFunding;
+    }
+
+    struct FeeTier {
+        uint256 orderSizeThreshold;
+        uint256 feeRateBps;
+    }
+
+    struct Snapshot {
+        uint64 timestamp;
+        uint256[] bidOrderIds;
+        uint256[] askOrderIds;
+    }
+
+    struct SignedOrder {
+        address user;
+        bool isBuy;
+        bool isMarket;
+        bool isStopLoss;
+        uint96 price;
+        uint96 triggerPrice;
+        uint96 amount;
+        uint64 expiryTimestamp;
+        address tokenA;
+        address tokenB;
+        bool useConcentratedLiquidity;
+        uint256 nonce;
+        bytes signature;
+    }
+
+    struct Proposal {
+        uint256 proposalId;
+        address proposer;
+        string description;
+        uint256 voteCount;
+        uint64 endTime;
+        bool executed;
+        ProposalType proposalType;
+        bytes data;
+        mapping(address => bool) hasVoted;
+    }
+
+    enum ProposalType {
+        ParameterChange,
+        Upgrade,
+        TreasuryAllocation,
+        Other
+    }
+
+    struct TraderReward {
+        uint256 accumulatedFees;
+        uint64 lastClaimTimestamp;
+        uint256 unclaimedTokens;
+    }
+
+    // Custom Errors (unchanged)
     error InvalidOrder();
     error InvalidOrderId(uint256 orderId);
     error NotOrderOwner(address user);
@@ -251,7 +198,7 @@ contract OrderBook is
     error MarginTransferFailed();
     error PositionNotLiquidatable(uint256 orderId);
 
-    // Events
+    // Events (unchanged)
     event OrderPlaced(
         address indexed user,
         bool isBuy,
@@ -334,6 +281,7 @@ contract OrderBook is
     constructor() {
         _disableInitializers();
     }
+
 
     /// @notice Initializes the contract
     function initialize(
