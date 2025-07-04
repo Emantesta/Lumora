@@ -122,7 +122,7 @@ error InvalidExpiry();
 error InvalidAmount();
 error InvalidPremium();
 error NotOptionOwner();
-error OptionExercised();
+error OptionAlreadyExercised();
 error OptionExpired();
 error NotInTheMoney();
 error TransferFailed();
@@ -682,7 +682,7 @@ contract CryptoOptions is Initializable, UUPSUpgradeable, OwnableUpgradeable, Re
         Option storage option = options[_optionId];
         if (option.buyer != msg.sender && msg.sender != owner()) revert NotOptionOwner();
         if (option.optionType != OptionType.AsianAveragePrice && option.optionType != OptionType.AsianAverageStrike) revert InvalidOptionType();
-        if (option.exercised) revert OptionExercised();
+        if (option.exercised) revert OptionAlreadyExercised();
         if (block.timestamp > option.expiry) revert OptionExpired();
 
         uint256 currentIndex;
@@ -714,7 +714,7 @@ contract CryptoOptions is Initializable, UUPSUpgradeable, OwnableUpgradeable, Re
         Option storage option = options[_optionId];
         if (option.buyer != msg.sender && msg.sender != owner()) revert NotOptionOwner();
         if (option.optionType != OptionType.LookbackFixedStrike && option.optionType != OptionType.LookbackFloatingStrike) revert InvalidOptionType();
-        if (option.exercised) revert OptionExercised();
+        if (option.exercised) revert OptionAlreadyExercised();
         if (block.timestamp > option.expiry && option.expiry != 0) revert OptionExpired();
 
         (uint256 price, bool isValid) = getAssetPrice(option.underlyingToken, option.quoteToken);
@@ -760,7 +760,7 @@ contract CryptoOptions is Initializable, UUPSUpgradeable, OwnableUpgradeable, Re
         Option storage option = options[_optionId];
         if (option.buyer != msg.sender) revert NotOptionOwner();
         if (option.optionType != OptionType.Perpetual) revert InvalidOptionType();
-        if (option.exercised) revert OptionExercised();
+        if (option.exercised) revert OptionAlreadyExercised();
         if (block.timestamp < option.lastFundingPayment + fundingInterval) revert FundingRateNotPaid();
 
         uint256 fundingAmount = (option.premium * option.fundingRateBps) / BPS_DENOMINATOR;
@@ -778,19 +778,19 @@ contract CryptoOptions is Initializable, UUPSUpgradeable, OwnableUpgradeable, Re
     function exerciseOption(uint256 _optionId) public payable nonReentrant whenNotPaused {
         Option storage option = options[_optionId];
         if (option.buyer != msg.sender) revert NotOptionOwner();
-        if (option.exercised) revert OptionExercised();
+        if (option.exercised) revert OptionAlreadyExercised();
         if (option.optionType != OptionType.Perpetual && block.timestamp > option.expiry) revert OptionExpired();
         if (option.optionType != OptionType.Perpetual && !option.isAmerican && block.timestamp != option.expiry) revert OptionExpired();
         if (option.optionType == OptionType.Perpetual && block.timestamp >= option.lastFundingPayment + fundingInterval) revert FundingRateNotPaid();
 
         if (option.optionType == OptionType.BarrierKnockIn || option.optionType == OptionType.BarrierKnockOut) {
-            (uint256 price, bool isValid) = getAssetPrice(option.underlyingToken, option.quoteToken);
-            if (!isValid) revert InvalidPrice();
-            if (option.optionType == OptionType.BarrierKnockIn && price < option.barrierPrice) revert BarrierNotMet();
-            if (option.optionType == OptionType.BarrierKnockOut && price >= option.barrierPrice) revert BarrierNotMet();
+            (uint256 currentPrice, bool priceValid) = getAssetPrice(option.underlyingToken, option.quoteToken);
+            if (!priceValid) revert InvalidPrice();
+            if (option.optionType == OptionType.BarrierKnockIn && currentPrice < option.barrierPrice) revert BarrierNotMet();
+            if (option.optionType == OptionType.BarrierKnockOut && currentPrice >= option.barrierPrice) revert BarrierNotMet();
         }
 
-        uint256 price;
+        uint256 price; 
         bool isValid;
         if (option.optionType == OptionType.AsianAveragePrice || option.optionType == OptionType.AsianAverageStrike) {
             price = calculateAveragePrice(_optionId);
@@ -879,7 +879,7 @@ contract CryptoOptions is Initializable, UUPSUpgradeable, OwnableUpgradeable, Re
         Option storage option = options[_optionId];
         if (option.buyer != msg.sender) revert NotOptionOwner();
         if (option.optionType != OptionType.Perpetual && block.timestamp <= option.expiry) revert OptionExpired();
-        if (option.exercised) revert OptionExercised();
+        if (option.exercised) revert OptionAlreadyExercised();
 
         uint256 refund = option.premium;
         option.exercised = true;

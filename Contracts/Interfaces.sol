@@ -5,7 +5,7 @@ interface IPriceOracle {
     function getPrice(address asset) external returns (uint256);
     function getPrice(address tokenA, address tokenB) external view returns (int256);
     function getCurrentPrice(address asset) external view returns (uint256);
-    function getCurrentPairPrice(address baseToken, address quoteToken) external view returns (uint256 price, bool cachedStatus);
+    function getCurrentPairPrice(address baseToken, address quoteToken) external view returns (uint256 price, bool cachedStatus, uint256 timestamp);
     function assetConfigs(address pool) external view returns (
         uint256, address, address, uint256, uint256, uint256, uint256, uint256, uint256
     );
@@ -65,6 +65,14 @@ interface IAMMPool {
         uint16 dstChainId,
         bytes calldata adapterParams
     ) external payable;
+    function addConcentratedLiquidityCrossChain(
+        uint256 positionId,
+        address owner,
+        int24 tickLower,
+        int24 tickUpper,
+        uint16 srcChainId,
+        address recipient
+    ) external;
     function collectFeesInternal(uint256 positionId) external;
     function adjust(uint256 positionId, int24 tickLower, int24 tickUpper, uint256 liquidity) external;
     function exitFallbackPoolInternal(uint256 positionId) external;
@@ -84,8 +92,6 @@ interface IAMMPool {
     function emaVol() external view returns (uint256);
     function getReserves() external view returns (uint64 reserveA, uint64 reserveB);
     function TICK_SPACING() external view returns (uint24);
-    event PositionCreated(uint256 indexed positionId, address indexed owner, int24 tickLower, int24 tickUpper, uint128 liquidity);
-    event VolatilityThresholdUpdated(uint256 newThreshold);
     function getVolatilityThreshold() external view returns (uint256);
     function volatilityThreshold() external view returns (uint256);
     function updateVolatilityThreshold(uint256 newThreshold) external;
@@ -117,51 +123,7 @@ interface IAMMPool {
     function validatedMessages(bytes32 messageHash) external view returns (bool);
     function setValidatedMessages(bytes32 messageHash, bool validated) external;
     function wormholeTrustedSenders(uint16 chainId) external view returns (bytes32);
-    function emitCrossChainLiquiditySent(
-        address provider,
-        uint256 amountA,
-        uint256 amountB,
-        uint16 dstChainId,
-        uint64 nonce,
-        uint256 timelock,
-        uint256 positionId
-    ) external;
-    function emitCrossChainSwap(
-        address user,
-        address inputToken,
-        uint256 amountIn,
-        uint256 amountOut,
-        uint16 dstChainId,
-        uint64 nonce,
-        uint256 timelock,
-        uint8 messengerType
-    ) external;
-    function emitCrossChainLiquidityReceived(
-        address provider,
-        uint256 amountA,
-        uint256 amountB,
-        uint256 amountB,
-        uint16 srcChainId,
-        uint64 nonce,
-        uint8 messengerType
-    ) external;
-    function emitFailedMessageStored(
-        uint256 messageId,
-        uint16 dstChainId,
-        string memory dstAxelarChain,
-        uint256 timestamp,
-        uint8 messengerType
-    ) external;
-    function emitFailedMessageRetried(
-        uint256 messageId,
-        uint16 dstChainId,
-        uint256 retries,
-        uint8 messengerType
-    ) external;
-    function emitFailedMessageRetryScheduled(uint256 messageId, uint256 nextRetryTimestamp) external;
-    function emitBatchMessagesSent(uint16[] memory dstChainIds, uint8 messengerType, uint256 totalFee) external;
-    function emitBatchRetryProcessed(uint256[] memory messageIds, uint256 successfulRetries, uint256 failedRetries) external;
-    // Add functions from OrderBook.sol for compatibility
+    function addLiquidityFromFees(uint256 positionId, uint256 amount0, uint256 amount1) external; // Added function
     function token0() external view returns (address);
     function token1() external view returns (address);
     function treasury() external view returns (address);
@@ -170,6 +132,52 @@ interface IAMMPool {
     function adjustLiquidityRange(uint256 minPrice, uint256 maxPrice) external;
     function getConcentratedPrice() external view returns (uint256);
     function rebalanceReserves(uint16 chainId) external;
+
+    event PositionCreated(uint256 indexed positionId, address indexed owner, int24 tickLower, int24 tickUpper, uint128 liquidity);
+    event VolatilityThresholdUpdated(uint256 newThreshold);
+    event CrossChainLiquiditySent(
+        address indexed provider,
+        uint256 amountA,
+        uint256 amountB,
+        uint16 dstChainId,
+        uint64 nonce,
+        uint256 timelock,
+        uint256 positionId
+    );
+    event CrossChainSwap(
+        address indexed user,
+        address inputToken,
+        uint256 amountIn,
+        uint256 amountOut,
+        uint16 dstChainId,
+        uint64 nonce,
+        uint256 timelock,
+        uint8 messengerType
+    );
+    event CrossChainLiquidityReceived(
+        address indexed provider,
+        uint256 amountA,
+        uint256 amountB,
+        uint16 srcChainId,
+        uint64 nonce,
+        uint8 messengerType
+    );
+    event FailedMessageStored(
+        uint256 indexed messageId,
+        uint16 dstChainId,
+        string dstAxelarChain,
+        uint256 timestamp,
+        uint8 messengerType
+    );
+    event FailedMessageRetried(
+        uint256 indexed messageId,
+        uint16 dstChainId,
+        uint256 retries,
+        uint8 messengerType
+    );
+    event FailedMessageRetryScheduled(uint256 indexed messageId, uint256 nextRetryTimestamp);
+    event BatchMessagesSent(uint16[] dstChainIds, uint8 messengerType, uint256 totalFee);
+    event BatchRetryProcessed(uint256[] messageIds, uint256 successfulRetries, uint256 failedRetries);
 }
 
 interface IPositionManager {

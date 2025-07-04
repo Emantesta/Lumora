@@ -56,7 +56,7 @@ interface IOrderBook {
         uint96 triggerPrice,
         uint64 timestamp,
         uint64 expiryTimestamp,
-        uint256 orderId,
+        uint256 returnedorderId,
         bool isBuy,
         bool isMarket,
         bool isStopLoss,
@@ -129,6 +129,7 @@ contract AMMPool is
     address public positionManager;
     address public positionAdjuster;
     address public governance;
+    address public crossChainModuleAddress;
     address public primaryPriceOracle;
     address[] public fallbackPriceOracles;
     address public orderBook; // Reference to OrderBook contract
@@ -217,7 +218,7 @@ contract AMMPool is
     ConcentratedLiquidity public concentratedLiquidity;
     CrossChainModule public crossChainModule;
     FallbackPool public fallbackPool;
-    GovernanceModule public governance;
+    GovernanceModule public governanceModule;
 
     // Constants
     uint256 public constant PRICE_HISTORY_SIZE = 20;
@@ -329,7 +330,6 @@ contract AMMPool is
     event OrderBookSet(address indexed orderBook);
     event OrderBookSwap(address indexed user, address indexed inputToken, uint256 amountIn, uint256 amountOut, uint256 orderId);
     event OrderBookPerpetualPlaced(uint256 indexed orderId, address indexed user, bool isBuy, uint256 leverage, uint256 margin);
-    event PositionCreated(uint256 indexed positionId, address indexed owner, int24 tickLower, int24 tickUpper, uint128 liquidity);
 
     // Modifiers
     modifier whenNotPaused() {
@@ -343,7 +343,7 @@ contract AMMPool is
     }
 
     modifier onlyGovernance() {
-        if (msg.sender != governance) revert Unauthorized();
+        if (msg.sender != address(governanceModule)) revert Unauthorized();
         _;
     }
 
@@ -387,6 +387,47 @@ contract AMMPool is
     modifier onlyLiquidityOrCrossChain() {
         if (msg.sender != address(concentratedLiquidity) && msg.sender != crossChainModuleAddress) revert Unauthorized();
         _;
+    }
+
+    /// @notice Adjusts the liquidity range for a position
+    /// @param minPrice The minimum price for the liquidity range
+    /// @param maxPrice The maximum price for the liquidity range
+    function adjustLiquidityRange(uint256 minPrice, uint256 maxPrice) external override onlyPositionAdjuster {
+        // Convert prices to ticks
+        int24 tickLower = TickMathLibrary.priceToTick(minPrice);
+        int24 tickUpper = TickMathLibrary.priceToTick(maxPrice);
+
+        // Validate tick range
+        if (tickLower >= tickUpper || tickLower < TickMathLibrary.MIN_TICK || tickUpper > TickMathLibrary.MAX_TICK) {
+            revert InvalidTickRange(tickLower, tickUpper);
+        }
+
+        // Adjust liquidity range through the concentrated liquidity module
+        // Assuming positionId is managed externally or a default position is used
+        // For simplicity, adjust the first position owned by the caller or revert
+        for (uint256 i = 1; i <= positionCounter; i++) {
+            if (_positions[i].owner == msg.sender) {
+                concentratedLiquidity.adjust(i, tickLower, tickUpper, _positions[i].liquidity);
+                emit PositionUpdated(i, tickLower, tickUpper, _positions[i].liquidity);
+                return;
+            }
+        }
+        revert PositionNotFound(0); // No position found for the caller
+    }
+
+    /// @notice Returns the current volatility from the fee state
+    /// @return The current volatility value
+    function getVolatility() external view override returns (uint256) {
+        return feeState.emaVolatility;
+    }
+
+    /// @notice Returns the concentrated price based on the current tick
+    /// @return The current concentrated price
+    function getConcentratedPrice() external view override returns (uint256) {
+        uint160 sqrtPriceX96 = TickMathLibrary.tickToSqrtPriceX96(feeState.currentTick);
+        // Convert sqrtPriceX96 to price (assuming tokenA/tokenB pair)
+        uint256 price = FullMath.mulDiv(uint256(sqrtPriceX96) * uint256(sqrtPriceX96), 1e18, 2**192);
+        return price;
     }
 
     // Constructor
@@ -526,7 +567,7 @@ contract AMMPool is
         uint256 amount1Out,
         address to,
         bytes calldata data
-    ) external whenNotPaused nonReentrant {
+    ) external whenNotPaused nonReentrant returns (uint256) {
         if (amount0Out == 0 && amount1Out == 0) revert InvalidAmount(0, 0);
         if (amount0Out > 0 && amount1Out > 0) revert InvalidAmount(amount0Out, amount1Out);
         if (to == address(0)) revert InvalidAddress(to, "Invalid recipient");
@@ -595,6 +636,7 @@ contract AMMPool is
             if (treasuryFee > 0) {
                 IERC20Upgradeable(inputToken).safeTransfer(treasury, treasuryFee);
             }
+            amountOut = orderBookAmountOut; // Update amountOut to reflect OrderBook swap
         }
 
         if (data.length > 0) {
@@ -602,6 +644,7 @@ contract AMMPool is
         }
 
         emit Swap(msg.sender, inputToken, amountIn, amountOut, fee);
+        return amountOut; // Return the amountOut
     }
 
     /// @notice Returns address of token0 (tokenA)
@@ -798,8 +841,8 @@ contract AMMPool is
                     0, // price (0 for market order)
                     0, // triggerPrice
                     uint96(amountIn),
-                    tokenA,
-                    tokenB,
+                    tokenA, // Use state variable
+                    tokenB, // Use state variable
                     0, // expiryTimestamp (0 for immediate execution)
                     false // useConcentratedLiquidity
                 );
@@ -828,21 +871,21 @@ contract AMMPool is
 
     /// @notice Places a perpetual order through the OrderBook
     function placePerpetualOrder(
-        address tokenA,
-        address tokenB,
+        address _tokenA,
+        address _tokenB,
         uint256 amount,
         bool isBuy,
         uint256 leverage,
         uint256 margin
     ) external whenNotPaused nonReentrant returns (uint256 orderId) {
         if (orderBook == address(0)) revert OrderBookNotSet();
-        if (tokenA != this.tokenA || tokenB != this.tokenB) revert InvalidToken(tokenA);
+        if (_tokenA != this.tokenA || _tokenB != this.tokenB) revert InvalidToken(_tokenA);
 
-        IERC20Upgradeable usdc = IERC20Upgradeable(tokenA); // Assuming tokenA is USDC for margin
+        IERC20Upgradeable usdc = IERC20Upgradeable(_tokenA);
         usdc.safeTransferFrom(msg.sender, address(this), margin);
         usdc.approve(orderBook, margin);
 
-        try IOrderBook(orderBook).placePerpetualOrder(tokenA, tokenB, amount, isBuy, leverage, margin) returns (uint256 _orderId) {
+        try IOrderBook(orderBook).placePerpetualOrder(_tokenA, _tokenB, amount, isBuy, leverage, margin) returns (uint256 _orderId) {
             orderId = _orderId;
             emit OrderBookPerpetualPlaced(orderId, msg.sender, isBuy, leverage, margin);
         } catch {
@@ -902,6 +945,16 @@ contract AMMPool is
         if (adjuster == address(0)) revert InvalidAddress(adjuster, "Invalid adjuster address");
         authorizedAdjusters[positionId] = adjuster;
         emit PositionAdjusterUpdated(adjuster);
+    }
+
+    function addLiquidityFromFees(uint256 positionId, uint256 amount0, uint256 amount1) 
+        external 
+        override 
+        whenNotPaused 
+        nonReentrant 
+        onlyPositionManager 
+    {
+        concentratedLiquidity.addLiquidityFromFees(positionId, amount0, amount1);
     }
 
     function adjust(
@@ -983,6 +1036,19 @@ contract AMMPool is
     ) external payable whenNotPaused whenChainNotPaused(dstChainId) nonReentrant {
         crossChainModule.addConcentratedLiquidityCrossChain{value: msg.value}(
             msg.sender, amountA, amountB, tickLower, tickUpper, dstChainId, adapterParams
+        );
+    }
+
+    function addConcentratedLiquidityCrossChain(
+        uint256 positionId,
+        address owner,
+        int24 tickLower,
+        int24 tickUpper,
+        uint16 srcChainId,
+        address recipient
+    ) external override whenNotPaused nonReentrant onlyPositionManager {
+        concentratedLiquidity.addConcentratedLiquidityCrossChain(
+            positionId, owner, tickLower, tickUpper, srcChainId, recipient
         );
     }
 

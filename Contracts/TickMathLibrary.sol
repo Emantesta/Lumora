@@ -17,6 +17,50 @@ library TickMathLibrary {
     error ZeroAmount();
     error InvalidToken(address token);
     error Overflow();
+    error InvalidPrice(uint256 price);
+
+    /// @notice Converts a price to a tick
+    /// @param price The price of token1/token0 (e.g., tokenB/tokenA) in 1e18 decimal format
+    /// @return tick The corresponding tick for the given price
+    function priceToTick(uint256 price) internal pure returns (int24 tick) {
+        if (price == 0) revert InvalidPrice(price);
+
+        // Calculate sqrtPriceX96 = sqrt(price) * 2^96
+        // Assume price is in 1e18 format (tokenB/tokenA)
+        // sqrt(price * 1e18) * 2^96 / 1e9 = sqrt(price) * 2^96 / 1e9
+        uint256 sqrtPrice = sqrt(price * 1e18); // Adjust for 1e18 decimals
+        uint160 sqrtPriceX96 = uint160(FullMath.mulDiv(sqrtPrice, 1 << 96, 1e9));
+
+        // Validate sqrtPriceX96 bounds
+        if (sqrtPriceX96 < TickMath.MIN_SQRT_RATIO || sqrtPriceX96 > TickMath.MAX_SQRT_RATIO) {
+            revert InvalidSqrtPriceX96(sqrtPriceX96);
+        }
+
+        // Convert sqrtPriceX96 to tick using Uniswap V3's TickMath
+        tick = TickMath.getTickAtSqrtRatio(sqrtPriceX96);
+
+        // Ensure tick is within valid bounds
+        if (tick < TickMath.MIN_TICK || tick > TickMath.MAX_TICK) {
+            revert InvalidTick(tick);
+        }
+
+        return tick;
+    }
+
+    /// @notice Computes the square root of a number
+    /// @param x The input number (scaled by 1e18 for precision)
+    /// @return y The square root of the input number (scaled by 1e9)
+    function sqrt(uint256 x) internal pure returns (uint256 y) {
+        if (x == 0) return 0;
+        uint256 z = (x + 1) / 2;
+        y = x;
+        while (z < y) {
+            y = z;
+            z = (x / z + z) / 2;
+        }
+        // Adjust for 1e18 input scaling (sqrt(1e18) = 1e9)
+        return y / 1e9;
+    }
 
     /// @notice Converts a tick to a sqrt price (Q64.96 format)
     /// @param tick The tick value

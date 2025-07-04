@@ -123,6 +123,58 @@ contract ConcentratedLiquidity is ReentrancyGuard {
         return positionId;
     }
 
+    function addLiquidityFromFees(uint256 positionId, uint256 amount0, uint256 amount1) 
+        external 
+        nonReentrant 
+        onlyPool 
+    {
+        (
+            address owner,
+            int24 tickLower,
+            int24 tickUpper,
+            uint128 currentLiquidity,
+            uint256 feeGrowthInside0LastX128,
+            uint256 feeGrowthInside1LastX128,
+            uint128 tokensOwed0,
+            uint128 tokensOwed1
+        ) = pool.positions(positionId);
+        if (currentLiquidity == 0) revert PositionNotFound(positionId);
+        if (amount0 > tokensOwed0 || amount1 > tokensOwed1) revert InvalidAmount(amount0, amount1);
+
+        // Calculate additional liquidity from fees
+        uint128 additionalLiquidity = _getLiquidityForAmounts(
+            tickLower, 
+            tickUpper, 
+            amount0, 
+            amount1, 
+            pool.getCurrentTick()
+        );
+        if (additionalLiquidity == 0) revert InsufficientLiquidity(additionalLiquidity);
+
+        // Update position
+        AMMPool.Position memory position;
+        position.owner = owner;
+        position.tickLower = tickLower;
+        position.tickUpper = tickUpper;
+        position.liquidity = currentLiquidity + additionalLiquidity;
+        position.feeGrowthInside0LastX128 = _isInRange(pool.getCurrentTick(), tickLower, tickUpper)
+            ? pool.feeGrowthGlobal0X128()
+            : 0;
+        position.feeGrowthInside1LastX128 = _isInRange(pool.getCurrentTick(), tickLower, tickUpper)
+            ? pool.feeGrowthGlobal1X128()
+            : 0;
+        position.tokensOwed0 = tokensOwed0 - uint128(amount0);
+        position.tokensOwed1 = tokensOwed1 - uint128(amount1);
+
+        pool.setPositionByLiquidity(positionId, position);
+
+        // Update ticks
+        _updateTick(tickLower, int128(additionalLiquidity), true);
+        _updateTick(tickUpper, int128(additionalLiquidity), false);
+
+        pool.emitPositionUpdated(positionId, tickLower, tickUpper, position.liquidity);
+    }
+
     /// @notice Removes liquidity from a concentrated position
     /// @param positionId The ID of the position
     /// @param liquidity The amount of liquidity to remove
@@ -172,6 +224,42 @@ contract ConcentratedLiquidity is ReentrancyGuard {
         }
 
         pool.emitPositionUpdated(positionId, tickLower, tickUpper, position.liquidity);
+    }
+
+    function addConcentratedLiquidityCrossChain(
+        uint256 positionId,
+        address owner,
+        int24 tickLower,
+        int24 tickUpper,
+        uint16 srcChainId,
+        address recipient
+    ) external nonReentrant onlyPool {
+        if (owner == address(0) || recipient == address(0)) 
+            revert InvalidAddress(owner, "Invalid owner or recipient");
+        if (!_isValidTickRange(tickLower, tickUpper)) 
+            revert InvalidTickRange(tickLower, tickUpper);
+        if (pool.positions(positionId).liquidity != 0) 
+            revert PositionNotFound(positionId); // Ensure positionId is new
+
+        // Create position without token transfer (tokens handled via bridge)
+        AMMPool.Position memory position;
+        position.owner = owner;
+        position.tickLower = tickLower;
+        position.tickUpper = tickUpper;
+        position.liquidity = 0; // Liquidity may be updated later via bridged tokens
+        position.feeGrowthInside0LastX128 = _isInRange(pool.getCurrentTick(), tickLower, tickUpper)
+            ? pool.feeGrowthGlobal0X128()
+            : 0;
+        position.feeGrowthInside1LastX128 = _isInRange(pool.getCurrentTick(), tickLower, tickUpper)
+            ? pool.feeGrowthGlobal1X128()
+            : 0;
+        position.tokensOwed0 = 0;
+        position.tokensOwed1 = 0;
+
+        pool.setPositionByLiquidity(positionId, position);
+
+        // Emit event (assuming tokens will be added later)
+        pool.emitPositionCreated(positionId, owner, tickLower, tickUpper, 0);
     }
 
     /// @notice Collects accumulated fees for a position

@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.24;
 
-import "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
-import "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
-import "@openzeppelin/contracts-upgradeable/security/PausableUpgradeable.sol";
-import "@openzeppelin/contracts-upgradeable/security/ReentrancyGuardUpgradeable.sol";
-import "@openzeppelin/contracts-upgradeable/utils/math/SafeMathUpgradeable.sol";
-import "@openzeppelin/contracts-upgradeable/token/ERC20/utils/SafeERC20Upgradeable.sol";
-import "@openzeppelin/contracts-upgradeable/token/ERC20/IERC20Upgradeable.sol";
-import "@openzeppelin/contracts-upgradeable/utils/cryptography/ECDSAUpgradeable.sol";
-import "@openzeppelin/contracts-upgradeable/utils/cryptography/EIP712Upgradeable.sol";
+import {Initializable} from "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
+import {UUPSUpgradeable} from "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
+import {PausableUpgradeable} from "@openzeppelin/contracts-upgradeable/security/PausableUpgradeable.sol";
+import {ReentrancyGuardUpgradeable} from "@openzeppelin/contracts-upgradeable/security/ReentrancyGuardUpgradeable.sol";
+import {SafeMathUpgradeable} from "@openzeppelin/contracts-upgradeable/utils/math/SafeMathUpgradeable.sol";
+import {SafeERC20Upgradeable} from "@openzeppelin/contracts-upgradeable/token/ERC20/utils/SafeERC20Upgradeable.sol";
+import {IERC20Upgradeable} from "@openzeppelin/contracts-upgradeable/token/ERC20/IERC20Upgradeable.sol";
+import {ECDSAUpgradeable} from "@openzeppelin/contracts-upgradeable/utils/cryptography/ECDSAUpgradeable.sol";
+import {EIP712Upgradeable} from "@openzeppelin/contracts-upgradeable/utils/cryptography/EIP712Upgradeable.sol";
 import {IPriceOracle, ICrossChainModule, IAMMPool, IGovernanceModule, IGovernanceToken, ICrossChainRetryOracle} from "./Interfaces.sol";
 
 
@@ -151,6 +151,12 @@ contract OrderBook is
         uint256 unclaimedTokens;
     }
 
+    struct Transfer {
+        address user;
+        address token;
+        uint256 amount;
+    }
+
     // Custom Errors (unchanged)
     error InvalidOrder();
     error InvalidOrderId(uint256 orderId);
@@ -217,7 +223,7 @@ contract OrderBook is
     event FundingRateApplied(address indexed user, bytes32 orderId, int256 fundingAmount);
     event PositionLiquidated(bytes32 orderId, address indexed user, uint256 collateralReturned, uint256 fee);
     event OrderCancelled(address indexed user, uint256 orderId);
-    event OrderLocked(uint256 orderId);
+    event OrderLockedEvent(uint256 orderId);
     event OrderUnlocked(uint256 orderId);
     event OrdersMatched(
         uint256 bidOrderId,
@@ -377,7 +383,7 @@ contract OrderBook is
             0
         );
         if (isMarket) {
-            matchOrders(0);
+            _matchOrders(0, MAX_MATCHES_PER_TX);
         }
     }
 
@@ -458,7 +464,7 @@ contract OrderBook is
             uint256 timestamp
         ) = abi.decode(orderData, (address, address, address, uint256, bool, uint256, uint256, uint256));
 
-        uint256 orderId = placePerpetualOrder(tokenA, tokenB, amount, isBuy, leverage, margin);
+        uint256 orderId = this.placePerpetualOrder(tokenA, tokenB, amount, isBuy, leverage, margin);
         orders[orderId].timestamp = uint64(timestamp); // Preserve original timestamp
     }
 
@@ -493,7 +499,7 @@ contract OrderBook is
     /// @notice Batch applies funding for multiple orders
     function batchApplyFunding(uint256[] calldata orderIds) external nonReentrant {
         for (uint256 i = 0; i < orderIds.length; i++) {
-            applyFunding(orderIds[i]);
+            this.applyFunding(orderIds[i]);
         }
     }
 
@@ -561,7 +567,7 @@ contract OrderBook is
         );
 
         if (signedOrder.isMarket) {
-            matchOrders(0);
+            _matchOrders(0, MAX_MATCHES_PER_TX);
         }
     }
 
@@ -746,7 +752,7 @@ contract OrderBook is
         }
 
         if (order.isStopLoss) {
-            _removeOrderStopLossOrder(order.user, orderId);
+            _removeStopLossOrder(order.user, orderId);
         }
         _removeOrder(orderId, order.isBuy);
         emit OrderCancelled(msg.sender, orderId);
@@ -754,22 +760,22 @@ contract OrderBook is
 
     /// @notice Matches orders
     function matchOrders(uint256 minAmountOut) external whenNotPaused nonReentrant {
-        if (bidHeap.length == 0 && askHeap.length == 0) revert NoMatchableOrders;
+        if (bidHeap.length == 0 && askHeap.length == 0) revert NoMatchableOrders();
         // Prioritize perpetual orders
         for (uint256 i = 0; i < userOrders[msg.sender].length; i++) {
-            uint256 orderId = userOrders[orderIds[msg.sender][i];
+            uint256 orderId = userOrders[msg.sender][i]; // Fixed: Corrected userOrders access
             Order storage order = orders[orderId];
             if (order.isPerpetual) {
                 _matchPerpetualOrder(orderId);
             }
         }
         _checkStopLossOrders();
-        _matchOrders(minAmountOut, MAX_MATCHES_PER);
+        _matchOrders(minAmountOut, MAX_MATCHES_PER_TX); // Fixed: Corrected constant name
     }
 
     /// @notice Matches multiple orders
     function matchMultipleOrders(uint256 maxMatches, uint256 minAmountOut) external whenNotPaused nonReentrant {
-        if (bidHeap.length == 0 && askHeap.length == 0) revert NoMatchableOrders;
+        if (bidHeap.length == 0 && askHeap.length == 0) revert NoMatchableOrders();
         if (maxMatches == 0 || maxMatches > MAX_MATCHES_PER_TX) revert InvalidAmount(maxMatches);
         // Prioritize perpetual orders
         for (uint256 i = 0; i < userOrders[msg.sender].length; i++) {
@@ -791,7 +797,7 @@ contract OrderBook is
         bytes calldata adapterParams
     ) external payable whenNotPaused nonReentrant {
         if (dstChainId == 0) revert InvalidChainId(dstChainId);
-        if (bidHeap.length == 0 || askHeap.length == 0) revert NoMatchableOrders;
+        if (bidHeap.length == 0 || askHeap.length == 0) revert NoMatchableOrders();
 
         ICrossChainRetryOracle.NetworkStatus memory status = retryOracle.getNetworkStatus(uint64(dstChainId));
         if (!status.retryRecommended || !status.bridgeOperational) revert InvalidOperation("Retry not recommended");
@@ -1014,7 +1020,7 @@ contract OrderBook is
         Order storage order = orders[orderId];
         if (order.locked) revert OrderLocked(orderId);
         order.locked = true;
-        emit OrderLocked(orderId);
+        emit OrderLockedEvent(orderId);
     }
 
     /// @notice Unlocks an order
@@ -1220,7 +1226,7 @@ contract OrderBook is
 
     /// @notice Retrieves aggregated price
     function getAggregatedPrice(address tokenA, address tokenB) public view returns (uint256) {
-        try priceOracle.getCurrentPairPrice(address(this), tokenA) returns (uint256 price, bool cachedStatus) {
+        try priceOracle.getCurrentPairPrice(address(this), tokenA) returns (uint256 price, bool cachedStatus, uint256 timestamp) {
             if (price == 0) revert NoValidPrice();
             if (cachedStatus && block.timestamp > timestamp + oracleStalenessThreshold) {
                 revert PriceOracleStale(block.timestamp);
@@ -1322,13 +1328,13 @@ contract OrderBook is
 
         // Check for liquidation
         if (_isUnderMargined(order)) {
-            liquidatePosition(orderId);
+            this.liquidatePosition(orderId);
             return;
         }
 
         // Apply funding if due
         if (block.timestamp >= order.lastFundingTimestamp + FUNDING_INTERVAL) {
-            applyFunding(orderId);
+            this.applyFunding(orderId);
         }
 
         // Simplified matching logic for perpetuals (assumes AMM counterparty)
@@ -1449,24 +1455,20 @@ contract OrderBook is
         uint256 currentPrice = getAggregatedPrice(ammPool.token0(), ammPool.token1());
         uint256 matches = 0;
         uint256 gasLimit = gasleft();
-        uint256 gasPerMatch = 100000; // Estimated gas per match
+        uint256 gasPerMatch = 100000;
 
         _adjustLiquidityRange();
 
-        // Batch storage reads
         uint256[] memory bidHeapCache = bidHeap;
         uint256[] memory askHeapCache = askHeap;
 
-        // Batch transfers and events
-        struct Transfer {
-            address user;
-            address token;
-            uint256 amount;
-        }
-        Transfer[] memory transfers = new Transfer[](maxMatches * 3); // For bid, ask, treasury
+        Transfer[] memory transfers = new Transfer[](maxMatches * 3);
         uint256 transferCount = 0;
-        uint256[] memory matchedOrderIds = new uint256[](maxMatches * 2); // For bid and ask IDs
+        uint256[] memory matchedOrderIds = new uint256[](maxMatches * 2);
         uint256 matchOrderCount = 0;
+        uint256[] memory tradePrices = new uint256[](maxMatches); // Store trade prices
+        uint256[] memory tradeAmounts = new uint256[](maxMatches); // Store trade amounts
+        uint256[] memory totalFees = new uint256[](maxMatches); // Store total fees
 
         while (bidHeapCache.length > 0 && askHeapCache.length > 0 && matches < maxMatches && gasLimit >= gasPerMatch) {
             uint256 bidId = bidHeapCache[0];
@@ -1504,6 +1506,7 @@ contract OrderBook is
                 tradePrice = bid.useConcentratedLiquidity || ask.useConcentratedLiquidity ?
                     ammPool.getConcentratedPrice() :
                     (bid.price + ask.price) / 2;
+            }
             uint256 tradeValue;
             unchecked {
                 tradeValue = tradePrice * bid.amount.min(ask.amount);
@@ -1516,48 +1519,45 @@ contract OrderBook is
                 totalFee = tradeAmount * tradePrice * feeRate / 10000;
             }
 
+            // Store values for event emission
+            tradePrices[matches] = tradePrice;
+            tradeAmounts[matches] = tradeAmount;
+            totalFees[matches] = totalFee;
+
             // Update trader rewards
             _updateTraderRewards(bid.user, totalFee);
             _updateTraderRewards(ask.user, totalFee);
 
-            // Batch fees
-            uint256 lpFee = totalFee / 4;
             uint256 lpFee;
             uint256 govFee;
             uint256 treasuryFee;
             unchecked {
-                lpFee = totalFee;
-                lpFee lpFee / 4;
+                lpFee = totalFee / 4;
                 govFee = totalFee / 4;
-                treasuryFee lpFee - totalFee - lpFee - fee;
+                treasuryFee = totalFee - lpFee - govFee;
                 lpRewardPool += lpFee;
                 governanceRewardPool += govFee;
             }
-            }
-            // Approve tokens for AMM swap
-            IERC20Upgradeable(bid.tokenB).approve(address(ammPool), tradeAmount * tradePrice);
-            IERC20(orderableAsk.token(ask.tokenA).approve(address(ammPool), tradeAmount));
 
-            // Perform swap
+            IERC20Upgradeable(bid.tokenB).approve(address(ammPool), tradeAmount * tradePrice);
+            IERC20Upgradeable(ask.tokenA).approve(address(ammPool), tradeAmount);
+
             uint256 amountOut = ammPool.swap(
                 bid.tokenA == ammPool.token0() ? tradeAmount : 0,
-                bid.tokenA == ammPool.token0() ? 0 : tradeAmount : ,
+                bid.tokenA == ammPool.token0() ? 0 : tradeAmount,
                 address(this),
                 ""
             );
 
             if (amountOut < minAmountOut) revert SlippageExceeded(amountOut, minAmountOut);
 
-            // Batch transfers
             transfers[transferCount++] = Transfer({user: bid.user, token: bid.tokenA, amount: tradeAmount});
             transfers[transferCount++] = Transfer({user: ask.user, token: ask.tokenB, amount: tradeAmount * tradePrice - totalFee});
             transfers[transferCount++] = Transfer({user: ammPool.treasury(), token: ask.tokenB, amount: treasuryFee});
 
-            // Update amounts
             orders[bidId].amount -= uint96(tradeAmount);
             orders[askId].amount -= uint96(tradeAmount);
 
-            // Store matched order IDs
             matchedOrderIds[matchOrderCount++] = bidId;
             matchedOrderIds[matchOrderCount++] = askId;
 
@@ -1586,17 +1586,16 @@ contract OrderBook is
         }
 
         // Emit batched events
-        for (uint256 i = 0; i < matchOrderCount; i += 2) {
+        for (uint256 i = 0; i < matches; i++) {
             emit OrdersMatched(
-                matchedOrderIds[i],
-                matchedOrderIds[i + 1],
-                tradePrice,
-                tradeAmount,
-                totalFee
+                matchedOrderIds[i * 2],
+                matchedOrderIds[i * 2 + 1],
+                tradePrices[i],
+                tradeAmounts[i],
+                totalFees[i]
             );
         }
 
-        // Update heaps if modified
         bidHeap = bidHeapCache;
         askHeap = askHeapCache;
     }

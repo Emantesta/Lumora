@@ -493,18 +493,18 @@ contract PriceOracle is
     }
 
     /// @notice Gets the current price for a specific token pair
-    function getCurrentPairPrice(address asset, address inputToken) public view returns (uint256 currentPrice, bool cachedStatus) {
+    function getCurrentPairPrice(address asset, address inputToken) public view returns (uint256 currentPrice, bool cachedStatus, uint256 timestamp) {
         if (asset == address(0) || inputToken == address(0)) revert PriceOracleZeroAddress();
         AssetConfig memory config = assetConfigs[asset];
         if (inputToken != config.tokenA && inputToken != config.tokenB) revert InvalidTokenPair();
 
         currentPrice = getCurrentPrice(asset);
         cachedStatus = emergencyOverrideActive[asset] || pendingVRFRequestId[asset] != 0;
-        if (currentPrice == 0) return (0, cachedStatus);
+        if (currentPrice == 0) return (0, cachedStatus, block.timestamp);
 
         // If inputToken is tokenB, invert the price (tokenB/tokenA = 1 / (tokenA/tokenB))
         currentPrice = inputToken == config.tokenA ? currentPrice : (PRICE_PRECISION * PRICE_PRECISION) / currentPrice;
-        return (currentPrice, cachedStatus);
+        return (currentPrice, cachedStatus, block.timestamp);
     }
 
     /// @notice Checks if a VRF request is pending for an asset

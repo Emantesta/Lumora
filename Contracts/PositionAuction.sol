@@ -244,7 +244,7 @@ contract PositionAuction is
     error NotTokenOwner(uint256 tokenId);
     error AuctionAlreadyExists(uint256 tokenId);
     error AuctionNotActive(uint256 auctionId);
-    error AuctionEnded(uint256 auctionId);
+    error ErrAuctionEnded(uint256 auctionId);
     error InvalidAuctionDuration(uint256 duration);
     error BidTooLow(uint256 bidAmount, uint256 minimumBid);
     error ReservePriceNotMet(uint256 bidAmount, uint256 reservePrice);
@@ -252,7 +252,7 @@ contract PositionAuction is
     error InvalidFeePercent(uint256 feePercent);
     error InsufficientBalance(uint256 balance, uint256 required);
     error TransferFailed(address token, address to, uint256 amount);
-    error ContractPaused();
+    error ErrContractPaused();
     error InvalidChainId(uint16 chainId);
     error InvalidMessengerType(uint8 messengerType);
     error InsufficientLiquidity(address paymentToken);
@@ -286,7 +286,7 @@ contract PositionAuction is
     }
 
     modifier whenNotPausedAuction() {
-        if (paused()) revert ContractPaused();
+        if (paused()) revert ErrContractPaused();
         _;
     }
 
@@ -595,7 +595,7 @@ contract PositionAuction is
         whenNotPausedAuction
     {
         Auction storage auction = auctions[auctionId];
-        if (block.timestamp >= auction.endTime) revert AuctionEnded(auctionId);
+        if (block.timestamp >= auction.endTime) revert ErrAuctionEnded(auctionId);
 
         _validateBid(auction, bidAmount);
 
@@ -633,7 +633,7 @@ contract PositionAuction is
         bytes calldata adapterParams
     ) external payable nonReentrant onlyValidAuction(auctionId) whenNotPausedAuction {
         Auction storage auction = auctions[auctionId];
-        if (block.timestamp >= auction.endTime) revert AuctionEnded(auctionId);
+        if (block.timestamp >= auction.endTime) revert ErrAuctionEnded(auctionId);
         if (trustedRemoteManagers[dstChainId].length == 0) revert InvalidChainId(dstChainId);
         _validateAdapterParams(adapterParams);
 
@@ -714,7 +714,7 @@ contract PositionAuction is
         whenNotPausedAuction
     {
         Auction storage auction = auctions[auctionId];
-        if (block.timestamp >= auction.endTime) revert AuctionEnded(auctionId);
+        if (block.timestamp >= auction.endTime) revert ErrAuctionEnded(auctionId);
         if (auction.buyNowPrice == 0) revert InvalidBuyNowPrice(0, auction.reservePrice);
 
         // Transfer payment
@@ -881,7 +881,7 @@ contract PositionAuction is
 
         Auction storage auction = auctions[auctionId];
         if (auction.tokenId != tokenId || auction.ended) revert AuctionNotActive(auctionId);
-        if (block.timestamp >= auction.endTime) revert AuctionEnded(auctionId);
+        if (block.timestamp >= auction.endTime) revert ErrAuctionEnded(auctionId);
         if (block.timestamp < timelock) revert InvalidTimelock(timelock);
 
         bytes32 messageHash = keccak256(abi.encode(srcChainId, srcAddress, payload));
