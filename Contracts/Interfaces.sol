@@ -366,3 +366,18 @@ interface ICrossChainRetryOracle {
     }
     function getNetworkStatus(uint64 chainId) external view returns (NetworkStatus memory);
 }
+
+interface IOrderBook {
+    function placeOrder(
+        bool isBuy,
+        bool isMarket,
+        bool isStopLoss,
+        uint96 price,
+        uint96 triggerPrice,
+        uint96 amount,
+        address tokenA,
+        address tokenB,
+        uint64 expiryTimestamp,
+        bool useConcentratedLiquidity
+    ) external returns (uint256 orderId);
+}

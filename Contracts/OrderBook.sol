@@ -365,8 +365,8 @@ contract OrderBook is
         address tokenB,
         uint64 expiryTimestamp,
         bool useConcentratedLiquidity
-    ) external whenNotPaused nonReentrant {
-        _placeOrder(
+    ) external whenNotPaused nonReentrant returns (uint256 orderId) {
+        orderId = _placeOrder(
             msg.sender,
             isBuy,
             isMarket,
@@ -385,6 +385,7 @@ contract OrderBook is
         if (isMarket) {
             _matchOrders(0, MAX_MATCHES_PER_TX);
         }
+        return orderId;
     }
 
     /// @notice Places a perpetual order
@@ -484,7 +485,7 @@ contract OrderBook is
         if (fundingRate < -int256(fundingRateCapBps)) fundingRate = -int256(fundingRateCapBps);
 
         // Calculate funding payment: position size * funding rate
-        uint256 positionSize = order.amount.mul(order.leverage);
+        uint256 positionSize = uint256(order.amount) * order.leverage; // Cast uint96 to uint256
         int256 fundingAmount = (int256(positionSize) * fundingRate) / 1e4;
         if (!order.isBuy) fundingAmount = -fundingAmount; // Shorts pay/receive opposite of longs
 
@@ -633,7 +634,7 @@ contract OrderBook is
 
         IERC20Upgradeable collateralToken = IERC20Upgradeable(isBuy ? tokenB : tokenA);
         uint256 collateral = isMarket ? amount : uint256(price) * amount;
-        collateralToken.safeTransferFrom(msg.sender, address(this), collateral);
+        SafeERC20Upgradeable.safeTransferFrom(collateralToken, msg.sender, address(this), collateral);
 
         bytes memory payload = abi.encode(
             msg.sender,
@@ -650,12 +651,23 @@ contract OrderBook is
             useConcentratedLiquidity
         );
 
+        uint16[] memory dstChainIds = new uint16[](1);
+        dstChainIds[0] = dstChainId;
+        string[] memory axelarChainIds = new string[](1);
+        axelarChainIds[0] = ammPool.chainIdToAxelarChain(dstChainId);
+        bytes[] memory payloads = new bytes[](1);
+        payloads[0] = payload;
+        bytes[] memory adapterParamsArray = new bytes[](1);
+        adapterParamsArray[0] = adapterParams;
+        uint256[] memory retryDelays = new uint256[](1);
+        retryDelays[0] = block.timestamp + status.recommendedRetryDelay;
+
         crossChainModule.batchCrossChainMessages{value: msg.value}(
-            _toArray(dstChainId),
-            _toArray(ammPool.chainIdToAxelarChain(dstChainId)),
-            _toArray(payload),
-            _toArray(adapterParams),
-            _toArray(block.timestamp + status.recommendedRetryDelay)
+            dstChainIds,
+            axelarChainIds,
+            payloads,
+            adapterParamsArray,
+            retryDelays
         );
         crossChainOrders[dstChainId][orderId] = true;
 
@@ -1253,7 +1265,7 @@ contract OrderBook is
         bool isPerpetual,
         uint256 leverage,
         uint256 margin
-    ) internal {
+    ) internal returns (uint256 orderId) {
         _validateOrder(isBuy, isMarket, isStopLoss, price, triggerPrice, amount, tokenA, tokenB, expiryTimestamp);
         if (userOrders[user].length >= MAX_ORDERS_PER_USER) revert TooManyOrders(user);
 
@@ -1263,7 +1275,6 @@ contract OrderBook is
             collateralToken.safeTransferFrom(user, address(this), collateral);
         }
 
-        uint256 orderId;
         unchecked {
             orderId = nextOrderId++;
         }
@@ -1319,6 +1330,8 @@ contract OrderBook is
             expiryTimestamp,
             useConcentratedLiquidity
         );
+
+        return orderId;
     }
 
     /// @dev Matches a perpetual order

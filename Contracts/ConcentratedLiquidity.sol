@@ -2,7 +2,7 @@
 pragma solidity ^0.8.24;
 
 import {IERC20Upgradeable} from "@openzeppelin/contracts-upgradeable/token/ERC20/IERC20Upgradeable.sol";
-import {SafeERC20Upgradeable} from "@offchainlabs/upgrade-executor/node_modules/@openzeppelin/contracts-upgradeable/token/ERC20/utils/SafeERC20Upgradeable.sol";
+import {SafeERC20Upgradeable} from "@openzeppelin/contracts-upgradeable/token/ERC20/utils/SafeERC20Upgradeable.sol";
 import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import {FullMath} from "@uniswap/v3-core/contracts/libraries/FullMath.sol";
 import {TickMath} from "@uniswap/v3-core/contracts/libraries/TickMath.sol";
@@ -94,10 +94,10 @@ contract ConcentratedLiquidity is ReentrancyGuard {
 
         // Transfer tokens to AMMPool
         if (amountA > 0) {
-            IERC20Upgradeable(pool.tokenA()).safeTransferFrom(provider, address(pool), amountA);
+            SafeERC20Upgradeable.safeTransferFrom(IERC20Upgradeable(pool.tokenA()), provider, address(pool), amountA);
         }
         if (amountB > 0) {
-            IERC20Upgradeable(pool.tokenB()).safeTransferFrom(provider, address(pool), amountB);
+            SafeERC20Upgradeable.safeTransferFrom(IERC20Upgradeable(pool.tokenB()), provider, address(pool), amountB);
         }
 
         // Create position
@@ -122,6 +122,7 @@ contract ConcentratedLiquidity is ReentrancyGuard {
 
         return positionId;
     }
+
 
     function addLiquidityFromFees(uint256 positionId, uint256 amount0, uint256 amount1) 
         external 
@@ -217,15 +218,15 @@ contract ConcentratedLiquidity is ReentrancyGuard {
         (uint256 amountA, uint256 amountB) = _getAmountsForLiquidity(tickLower, tickUpper, liquidity);
 
         if (amountA > 0) {
-            IERC20Upgradeable(pool.tokenA()).safeTransfer(owner, amountA);
+            SafeERC20Upgradeable.safeTransfer(IERC20Upgradeable(pool.tokenA()), owner, amountA);
         }
         if (amountB > 0) {
-            IERC20Upgradeable(pool.tokenB()).safeTransfer(owner, amountB);
+            SafeERC20Upgradeable.safeTransfer(IERC20Upgradeable(pool.tokenB()), owner, amountB);
         }
 
         pool.emitPositionUpdated(positionId, tickLower, tickUpper, position.liquidity);
     }
-
+    
     function addConcentratedLiquidityCrossChain(
         uint256 positionId,
         address owner,
@@ -238,7 +239,18 @@ contract ConcentratedLiquidity is ReentrancyGuard {
             revert InvalidAddress(owner, "Invalid owner or recipient");
         if (!_isValidTickRange(tickLower, tickUpper)) 
             revert InvalidTickRange(tickLower, tickUpper);
-        if (pool.positions(positionId).liquidity != 0) 
+
+        // Fetch position data to check if it exists
+        (
+            address existingOwner,
+            ,
+            ,
+            uint128 currentLiquidity,
+            ,
+            ,
+            ,
+        ) = pool.positions(positionId);
+        if (currentLiquidity != 0 || existingOwner != address(0))
             revert PositionNotFound(positionId); // Ensure positionId is new
 
         // Create position without token transfer (tokens handled via bridge)
@@ -261,7 +273,8 @@ contract ConcentratedLiquidity is ReentrancyGuard {
         // Emit event (assuming tokens will be added later)
         pool.emitPositionCreated(positionId, owner, tickLower, tickUpper, 0);
     }
-
+    
+    
     /// @notice Collects accumulated fees for a position
     /// @param positionId The ID of the position
     function collectFees(uint256 positionId) external nonReentrant onlyPool {
@@ -592,7 +605,7 @@ contract ConcentratedLiquidity is ReentrancyGuard {
             int24 tickUpper,
             uint128 liquidity,
             uint256 feeGrowthInside0LastX128,
-            uint256 feeGrowthInside1LastX128,
+            uint256 feeGrowthInside1LastX128, // Corrected typo
             uint128 tokensOwed0,
             uint128 tokensOwed1
         ) = pool.positions(positionId);
@@ -616,16 +629,13 @@ contract ConcentratedLiquidity is ReentrancyGuard {
         position.tokensOwed0 = tokensOwed0 + feesOwed0;
         position.tokensOwed1 = tokensOwed1 + feesOwed1;
 
-        // Write back to storage
-        pool.setPositionByLiquidity(positionId, position);
-
         // Transfer fees
         if (position.tokensOwed0 > 0) {
-            IERC20Upgradeable(pool.tokenA()).safeTransfer(position.owner, position.tokensOwed0);
+            SafeERC20Upgradeable.safeTransfer(IERC20Upgradeable(pool.tokenA()), position.owner, position.tokensOwed0);
             position.tokensOwed0 = 0;
         }
         if (position.tokensOwed1 > 0) {
-            IERC20Upgradeable(pool.tokenB()).safeTransfer(position.owner, position.tokensOwed1);
+            SafeERC20Upgradeable.safeTransfer(IERC20Upgradeable(pool.tokenB()), position.owner, position.tokensOwed1);
             position.tokensOwed1 = 0;
         }
 

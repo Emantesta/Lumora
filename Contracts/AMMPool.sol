@@ -291,9 +291,6 @@ contract AMMPool is
     event Unpaused(address indexed caller);
     event ChainPaused(uint16 indexed chainId, address indexed caller);
     event ChainUnpaused(uint16 indexed chainId, address indexed caller);
-    event CrossChainLiquiditySent(address indexed provider, uint256 amountA, uint256 amountB, uint16 indexed chainId, uint64 nonce, uint256 timelock, uint256 indexed positionId);
-    event CrossChainLiquidityReceived(address indexed provider, uint256 amountA, uint256 amountB, uint16 indexed chainId, uint64 nonce, uint8 messengerType);
-    event CrossChainSwap(address indexed user, address indexed inputToken, uint256 amountIn, uint256 amountOut, uint16 indexed chainId, uint64 nonce, uint256 timelock, uint8 messengerType);
     event ChainTimelockUpdated(uint16 indexed chainId, uint256 newTimelock);
     event TrustedRemotePoolAdded(uint16 indexed chainId, bytes poolAddress);
     event TokenBridgeUpdated(address indexed newTokenBridge);
@@ -311,9 +308,6 @@ contract AMMPool is
     event WormholeTrustedSenderUpdated(uint16 chainId, bytes32 senderAddress);
     event GovernanceProposalCreated(uint256 indexed proposalId, address target, bytes data, uint256 proposedAt);
     event GovernanceProposalExecuted(uint256 indexed proposalId);
-    event FailedMessageStored(uint256 indexed messageId, uint16 dstChainId, string dstAxelarChain, uint256 timestamp, uint8 messengerType);
-    event BatchMessagesSent(uint16[] dstChainIds, uint8 messengerType, uint256 totalFee);
-    event FailedMessageRetried(uint256 indexed messageId, uint16 dstChainId, uint256 retries, uint8 messengerType);
     event FailedMessageRecovered(uint256 indexed messageId, address indexed recipient);
     event AllLPFeesClaimed(address indexed provider, uint256 amountA, uint256 amountB);
     event OracleFailover(address indexed failedOracle, address indexed newOracle);
@@ -324,8 +318,6 @@ contract AMMPool is
     event TokenTransferred(address indexed token, address indexed from, address indexed to, uint256 amount);
     event PositionUpdated(uint256 indexed positionId, int24 tickLower, int24 tickUpper, uint128 liquidity);
     event PositionAdjusterUpdated(address indexed newAdjuster);
-    event FailedMessageRetryScheduled(uint256 indexed messageId, uint256 nextRetryTimestamp);
-    event BatchRetryProcessed(uint256[] messageIds, uint256 successfulRetries, uint256 failedRetries);
     event PositionManagerUpdated(address indexed newPositionManager);
     event OrderBookSet(address indexed orderBook);
     event OrderBookSwap(address indexed user, address indexed inputToken, uint256 amountIn, uint256 amountOut, uint256 orderId);
@@ -392,13 +384,14 @@ contract AMMPool is
     /// @notice Adjusts the liquidity range for a position
     /// @param minPrice The minimum price for the liquidity range
     /// @param maxPrice The maximum price for the liquidity range
+    // In AMMPool.sol, line 393
     function adjustLiquidityRange(uint256 minPrice, uint256 maxPrice) external override onlyPositionAdjuster {
         // Convert prices to ticks
         int24 tickLower = TickMathLibrary.priceToTick(minPrice);
         int24 tickUpper = TickMathLibrary.priceToTick(maxPrice);
 
         // Validate tick range
-        if (tickLower >= tickUpper || tickLower < TickMathLibrary.MIN_TICK || tickUpper > TickMathLibrary.MAX_TICK) {
+        if (tickLower >= tickUpper || tickLower < TickMath.MIN_TICK || tickUpper > TickMath.MAX_TICK) {
             revert InvalidTickRange(tickLower, tickUpper);
         }
 
@@ -870,6 +863,7 @@ contract AMMPool is
     }
 
     /// @notice Places a perpetual order through the OrderBook
+    /// @notice Places a perpetual order through the OrderBook
     function placePerpetualOrder(
         address _tokenA,
         address _tokenB,
@@ -879,7 +873,8 @@ contract AMMPool is
         uint256 margin
     ) external whenNotPaused nonReentrant returns (uint256 orderId) {
         if (orderBook == address(0)) revert OrderBookNotSet();
-        if (_tokenA != this.tokenA || _tokenB != this.tokenB) revert InvalidToken(_tokenA);
+        if (_tokenA != tokenA && _tokenA != tokenB) 
+            revert TickMathLibrary.InvalidToken(_tokenA);
 
         IERC20Upgradeable usdc = IERC20Upgradeable(_tokenA);
         usdc.safeTransferFrom(msg.sender, address(this), margin);
@@ -1735,7 +1730,7 @@ contract AMMPool is
         uint64 nonce,
         uint256 timelock,
         uint256 positionId
-    ) external override onlyCrossChainModule {
+    ) external onlyCrossChainModule {
         emit CrossChainLiquiditySent(provider, amountA, amountB, dstChainId, nonce, timelock, positionId);
     }
 
@@ -1769,7 +1764,7 @@ contract AMMPool is
         string memory dstAxelarChain,
         uint256 timestamp,
         uint8 messengerType
-    ) external override onlyCrossChainModule {
+    ) external onlyCrossChainModule {
         emit FailedMessageStored(messageId, dstChainId, dstAxelarChain, timestamp, messengerType);
     }
 
@@ -1778,7 +1773,7 @@ contract AMMPool is
         uint16 dstChainId,
         uint256 retries,
         uint8 messengerType
-    ) external override onlyCrossChainModule {
+    ) external onlyCrossChainModule {
         emit FailedMessageRetried(messageId, dstChainId, retries, messengerType);
     }
 

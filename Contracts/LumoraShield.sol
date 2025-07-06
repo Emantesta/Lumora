@@ -964,14 +964,13 @@ contract LumoraShield is Initializable, UUPSUpgradeable, ERC721Upgradeable, Reen
         }
     }
 
-    /// @notice Updates ERC721 policy ownership.
+    /// @notice Updates ERC721 policy ownership during token transfers.
+    /// @param from The previous owner's address.
     /// @param to The new owner's address.
     /// @param tokenId The policy NFT ID.
-    /// @param auth The authorized address.
-    /// @return The previous owner's address.
-    function _update(address to, uint256 tokenId, address auth) internal virtual override returns (address) {
+    function _transfer(address from, address to, uint256 tokenId) internal virtual override {
         if (to == address(0)) revert InvalidAddress(to, "Cannot transfer to zero address");
-        address previousOwner = super._update(to, tokenId, auth);
+        super._transfer(from, to, tokenId);
         
         // Update policy ownership based on tokenId
         if (policies[tokenId].user != address(0)) {
@@ -981,8 +980,6 @@ contract LumoraShield is Initializable, UUPSUpgradeable, ERC721Upgradeable, Reen
         } else if (parametricPolicies[tokenId].user != address(0)) {
             parametricPolicies[tokenId].user = to;
         }
-        
-        return previousOwner;
     }
 
     /// @notice Calculates the square root of a number using the Babylonian method.

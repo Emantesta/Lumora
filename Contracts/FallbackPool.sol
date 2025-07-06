@@ -3,7 +3,7 @@ pragma solidity ^0.8.24;
 
 import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import {IERC20Upgradeable} from "@openzeppelin/contracts-upgradeable/token/ERC20/IERC20Upgradeable.sol";
-import {SafeERC20Upgradeable} from "@offchainlabs/upgrade-executor/node_modules/@openzeppelin/contracts-upgradeable/token/ERC20/utils/SafeERC20Upgradeable.sol";
+import {SafeERC20Upgradeable} from "@openzeppelin/contracts-upgradeable/token/ERC20/utils/SafeERC20Upgradeable.sol";
 import {AMMPool} from "./AMMPool.sol";
 import {TickMath} from "@uniswap/v3-core/contracts/libraries/TickMath.sol";
 import {TickMathLibrary} from "./TickMathLibrary.sol";
@@ -133,12 +133,14 @@ contract FallbackPool is ReentrancyGuard {
         fallbackReserves.totalLiquidity -= liquidity;
         fallbackLiquidityBalance[owner] -= liquidity;
 
-        IERC20Upgradeable(pool.tokenA()).safeTransfer(owner, amountA);
-        IERC20Upgradeable(pool.tokenB()).safeTransfer(owner, amountB);
+        // Use SafeERC20Upgradeable explicitly
+        SafeERC20Upgradeable.safeTransfer(IERC20Upgradeable(pool.tokenA()), owner, amountA);
+        SafeERC20Upgradeable.safeTransfer(IERC20Upgradeable(pool.tokenB()), owner, amountB);
 
         emit FallbackPoolExited(positionId, liquidity);
     }
-
+    
+    
     /// @notice Compounds fees for a position in the fallback pool
     /// @param positionId The ID of the position
     /// @param tokensOwed0 Amount of token0 to compound

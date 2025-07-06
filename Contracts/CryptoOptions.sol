@@ -240,8 +240,6 @@ contract CryptoOptions is Initializable, UUPSUpgradeable, OwnableUpgradeable, Re
     event OptionExercised(uint256 indexed optionId, address indexed buyer, uint256 profit);
     event FeeCollected(address indexed recipient, uint256 fee);
     event LiquidityRewardDeposited(address indexed token, uint256 amount);
-    event Paused(address indexed owner);
-    event Unpaused(address indexed owner);
     event CrossChainModuleUpdated(address indexed crossChainModule);
     event OrderBookUpdated(address indexed orderBook);
     event FundingRatePaid(uint256 indexed optionId, address indexed buyer, uint256 amount);
@@ -1015,9 +1013,9 @@ contract CryptoOptions is Initializable, UUPSUpgradeable, OwnableUpgradeable, Re
     // @param _token Token address
     // @return pair The price feed pair
     function getTokenPair(address _token) internal pure returns (string memory) {
-        if (_token = "0x2260FAC5E1a373473335eF271974C34F6fB7A693") return "BTC/USD";
-        if (_token = "0x2170Ed0881dB1171A4A0d5A0A0B8c4860A9fB6F7") return "ETH/USD";
-        if (_token = "0x1234567890abcdef1234567890abcdef12345678") return "BRETT/USD";
+        if (_token == 0x2260fac5e1A373473335eF271974C34f6fb7A693) return "BTC/USD";
+        if (_token == 0x2170ed0881DB1171A4A0D5a0A0B8C4860A9Fb6F7) return "ETH/USD";
+        if (_token == 0x1234567890AbcdEF1234567890aBcdef12345678) return "BRETT/USD";
         return "";
     }
 
@@ -1095,13 +1093,13 @@ contract CryptoOptions is Initializable, UUPSUpgradeable, OwnableUpgradeable, Re
     // @notice Pause contract operations
     function pause() public onlyOwner {
         _pause();
-        emit Paused(msg.sender);
+        emit Paused(msg.sender); // Use inherited Paused event
     }
 
     // @notice Unpause contract operations
     function unpause() public onlyOwner {
         _unpause();
-        emit Unpaused(msg.sender);
+        emit Unpaused(msg.sender); // Use inherited Unpaused event
     }
 
     // @notice Get user's options
