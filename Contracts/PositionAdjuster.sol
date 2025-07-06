@@ -203,6 +203,20 @@ contract PositionAdjuster is KeeperCompatibleInterface, ReentrancyGuardUpgradeab
         emit StrategyRegistered(msg.sender, positionId, strategyType, rangeWidth, shouldcompoundFees, bridgeType);
     }
 
+    function performLocalAdjustment(
+        uint256 positionId,
+        int24 newTickLower,
+        int24 newTickUpper,
+        uint256 newLiquidity
+    ) external nonReentrant {
+        (address owner, , , uint128 liquidity, , , , ) = pool.positions(positionId);
+        require(msg.sender == owner, "Not owner");
+        if (liquidity == 0) revert InsufficientLiquidity(liquidity);
+        if (pausedAssets[address(pool)]) revert AssetPaused(address(pool));
+        pool.adjust(positionId, newTickLower, newTickUpper, newLiquidity);
+        emit LocalAdjustmentPerformed(positionId, newTickLower, newTickUpper, newLiquidity, 0, 0);
+    }
+
     function performCrossChainAdjustment(
     uint256 positionId,
     int24 newTickLower,
