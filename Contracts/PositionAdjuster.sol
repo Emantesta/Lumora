@@ -66,6 +66,7 @@ contract PositionAdjuster is KeeperCompatibleInterface, ReentrancyGuardUpgradeab
 
     event StrategyRegistered(address indexed owner, uint256 positionId, StrategyType strategyType, uint24 rangeWidth, bool compoundFees, uint8 bridgeType);
     event PositionAdjusted(uint256 indexed positionId, int24 newTickLower, int24 newTickUpper);
+    event LocalAdjustmentPerformed(uint256 indexed positionId, int24 newTickLower, int24 newTickUpper, uint256 newLiquidity, uint256 fee0, uint256 fee1);
     event CrossChainAdjustmentSent(uint256 indexed positionId, uint16 dstChainId, int24 newTickLower, int24 newTickUpper, bool fallbackActive, uint256 fee0, uint256 fee1, uint8 bridgeType);
     event FailedMessageStored(uint256 indexed messageId, uint16 dstChainId, uint256 positionId);
     event FailedMessageRetried(uint256 indexed messageId, uint16 dstChainId, uint256 retries);
