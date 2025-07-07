@@ -269,7 +269,7 @@ contract CryptoOptions is Initializable, UUPSUpgradeable, OwnableUpgradeable, Re
         address _bandOracle,
         address _crossChainModule
     ) external initializer {
-        __Ownable_init(msg.sender);
+        __Ownable_init();
         __ReentrancyGuard_init();
         __Pausable_init();
         usdc = IERC20(_usdc);

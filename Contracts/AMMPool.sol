@@ -32,7 +32,7 @@ interface IOrderBook {
         address tokenB,
         uint64 expiryTimestamp,
         bool useConcentratedLiquidity
-    ) external;
+    ) external returns (uint256 orderId);
 
     function placePerpetualOrder(
         address tokenA,
