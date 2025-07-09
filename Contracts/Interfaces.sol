@@ -10,7 +10,7 @@ interface IPriceOracle {
         uint256, address, address, uint256, uint256, uint256, uint256, uint256, uint256
     );
     function emergencyOverrideActive(address asset) external view returns (bool);
-    // Add functions from OrderBook.sol for compatibility
+    // Functions from OrderBook.sol for compatibility
     function getSpotPrice(address tokenA, address tokenB) external view returns (uint256);
     function getIndexPrice(address tokenA, address tokenB) external view returns (uint256);
 }
@@ -41,6 +41,14 @@ interface IAMMPool {
         uint256 nextRetryTimestamp;
     }
 
+    function initialize(
+        ICommonStructs.InitParams memory params,
+        address _retryOracle,
+        bytes32 _oracleJobId,
+        address _linkToken,
+        address _orderBook
+    ) external;
+
     function positions(uint256 positionId) external view returns (
         address owner,
         int24 tickLower,
@@ -53,7 +61,7 @@ interface IAMMPool {
     );
 
     function getCurrentTick() external view returns (int24);
-    function getOraclePrice() external view returns (uint256);
+    function getOraclePrice() external returns (uint256);
     function tokenA() external view returns (address);
     function tokenB() external view returns (address);
     function positionCounter() external view returns (uint256);
@@ -265,9 +273,33 @@ interface ICrossChainModule {
     function batchCrossChainMessages(uint16[] calldata dstChainIds, string[] calldata dstAxelarChains, bytes[] calldata payloads, bytes[] calldata adapterParams, uint256[] calldata timelocks) external payable;
     function retryFailedMessage(uint256 messageId) external payable;
     function retryFailedMessagesBatch(uint256[] calldata messageIds) external payable;
-    // Add functions from OrderBook.sol for compatibility
+    function sendCrossChainMessage(
+        uint16 dstChainId,
+        string memory dstAxelarChain,
+        bytes memory destinationAddress,
+        bytes memory payload,
+        bytes memory adapterParams,
+        uint64 nonce,
+        uint256 timelock,
+        uint8 messengerType
+    ) external payable;
+    function bridgeTokens(address token, uint256 amount, address recipient, uint16 dstChainId) external;
+    function validateCrossChainMessage(
+        uint16 srcChainId,
+        bytes memory srcAddress,
+        bytes memory payload,
+        bytes memory additionalParams
+    ) external;
+    function getNonce(uint16 chainId, uint8 messengerType) external view returns (uint64);
+    // Functions from OrderBook.sol for compatibility
     function sendCrossChainOrder(address targetChain, bytes memory orderData) external;
     function receiveCrossChainOrder(bytes memory orderData) external;
+    function getDynamicTimelock(uint16 chainId) external view returns (uint256);
+    function getEstimatedCrossChainFee(
+        uint16 dstChainId,
+        bytes calldata payload,
+        bytes calldata adapterParams
+    ) external view returns (uint256 nativeFee, uint256 zroFee);
 }
 
 interface ILayerZeroEndpoint {

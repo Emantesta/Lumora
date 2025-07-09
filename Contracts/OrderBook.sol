@@ -35,6 +35,7 @@ contract OrderBook is
     mapping(uint256 => uint256) public orderHeapIndex; // Order ID to heap index
     mapping(uint256 => bool) public orderExists; // Order existence
     mapping(address => uint256[]) public stopLossOrders; // User to stop-loss order IDs
+    address[] private userList;
     uint256 public nextOrderId; // Global order ID counter
     IGovernanceModule public governanceModule;
     IAMMPool public ammPool;
@@ -755,7 +756,7 @@ contract OrderBook is
 
         if (order.isPerpetual) {
             uint256 collateral = order.initialMargin;
-            userEquity[order.user] = userEquity[order.user].sub(collateral);
+            userEquity[order.user] = userEquity[order.user] - collateral; // Updated: Direct arithmetic
             if (!usdc.transfer(order.user, collateral)) revert MarginTransferFailed();
         } else {
             IERC20Upgradeable collateralToken = IERC20Upgradeable(order.isBuy ? order.tokenB : order.tokenA);
@@ -767,6 +768,18 @@ contract OrderBook is
             _removeStopLossOrder(order.user, orderId);
         }
         _removeOrder(orderId, order.isBuy);
+
+        // Remove user from userList if no orders remain
+        if (userOrders[order.user].length == 0 && stopLossOrders[order.user].length == 0) {
+            for (uint256 i = 0; i < userList.length; i++) {
+                if (userList[i] == order.user) {
+                    userList[i] = userList[userList.length - 1];
+                    userList.pop();
+                    break;
+                }
+            }
+        }
+
         emit OrderCancelled(msg.sender, orderId);
     }
 
@@ -847,11 +860,11 @@ contract OrderBook is
         );
 
         crossChainModule.batchCrossChainMessages{value: msg.value}(
-            _toArray(dstChainId),
-            _toArray(ammPool.chainIdToAxelarChain(dstChainId)),
-            _toArray(payload),
-            _toArray(adapterParams),
-            _toArray(block.timestamp + status.recommendedRetryDelay)
+            _toArrayUint16(dstChainId),
+            _toArrayString(ammPool.chainIdToAxelarChain(dstChainId)),
+            _toArrayBytes(payload),
+            _toArrayBytes(adapterParams),
+            _toArrayUint256(block.timestamp + status.recommendedRetryDelay)
         );
         ammPool.rebalanceReserves(dstChainId);
         crossChainMatches[dstChainId][matchId] = true;
@@ -1296,11 +1309,23 @@ contract OrderBook is
         order.isPerpetual = isPerpetual;
         order.leverage = leverage;
         order.initialMargin = margin;
-        order.maintenanceMargin = margin.mul(80).div(100);
+        order.maintenanceMargin = (margin * 80) / 100; // Updated: Use direct arithmetic
         order.lastFundingTimestamp = isPerpetual ? block.timestamp : 0;
 
         userOrders[user].push(orderId);
         orderExists[orderId] = true;
+
+        // Add user to userList if not already present
+        bool userExists = false;
+        for (uint256 i = 0; i < userList.length; i++) {
+            if (userList[i] == user) {
+                userExists = true;
+                break;
+            }
+        }
+        if (!userExists) {
+            userList.push(user);
+        }
 
         if (isStopLoss) {
             stopLossOrders[user].push(orderId);
@@ -1351,7 +1376,7 @@ contract OrderBook is
         }
 
         // Simplified matching logic for perpetuals (assumes AMM counterparty)
-        uint256 positionSize = order.amount.mul(order.leverage);
+        uint256 positionSize = uint256(order.amount).mul(order.leverage);
         uint256 currentPrice = priceOracle.getSpotPrice(order.tokenA, order.tokenB);
         uint256 tradeValue = positionSize.mul(currentPrice).div(1e18);
 
@@ -1377,14 +1402,14 @@ contract OrderBook is
     /// @dev Checks if a position is under-margined
     function _isUnderMargined(Order memory order) internal view returns (bool) {
         if (!order.isPerpetual) return false;
-        uint256 positionSize = order.amount.mul(order.leverage);
+        uint256 positionSize = uint256(order.amount) * order.leverage;
         uint256 currentPrice = priceOracle.getSpotPrice(order.tokenA, order.tokenB);
-        uint256 positionValue = positionSize.mul(currentPrice).div(1e18);
+        uint256 positionValue = (positionSize * currentPrice) / 1e18;
         int256 unrealizedPnL = order.isBuy
-            ? int256(currentPrice).sub(int256(order.price)).mul(int256(positionSize)).div(1e18)
-            : int256(order.price).sub(int256(currentPrice)).mul(int256(positionSize)).div(1e18);
+            ? (int256(currentPrice) - int256(uint256(order.price))) * int256(positionSize) / int256(1e18)
+            : (int256(uint256(order.price)) - int256(currentPrice)) * int256(positionSize) / int256(1e18);
 
-        uint256 availableMargin = order.initialMargin.add(uint256(unrealizedPnL)).sub(uint256(order.cumulativeFunding));
+        uint256 availableMargin = order.initialMargin + uint256(unrealizedPnL) - uint256(order.cumulativeFunding);
         return availableMargin < order.maintenanceMargin;
     }
 
@@ -1412,17 +1437,9 @@ contract OrderBook is
         uint256 gasLimit = gasleft();
         uint256 gasPerIteration = 50000; // Estimated gas per user iteration
 
-        address[] memory users = new address[](userOrders.length);
-        uint256 userCount = 0;
-        for (uint256 i = 0; i < userOrders.length; i++) {
-            if (userOrders[i] != address(0)) {
-                users[userCount++] = userOrders[i];
-            }
-        }
-
-        for (uint256 i = 0; i < userCount; i++) {
+        for (uint256 i = 0; i < userList.length; i++) {
             if (gasLimit < gasPerIteration) break;
-            address user = users[i];
+            address user = userList[i];
             uint256[] storage userStopLoss = stopLossOrders[user];
             for (uint256 j = userStopLoss.length; j > 0; ) {
                 unchecked {
@@ -1461,6 +1478,17 @@ contract OrderBook is
                 break;
             }
         }
+
+        // Remove user from userList if no orders remain
+        if (userOrders[user].length == 0 && stopLossOrders[user].length == 0) {
+            for (uint256 i = 0; i < userList.length; i++) {
+                if (userList[i] == user) {
+                    userList[i] = userList[userList.length - 1];
+                    userList.pop();
+                    break;
+                }
+            }
+        }
     }
 
     /// @dev Matches orders with batch processing
@@ -1479,9 +1507,9 @@ contract OrderBook is
         uint256 transferCount = 0;
         uint256[] memory matchedOrderIds = new uint256[](maxMatches * 2);
         uint256 matchOrderCount = 0;
-        uint256[] memory tradePrices = new uint256[](maxMatches); // Store trade prices
-        uint256[] memory tradeAmounts = new uint256[](maxMatches); // Store trade amounts
-        uint256[] memory totalFees = new uint256[](maxMatches); // Store total fees
+        uint256[] memory tradePrices = new uint256[](maxMatches);
+        uint256[] memory tradeAmounts = new uint256[](maxMatches);
+        uint256[] memory totalFees = new uint256[](maxMatches);
 
         while (bidHeapCache.length > 0 && askHeapCache.length > 0 && matches < maxMatches && gasLimit >= gasPerMatch) {
             uint256 bidId = bidHeapCache[0];
@@ -1518,18 +1546,18 @@ contract OrderBook is
             } else {
                 tradePrice = bid.useConcentratedLiquidity || ask.useConcentratedLiquidity ?
                     ammPool.getConcentratedPrice() :
-                    (bid.price + ask.price) / 2;
+                    (uint256(bid.price) + ask.price) / 2;
             }
             uint256 tradeValue;
             unchecked {
-                tradeValue = tradePrice * bid.amount.min(ask.amount);
+                tradeValue = tradePrice * min(bid.amount, ask.amount);
             }
 
             uint256 feeRate = _getFeeRate(msg.sender, tradeValue);
             uint256 tradeAmount = min(bid.amount, ask.amount);
             uint256 totalFee;
             unchecked {
-                totalFee = tradeAmount * tradePrice * feeRate / 10000;
+                totalFee = (tradeAmount * tradePrice * feeRate) / 10000; // Updated: Direct arithmetic
             }
 
             // Store values for event emission
@@ -1565,7 +1593,7 @@ contract OrderBook is
             if (amountOut < minAmountOut) revert SlippageExceeded(amountOut, minAmountOut);
 
             transfers[transferCount++] = Transfer({user: bid.user, token: bid.tokenA, amount: tradeAmount});
-            transfers[transferCount++] = Transfer({user: ask.user, token: ask.tokenB, amount: tradeAmount * tradePrice - totalFee});
+            transfers[transferCount++] = Transfer({user: ask.user, token: ask.tokenB, amount: (tradeAmount * tradePrice) - totalFee});
             transfers[transferCount++] = Transfer({user: ammPool.treasury(), token: ask.tokenB, amount: treasuryFee});
 
             orders[bidId].amount -= uint96(tradeAmount);
@@ -1577,12 +1605,32 @@ contract OrderBook is
             if (orders[bidId].amount == 0) {
                 _removeOrder(bidId, true);
                 bidHeapCache = bidHeap;
+                // Remove bid.user from userList if no orders remain
+                if (userOrders[bid.user].length == 0 && stopLossOrders[bid.user].length == 0) {
+                    for (uint256 i = 0; i < userList.length; i++) {
+                        if (userList[i] == bid.user) {
+                            userList[i] = userList[userList.length - 1];
+                            userList.pop();
+                            break;
+                        }
+                    }
+                }
             } else {
                 _heapifyDownBids(0);
             }
             if (orders[askId].amount == 0) {
                 _removeOrder(askId, false);
                 askHeapCache = askHeap;
+                // Remove ask.user from userList if no orders remain
+                if (userOrders[ask.user].length == 0 && stopLossOrders[ask.user].length == 0) {
+                    for (uint256 i = 0; i < userList.length; i++) {
+                        if (userList[i] == ask.user) {
+                            userList[i] = userList[userList.length - 1];
+                            userList.pop();
+                            break;
+                        }
+                    }
+                }
             } else {
                 _heapifyDownAsks(0);
             }
@@ -1882,28 +1930,28 @@ contract OrderBook is
     }
 
     /// @dev Utility to convert uint16 to array
-    function _toArray(uint16 value) internal pure returns (uint16[] memory) {
+    function _toArrayUint16(uint16 value) internal pure returns (uint16[] memory) {
         uint16[] memory arr = new uint16[](1);
         arr[0] = value;
         return arr;
     }
 
     /// @dev Utility to convert string to array
-    function _toArray(string memory value) internal pure returns (string[] memory) {
+    function _toArrayString(string memory value) internal pure returns (string[] memory) {
         string[] memory arr = new string[](1);
         arr[0] = value;
         return arr;
     }
 
     /// @dev Utility to convert bytes to array
-    function _toArray(bytes memory value) internal pure returns (bytes[] memory) {
+    function _toArrayBytes(bytes memory value) internal pure returns (bytes[] memory) {
         bytes[] memory arr = new bytes[](1);
         arr[0] = value;
         return arr;
     }
 
     /// @dev Utility to convert uint256 to array
-    function _toArray(uint256 value) internal pure returns (uint256[] memory) {
+    function _toArrayUint256(uint256 value) internal pure returns (uint256[] memory) {
         uint256[] memory arr = new uint256[](1);
         arr[0] = value;
         return arr;

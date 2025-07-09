@@ -1555,7 +1555,7 @@ contract AMMPool is
 
     // --- Internal Helper Functions ---
 
-    function getOraclePrice() public view returns (uint256 price) {
+    function getOraclePrice() public returns (uint256 price) {
         for (uint256 i = 0; i <= MAX_ORACLE_RETRIES; i++) {
             try IPriceOracle(primaryPriceOracle).getPrice(tokenA, tokenB) returns (int256 oraclePrice) {
                 if (oraclePrice <= 0) revert NegativeOraclePrice(oraclePrice);

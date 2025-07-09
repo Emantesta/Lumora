@@ -261,7 +261,7 @@ contract PositionManager is
 
     function estimateBatchFees(
         uint256[] calldata tokenIds,
-        uint64 dstChainId,
+        uint16 dstChainId,
         uint8 bridgeType,
         bytes calldata adapterParams
     ) external view validAdapterParams(adapterParams) returns (uint256 total0, uint256 total1, uint256 nativeFee) {
@@ -275,7 +275,7 @@ contract PositionManager is
             if (!_exists(tokenId)) revert InvalidTokenId(tokenId);
             if (ownerOf(tokenId) != msg.sender) revert NotTokenOwner(tokenId);
 
-            (, , , , , uint256 tokensOwed0, uint256 tokensOwed1) = IAMMPool(ammPool).positions(tokenId);
+            (, , , , uint256 feeGrowthInside0LastX128, uint256 feeGrowthInside1LastX128, uint256 tokensOwed0, uint256 tokensOwed1) = IAMMPool(ammPool).positions(tokenId);
             FeeTracking memory fees = feeTracking[tokenId];
             total0 += (fees.accumulated0 - fees.lastBridged0 + tokensOwed0);
             total1 += (fees.accumulated1 - fees.lastBridged1 + tokensOwed1);
@@ -462,7 +462,7 @@ contract PositionManager is
     }
 
     function _aggregateFees(uint256 tokenId) internal {
-        (, , , , , uint256 tokensOwed0, uint256 tokensOwed1) = IAMMPool(ammPool).positions(tokenId);
+        (, , , , uint256 feeGrowthInside0LastX128, uint256 feeGrowthInside1LastX128, uint256 tokensOwed0, uint256 tokensOwed1) = IAMMPool(ammPool).positions(tokenId);
         if (tokensOwed0 == 0 && tokensOwed1 == 0) return;
 
         IAMMPool(ammPool).collectFees(tokenId);
@@ -476,7 +476,7 @@ contract PositionManager is
 
     function collectAndBridgeFees(
         uint256 tokenId,
-        uint64 dstChainId,
+        uint16 dstChainId,
         uint8 bridgeType,
         bytes calldata adapterParams
     ) external payable nonReentrant onlyTokenOwner(tokenId) whenNotPausedCrossChain validAdapterParams(adapterParams) {
@@ -493,7 +493,8 @@ contract PositionManager is
 
         fees.lastBridged0 = fees.accumulated0;
         fees.lastBridged1 = fees.accumulated1;
-        fees.lastDstChainId = dstChainId;
+        if (dstChainId > type(uint16).max) revert InvalidChainId(dstChainId);
+        fees.lastDstChainId = uint16(dstChainId);
 
         address recipient = feeDestinations[msg.sender] != address(0) ? feeDestinations[msg.sender] : msg.sender;
         string memory dstAxelarChain = chainIdToAxelarChain[dstChainId];
@@ -510,12 +511,16 @@ contract PositionManager is
         if (msg.value < nativeFee) revert InsufficientFee(msg.value, nativeFee);
 
         if (amount0 > 0) {
-            IERC20Upgradeable(IAMMPool(ammPool).tokenA()).safeTransfer(crossChainModule, amount0);
-            ICrossChainModule(crossChainModule).bridgeTokens(IAMMPool(ammPool).tokenA(), amount0, recipient, uint16(dstChainId));
+            address tokenBridge = tokenBridges[bridgeType];
+            if (tokenBridge == address(0)) revert InvalidBridgeType();
+            IERC20Upgradeable(IAMMPool(ammPool).tokenA()).safeTransfer(tokenBridge, amount0);
+            ITokenBridge(tokenBridge).lock(IAMMPool(ammPool).tokenA(), amount0, recipient, uint16(dstChainId));
         }
         if (amount1 > 0) {
-            IERC20Upgradeable(IAMMPool(ammPool).tokenB()).safeTransfer(crossChainModule, amount1);
-            ICrossChainModule(crossChainModule).bridgeTokens(IAMMPool(ammPool).tokenB(), amount1, recipient, uint16(dstChainId));
+            address tokenBridge = tokenBridges[bridgeType];
+            if (tokenBridge == address(0)) revert InvalidBridgeType();
+            IERC20Upgradeable(IAMMPool(ammPool).tokenB()).safeTransfer(tokenBridge, amount1);
+            ITokenBridge(tokenBridge).lock(IAMMPool(ammPool).tokenB(), amount1, recipient, uint16(dstChainId));
         }
 
         uint64 initialNonce = nonces[dstChainId];
@@ -555,7 +560,7 @@ contract PositionManager is
 
     function batchBridgeFees(
         uint256[] calldata tokenIds,
-        uint64 dstChainId,
+        uint16 dstChainId,
         uint8 bridgeType,
         bytes calldata adapterParams
     ) external payable nonReentrant whenNotPausedCrossChain validAdapterParams(adapterParams) {
@@ -581,7 +586,8 @@ contract PositionManager is
             total1 += amount1;
             fees.lastBridged0 = fees.accumulated0;
             fees.lastBridged1 = fees.accumulated1;
-            fees.lastDstChainId = dstChainId;
+            if (dstChainId > type(uint16).max) revert InvalidChainId(dstChainId);
+            fees.lastDstChainId = uint16(dstChainId);
         }
 
         if (total0 == 0 && total1 == 0) revert FeesNotCollected(0);
@@ -645,7 +651,7 @@ contract PositionManager is
     }
 
     function bridgeAggregatedFees(
-        uint64 dstChainId,
+        uint16 dstChainId,
         uint8 bridgeType,
         uint256 amount0,
         uint256 amount1,
@@ -728,7 +734,7 @@ contract PositionManager is
 
     function transferPositionCrossChain(
         uint256 tokenId,
-        uint64 dstChainId,
+        uint16 dstChainId,
         bytes calldata adapterParams
     ) external payable nonReentrant onlyTokenOwner(tokenId) whenNotPausedCrossChain validAdapterParams(adapterParams) {
         if (!_exists(tokenId)) revert InvalidTokenId(tokenId);
@@ -818,7 +824,7 @@ contract PositionManager is
 
     function batchTransferPositionsCrossChain(
         uint256[] calldata tokenIds,
-        uint64 dstChainId,
+        uint16 dstChainId,
         bytes calldata adapterParams
     ) external payable nonReentrant whenNotPausedCrossChain validAdapterParams(adapterParams) {
         uint256 length = tokenIds.length;
@@ -1124,7 +1130,7 @@ contract PositionManager is
             '{"trait_type":"TokenB","value":"', StringsUpgradeable.toHexString(position.tokenB), '"},',
             '{"trait_type":"TickLower","value":"', int24ToString(position.tickLower), '"},',
             '{"trait_type":"TickUpper","value":"', int24ToString(position.tickUpper), '"},',
-            '{"trait_type":"Liquidity","value":"', position.liquidity.toString(), '"},',
+            '{"trait_type":"Liquidity","value":"', uint256(position.liquidity).toString(), '"},'
             '{"trait_type":"SourceChainId","value":"', uint256(position.sourceChainId).toString(), '"},',
             '{"trait_type":"Amount0","value":"', fees.accumulated0.toString(), '"},',
             '{"trait_type":"Amount1","value":"', fees.accumulated1.toString(), '"}]}'
@@ -1205,7 +1211,7 @@ contract PositionManager is
 
     // --- Helper Functions ---
 
-    function _getNonce(uint64 dstChainId) internal returns (uint64) {
+    function _getNonce(uint16 dstChainId) internal view returns (uint64) {
         try ICrossChainModule(crossChainModule).getNonce(uint16(dstChainId), messengerType) returns (uint64 nonce) {
             return nonce;
         } catch {

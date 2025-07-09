@@ -223,7 +223,7 @@ contract PositionAdjuster is KeeperCompatibleInterface, ReentrancyGuardUpgradeab
     int24 newTickLower,
     int24 newTickUpper,
     uint256 newLiquidity,
-    uint64 dstChainId,
+    uint16 dstChainId,
     uint8 bridgeType,
     bytes calldata adapterParams
 ) external payable nonReentrant {
@@ -285,7 +285,7 @@ contract PositionAdjuster is KeeperCompatibleInterface, ReentrancyGuardUpgradeab
     int24[] calldata newTickLowers,
     int24[] calldata newTickUppers,
     uint256[] calldata newLiquidities,
-    uint64 dstChainId,
+    uint16 dstChainId,
     uint8 bridgeType,
     bytes calldata adapterParams
 ) external payable nonReentrant {
@@ -659,7 +659,7 @@ contract PositionAdjuster is KeeperCompatibleInterface, ReentrancyGuardUpgradeab
         uint256 maxRetries = 3;
 
         while (retryCount < maxRetries) {
-            try IPriceOracle(priceOracle).getCurrentPairPrice(address(pool.tokenA()), address(pool.tokenB())) returns (uint256 price, bool isCached) {
+            try IPriceOracle(priceOracle).getCurrentPairPrice(address(pool.tokenA()), address(pool.tokenB())) returns (uint256 price, bool isCached, uint256 timestamp) {
                 (, address tokenA,,,,,,,) = IPriceOracle(priceOracle).assetConfigs(address(pool));
                 bool isToken0Base = tokenA == address(pool.tokenA());
                 price = isToken0Base ? price : 1e36 / price;
@@ -671,7 +671,7 @@ contract PositionAdjuster is KeeperCompatibleInterface, ReentrancyGuardUpgradeab
                 retryCount++;
                 if (retryCount == maxRetries) {
                     for (uint256 i = 0; i < fallbackPriceOracles.length; i++) {
-                        try IPriceOracle(fallbackPriceOracles[i]).getCurrentPairPrice(address(pool.tokenA()), address(pool.tokenB())) returns (uint256 price, bool isCached) {
+                        try IPriceOracle(fallbackPriceOracles[i]).getCurrentPairPrice(address(pool.tokenA()), address(pool.tokenB())) returns (uint256 price, bool isCached, uint256 timestamp) {
                             (, address tokenA, , , , , , , ) = IPriceOracle(fallbackPriceOracles[i]).assetConfigs(address(pool));
                             bool statusToken0 = tokenA == address(pool.tokenA());
                             price = statusToken0 ? price : 1e36 / price;

@@ -1,13 +1,13 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.24;
 
-import "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
-import "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
-import "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
-import "@openzeppelin/contracts-upgradeable/security/ReentrancyGuardUpgradeable.sol";
-import "@openzeppelin/contracts-upgradeable/security/PausableUpgradeable.sol";
-import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
-import "@chainlink/contracts/src/v0.8/shared/interfaces/AggregatorV3Interface.sol";
+import {Initializable} from "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
+import {UUPSUpgradeable} from "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
+import {OwnableUpgradeable} from "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
+import {ReentrancyGuardUpgradeable} from "@openzeppelin/contracts-upgradeable/security/ReentrancyGuardUpgradeable.sol";
+import {PausableUpgradeable} from "@openzeppelin/contracts-upgradeable/security/PausableUpgradeable.sol";
+import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {AggregatorV3Interface} from "@chainlink/contracts/src/v0.8/shared/interfaces/AggregatorV3Interface.sol";
 
 // Interface for Band Protocol (fallback oracle)
 interface IBandProtocol {
@@ -458,7 +458,8 @@ contract CryptoOptions is Initializable, UUPSUpgradeable, OwnableUpgradeable, Re
         uint256 _leverage,
         uint256 _margin,
         uint64 _observationInterval,
-        uint8 _observationCount
+        uint8 _observationCount,
+        string calldata _cosmosChainId // Add _cosmosChainId as a parameter
     ) public nonReentrant whenNotPaused returns (uint256) {
         if (!kycVerified[msg.sender]) revert Unauthorized();
         if (_signedOrder.user != msg.sender) revert Unauthorized();
@@ -471,12 +472,16 @@ contract CryptoOptions is Initializable, UUPSUpgradeable, OwnableUpgradeable, Re
             if (_observationInterval < MIN_OBSERVATION_INTERVAL) revert InvalidObservationInterval();
             if (_observationCount == 0 || _observationCount > MAX_OBSERVATIONS) revert InvalidObservationCount();
         }
+        // Add validation for _cosmosChainId if required
+        // For example, revert if _cosmosChainId is empty and cross-chain is expected
+        // if (someCondition && bytes(_cosmosChainId).length == 0) revert InvalidCosmosChainId();
 
         uint256 fee = getDynamicFee(uint256(_signedOrder.amount));
         uint256 netPremium = uint256(_signedOrder.amount) - fee;
         if (!usdc.transferFrom(msg.sender, address(this), _signedOrder.amount)) revert TransferFailed();
 
         uint256 orderBookId = orderBook.placeOrderWithSignature(_signedOrder);
+
         return createOption(
             _signedOrder.tokenA,
             _signedOrder.tokenB,
@@ -487,7 +492,7 @@ contract CryptoOptions is Initializable, UUPSUpgradeable, OwnableUpgradeable, Re
             _signedOrder.isBuy,
             _signedOrder.isMarket,
             uint32(block.chainid),
-            "",
+            _cosmosChainId, // Pass the provided _cosmosChainId
             _optionType,
             _barrierPrice,
             _payout,

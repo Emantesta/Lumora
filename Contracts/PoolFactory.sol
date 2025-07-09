@@ -61,6 +61,11 @@ contract PoolFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable, Reen
     /// @notice Nonces for cross-chain sync to prevent replays
     mapping(uint16 => mapping(uint64 => bool)) public usedNonces;
 
+    address public retryOracle; // Chainlink oracle for retries
+    bytes32 public oracleJobId; // Chainlink job ID
+    address public linkToken;   // LINK token address
+    address public orderBook;   // OrderBook contract address
+
     /// @notice Configuration struct for pool settings
     struct PoolConfig {
         string version;
@@ -382,120 +387,120 @@ contract PoolFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable, Reen
     }
 
     /// @notice Disable constructor for upgradeable contracts
-constructor() {
-    _disableInitializers();
-    poolConfig = PoolConfig({
-        version: "1.0.0",
-        minTimelock: uint32(1 hours),
-        maxTimelock: uint32(24 hours),
-        maxBatchSize: uint32(100),
-        maxGasLimit: uint32(10000000),
-        governanceTimelock: 2 days,
-        maxRetries: uint32(3)
-    });
-}
+    constructor() {
+        _disableInitializers();
+        poolConfig = PoolConfig({
+            version: "1.0.0",
+            minTimelock: uint32(1 hours),
+            maxTimelock: uint32(24 hours),
+            maxBatchSize: uint32(100),
+            maxGasLimit: uint32(10000000),
+            governanceTimelock: 2 days,
+            maxRetries: uint32(3)
+        });
+    }
 
     /// @notice Initializes the factory
-function initialize(
-    address _layerZeroEndpoint,
-    address _axelarGateway,
-    address _axelarGasService,
-    address _wormholeCore,
-    address _treasury,
-    address _tokenBridge,
-    address _governanceToken,
-    address _positionManager,
-    uint256 _defaultTimelock,
-    uint256 _defaultTargetReserveRatio,
-    uint256 _votingPeriod,
-    uint256 _minimumProposalPower,
-    uint256 _quorumThreshold,
-    uint256 _maxOracleStaleness,
-    address[] calldata _initialCommittee
-) external initializer {
-    if (crossChainMessengers[0] != address(0)) revert InvalidAmount("Contract already initialized");
-    if (
-        _layerZeroEndpoint == address(0) ||
-        _axelarGateway == address(0) ||
-        _axelarGasService == address(0) ||
-        _wormholeCore == address(0) ||
-        _treasury == address(0) ||
-        _tokenBridge == address(0) ||
-        _governanceToken == address(0) ||
-        _positionManager == address(0)
-    ) revert InvalidAddress(address(0), "Zero address not allowed");
-    if (_defaultTimelock < 10800 || _defaultTimelock > 48 * 3600)
-        revert InvalidTimelock(_defaultTimelock, 10800, 48 * 3600);
-    if (_defaultTargetReserveRatio == 0) revert InvalidReserveRatio();
-    if (_votingPeriod == 0 || _minimumProposalPower == 0 || _quorumThreshold == 0 || _quorumThreshold > 1e18)
-        revert InvalidAmount("Invalid voting parameters");
-    if (_maxOracleStaleness == 0) revert InvalidAmount("Invalid oracle staleness");
-    if (_initialCommittee.length < MIN_COMMITTEE_APPROVALS) revert InvalidAmount("Insufficient committee members");
+    function initialize(
+        address _layerZeroEndpoint,
+        address _axelarGateway,
+        address _axelarGasService,
+        address _wormholeCore,
+        address _treasury,
+        address _tokenBridge,
+        address _governanceToken,
+        address _positionManager,
+        uint256 _defaultTimelock,
+        uint256 _defaultTargetReserveRatio,
+        uint256 _votingPeriod,
+        uint256 _minimumProposalPower,
+        uint256 _quorumThreshold,
+        uint256 _maxOracleStaleness,
+        address[] calldata _initialCommittee
+    ) external initializer {
+        if (crossChainMessengers[0] != address(0)) revert InvalidAmount("Contract already initialized");
+        if (
+            _layerZeroEndpoint == address(0) ||
+            _axelarGateway == address(0) ||
+            _axelarGasService == address(0) ||
+            _wormholeCore == address(0) ||
+            _treasury == address(0) ||
+            _tokenBridge == address(0) ||
+            _governanceToken == address(0) ||
+            _positionManager == address(0)
+        ) revert InvalidAddress(address(0), "Zero address not allowed");
+        if (_defaultTimelock < 10800 || _defaultTimelock > 48 * 3600)
+            revert InvalidTimelock(_defaultTimelock, 10800, 48 * 3600);
+        if (_defaultTargetReserveRatio == 0) revert InvalidReserveRatio();
+        if (_votingPeriod == 0 || _minimumProposalPower == 0 || _quorumThreshold == 0 || _quorumThreshold > 1e18)
+            revert InvalidAmount("Invalid voting parameters");
+        if (_maxOracleStaleness == 0) revert InvalidAmount("Invalid oracle staleness");
+        if (_initialCommittee.length < MIN_COMMITTEE_APPROVALS) revert InvalidAmount("Insufficient committee members");
 
-    __Ownable_init();
-    __UUPSUpgradeable_init();
-    __ReentrancyGuard_init();
+        __Ownable_init();
+        __UUPSUpgradeable_init();
+        __ReentrancyGuard_init();
 
-    crossChainMessengers[0] = _layerZeroEndpoint; // LayerZero
-    crossChainMessengers[1] = _axelarGateway; // Axelar
-    crossChainMessengers[2] = _wormholeCore; // Wormhole
-    axelarGasService = _axelarGasService;
-    treasury = _treasury;
-    tokenBridge = _tokenBridge;
-    governanceToken = _governanceToken;
-    positionManager = _positionManager;
-    governanceTokenTotalSupply = IERC20Upgradeable(_governanceToken).totalSupply();
-    defaultTimelock = _defaultTimelock;
-    defaultTargetReserveRatio = _defaultTargetReserveRatio;
-    votingPeriod = _votingPeriod;
-    minimumProposalPower = _minimumProposalPower;
-    quorumThreshold = _quorumThreshold;
-    governanceTimelock = 15 * 3600;
-    minTimelock = uint32(10800);
-    maxTimelock = uint32(48 * 3600);
-    maxRetries = uint32(3);
-    maxBatchSize = uint32(10);
-    minGasLimit = uint32(200_000);
-    maxGasLimit = uint32(10000000); // Added to match PoolConfig
-    if (_maxOracleStaleness > type(uint32).max) revert InvalidAmount("Max oracle staleness exceeds uint32 max");
-    maxOracleStaleness = uint32(_maxOracleStaleness);
-    proposalCooldown = 1 days;
-    proposalFee = 0.01 ether;
-    maxOracleFailures = 3;
-    oracleHealthCheckInterval = 1 hours;
+        crossChainMessengers[0] = _layerZeroEndpoint; // LayerZero
+        crossChainMessengers[1] = _axelarGateway; // Axelar
+        crossChainMessengers[2] = _wormholeCore; // Wormhole
+        axelarGasService = _axelarGasService;
+        treasury = _treasury;
+        tokenBridge = _tokenBridge;
+        governanceToken = _governanceToken;
+        positionManager = _positionManager;
+        governanceTokenTotalSupply = IERC20Upgradeable(_governanceToken).totalSupply();
+        defaultTimelock = _defaultTimelock;
+        defaultTargetReserveRatio = _defaultTargetReserveRatio;
+        votingPeriod = _votingPeriod;
+        minimumProposalPower = _minimumProposalPower;
+        quorumThreshold = _quorumThreshold;
+        governanceTimelock = 15 * 3600;
+        minTimelock = uint32(10800);
+        maxTimelock = uint32(48 * 3600);
+        maxRetries = uint32(3);
+        maxBatchSize = uint32(10);
+        minGasLimit = uint32(200_000);
+        maxGasLimit = uint32(10000000); // Added to match PoolConfig
+        if (_maxOracleStaleness > type(uint32).max) revert InvalidAmount("Max oracle staleness exceeds uint32 max");
+        maxOracleStaleness = uint32(_maxOracleStaleness);
+        proposalCooldown = 1 days;
+        proposalFee = 0.01 ether;
+        maxOracleFailures = 3;
+        oracleHealthCheckInterval = 1 hours;
 
-    // Synchronize poolConfig with state variables
-    poolConfig = PoolConfig({
-        version: "1.0.0",
-        minTimelock: minTimelock,
-        maxTimelock: maxTimelock,
-        maxBatchSize: maxBatchSize,
-        maxGasLimit: maxGasLimit,
-        governanceTimelock: governanceTimelock,
-        maxRetries: maxRetries
-    });
+        // Synchronize poolConfig with state variables
+        poolConfig = PoolConfig({
+            version: "1.0.0",
+            minTimelock: minTimelock,
+            maxTimelock: maxTimelock,
+            maxBatchSize: maxBatchSize,
+            maxGasLimit: maxGasLimit,
+            governanceTimelock: governanceTimelock,
+            maxRetries: maxRetries
+        });
 
-    for (uint256 i = 0; i < _initialCommittee.length; i++) {
-        if (_initialCommittee[i] == address(0)) revert InvalidAddress(_initialCommittee[i], "Invalid committee member");
-        committeeMembers[_initialCommittee[i]] = true;
-        emit CommitteeMemberAdded(_initialCommittee[i]);
+        for (uint256 i = 0; i < _initialCommittee.length; i++) {
+            if (_initialCommittee[i] == address(0)) revert InvalidAddress(_initialCommittee[i], "Invalid committee member");
+            committeeMembers[_initialCommittee[i]] = true;
+            emit CommitteeMemberAdded(_initialCommittee[i]);
+        }
+        committeeMemberCount = _initialCommittee.length;
+
+        governanceTargetWhitelist[address(this)] = true;
+        emit GovernanceTargetWhitelisted(address(this));
+
+        emit MinTimelockUpdated(minTimelock);
+        emit MaxTimelockUpdated(maxTimelock);
+        emit MaxRetriesUpdated(maxRetries);
+        emit MaxBatchSizeUpdated(maxBatchSize);
+        emit MinGasLimitUpdated(minGasLimit);
+        emit MaxOracleStalenessUpdated(maxOracleStaleness);
+        emit ProposalCooldownUpdated(proposalCooldown);
+        emit ProposalFeeUpdated(proposalFee);
+        emit OracleConfigUpdated(maxOracleFailures, oracleHealthCheckInterval);
+        emit PositionManagerUpdated(_positionManager);
     }
-    committeeMemberCount = _initialCommittee.length;
-
-    governanceTargetWhitelist[address(this)] = true;
-    emit GovernanceTargetWhitelisted(address(this));
-
-    emit MinTimelockUpdated(minTimelock);
-    emit MaxTimelockUpdated(maxTimelock);
-    emit MaxRetriesUpdated(maxRetries);
-    emit MaxBatchSizeUpdated(maxBatchSize);
-    emit MinGasLimitUpdated(minGasLimit);
-    emit MaxOracleStalenessUpdated(maxOracleStaleness);
-    emit ProposalCooldownUpdated(proposalCooldown);
-    emit ProposalFeeUpdated(proposalFee);
-    emit OracleConfigUpdated(maxOracleFailures, oracleHealthCheckInterval);
-    emit PositionManagerUpdated(_positionManager);
-}
 
     /// @notice Updates oracle configuration parameters
     function updateOracleConfig(uint256 _maxOracleFailures, uint256 _oracleHealthCheckInterval) external onlyGovernance {
@@ -533,7 +538,7 @@ function initialize(
                         isHealthy = false;
                     }
                 } else {
-                    try IPriceOracle(oracle).getCurrentPairPrice(tokenA, tokenB) returns (uint256 price, bool) {
+                    try IPriceOracle(oracle).getCurrentPairPrice(tokenA, tokenB) returns (uint256 price, bool cachedStatus, uint256 timestamp) {
                         isHealthy = price > 0;
                         health.lastPrice = price;
                     } catch {
@@ -543,7 +548,7 @@ function initialize(
             }
             health.lastPrice = (uint256(answer) * 1e18) / (10 ** IChainlinkOracle(oracle).decimals());
         } catch {
-            try IPriceOracle(oracle).getCurrentPairPrice(tokenA, tokenB) returns (uint256 price, bool) {
+            try IPriceOracle(oracle).getCurrentPairPrice(tokenA, tokenB) returns (uint256 price, bool cachedStatus, uint256 timestamp) {
                 isHealthy = price > 0;
                 health.lastPrice = price;
             } catch {
@@ -640,7 +645,7 @@ function initialize(
         address tokenA,
         address tokenB,
         address primaryPriceOracle,
-        uint64 chainId,
+        uint16 chainId,
         bytes calldata adapterParams,
         bytes32 customSalt
     ) external payable whenNotPaused whenChainNotPaused(chainId) whenCircuitBreakerNotTriggered nonReentrant returns (address pool) {
@@ -654,7 +659,7 @@ function initialize(
     function batchCreatePools(
         address[2][] calldata tokens,
         address[] calldata primaryPriceOracles,
-        uint64[] calldata chainIds,
+        uint16[] calldata chainIds,
         bytes[] calldata adapterParams,
         bytes32[] calldata customSalts
     ) external payable whenNotPaused whenCircuitBreakerNotTriggered nonReentrant returns (address[] memory pools) {
@@ -691,7 +696,7 @@ function initialize(
     function predictPoolAddress(
         address tokenA,
         address tokenB,
-        uint64 chainId,
+        uint16 chainId,
         bytes32 customSalt
     ) external view returns (address pool) {
         (address token0, address token1) = tokenA < tokenB ? (tokenA, tokenB) : (tokenB, tokenA);
@@ -714,7 +719,7 @@ function initialize(
 
     /// @notice Gets the estimated cross-chain fee
     function getEstimatedCrossChainFee(
-        uint64 dstChainId,
+        uint16 dstChainId,
         bytes calldata payload,
         bytes calldata adapterParams
     ) public view returns (uint256 nativeFee, uint256 zroFee) {
@@ -797,7 +802,7 @@ function initialize(
 
     /// @notice Synchronizes pool data with a remote chain
     function syncCrossChainPools(
-        uint64 chainId,
+        uint16 chainId,
         bytes calldata adapterParams,
         uint64 nonce
     ) external payable whenCircuitBreakerNotTriggered nonReentrant {
@@ -863,7 +868,7 @@ function initialize(
 
     /// @notice Receives cross-chain pool updates
     function receiveCrossChainPoolUpdate(
-        uint64 srcChainId,
+        uint16 srcChainId,
         bytes calldata srcAddress,
         bytes calldata payload
     ) external whenCircuitBreakerNotTriggered nonReentrant {
@@ -1096,7 +1101,7 @@ function initialize(
 }
 
     /// @notice Selects an existing oracle/relayer pair
-    function selectOracleRelayer(uint64 chainId, uint256 index) external onlyGovernance {
+    function selectOracleRelayer(uint16 chainId, uint256 index) external onlyGovernance {
         if (index >= chainOracles[chainId].length || index >= chainRelayers[chainId].length)
             revert InvalidOracleRelayer(address(0), address(0));
         selectedOracle[chainId] = chainOracles[chainId][index];
@@ -1105,7 +1110,7 @@ function initialize(
     }
 
     /// @notice Updates timelock for a chain
-    function updateTimelock(uint64 chainId, uint256 timelock) external onlyGovernance {
+    function updateTimelock(uint16 chainId, uint256 timelock) external onlyGovernance {
         if (timelock < minTimelock || timelock > maxTimelock) revert InvalidTimelock(timelock, minTimelock, maxTimelock);
         timelocks[chainId] = timelock;
         emit TimelockUpdated(chainId, timelock);
@@ -1134,14 +1139,14 @@ function initialize(
     }
 
     /// @notice Updates chain ID to Axelar chain mapping
-    function updateChainIdMapping(uint64 chainId, string calldata axelarChain) external onlyGovernance {
+    function updateChainIdMapping(uint16 chainId, string calldata axelarChain) external onlyGovernance {
         chainIdToAxelarChain[chainId] = axelarChain;
         axelarChainToChainId[axelarChain] = chainId;
         emit ChainIdMappingUpdated(chainId, axelarChain);
     }
 
     /// @notice Updates wormhole trusted sender
-    function updateWormholeTrustedSender(uint64 chainId, bytes32 senderAddress) external onlyGovernance {
+    function updateWormholeTrustedSender(uint16 chainId, bytes32 senderAddress) external onlyGovernance {
         wormholeTrustedSenders[chainId] = senderAddress;
         emit WormholeTrustedSenderUpdated(chainId, senderAddress);
     }
@@ -1168,14 +1173,14 @@ function initialize(
     }
 
     /// @notice Pauses a specific chain
-    function pauseChain(uint64 chainId) external onlyGovernance {
+    function pauseChain(uint16 chainId) external onlyGovernance {
         if (chainPaused[chainId]) revert ChainPausedError(chainId);
         chainPaused[chainId] = true;
         emit ChainPaused(chainId, msg.sender);
     }
 
     /// @notice Unpauses a specific chain
-    function unpauseChain(uint64 chainId) external onlyGovernance {
+    function unpauseChain(uint16 chainId) external onlyGovernance {
         if (!chainPaused[chainId]) revert UnauthorizedCaller(msg.sender);
         chainPaused[chainId] = false;
         emit ChainUnpaused(chainId, msg.sender);
@@ -1204,14 +1209,14 @@ function initialize(
     }
 
     /// @notice Adds a trusted remote factory for a chain
-    function addTrustedRemoteFactory(uint64 chainId, bytes calldata factoryAddress) external onlyGovernance {
+    function addTrustedRemoteFactory(uint16 chainId, bytes calldata factoryAddress) external onlyGovernance {
         if (factoryAddress.length == 0) revert InvalidAddress(address(0), "Invalid factory address");
         trustedRemoteFactories[chainId] = factoryAddress;
         emit TrustedRemoteFactoryAdded(chainId, factoryAddress);
     }
 
     /// @notice Removes a trusted remote factory for a chain
-    function removeTrustedRemoteFactory(uint64 chainId) external onlyGovernance {
+    function removeTrustedRemoteFactory(uint16 chainId) external onlyGovernance {
         if (trustedRemoteFactories[chainId].length == 0) revert InvalidAddress(address(0), "No factory set");
         delete trustedRemoteFactories[chainId];
         emit TrustedRemoteFactoryAdded(chainId, bytes(""));
@@ -1267,7 +1272,7 @@ function initialize(
     }
 
     /// @notice Updates fallback oracles for a chain
-    function updateFallbackOracles(uint64 chainId, address[] calldata oracles) external onlyGovernance {
+    function updateFallbackOracles(uint16 chainId, address[] calldata oracles) external onlyGovernance {
         for (uint256 i = 0; i < oracles.length; i++) {
             if (oracles[i] == address(0)) revert InvalidOracle(oracles[i], "Invalid oracle address");
             try IChainlinkOracle(oracles[i]).latestRoundData() returns (
@@ -1347,7 +1352,7 @@ function initialize(
     }
 
     /// @notice Internal function to validate oracles with automatic failover
-    function _validateOracles(address primaryPriceOracle, uint64 chainId, address tokenA, address tokenB) internal returns (address validatedOracle) {
+    function _validateOracles(address primaryPriceOracle, uint16 chainId, address tokenA, address tokenB) internal returns (address validatedOracle) {
     if (primaryPriceOracle == address(0)) revert InvalidOracle(primaryPriceOracle, "Zero address");
     if (!oracleOverride && selectedOracle[chainId] != address(0) && primaryPriceOracle != selectedOracle[chainId])
         revert InvalidOracle(primaryPriceOracle, "Not selected oracle");
@@ -1408,7 +1413,7 @@ function _createSinglePool(
     address tokenA,
     address tokenB,
     address primaryPriceOracle,
-    uint64 chainId,
+    uint16 chainId,
     bytes calldata adapterParams,
     bytes32 customSalt
 ) internal returns (address pool) {
@@ -1442,7 +1447,15 @@ function _createSinglePool(
         defaultTimelock: defaultTimelock,
         targetReserveRatio: defaultTargetReserveRatio
     });
-    AMMPool(pool).initialize(params);
+    
+    // Add state variables or constants in PoolFactory.sol for these values
+    AMMPool(pool).initialize(
+        params,
+        retryOracle, // Define this in PoolFactory.sol (e.g., Chainlink oracle address)
+        oracleJobId, // Define this in PoolFactory.sol (e.g., Chainlink job ID)
+        linkToken,   // Define this in PoolFactory.sol (e.g., LINK token address)
+        orderBook    // Define this in PoolFactory.sol (e.g., OrderBook contract address)
+    );
 
     getPool[token0][token1] = pool;
     allPools.push(pool);

@@ -133,6 +133,11 @@ contract CrossChainModule is ReentrancyGuard {
         _;
     }
 
+    modifier onlyAuthorized() {
+        if (msg.sender != address(pool) && msg.sender != pool.positionManager()) revert Unauthorized();
+        _;
+    }
+
     // --- External Functions ---
 
     /// @notice Adds liquidity to a pool on another chain
@@ -954,6 +959,13 @@ contract CrossChainModule is ReentrancyGuard {
         }
     }
 
+    /// @notice External wrapper for getting the dynamic timelock
+    /// @param chainId The chain ID
+    /// @return timelock The timelock
+    function getDynamicTimelock(uint16 chainId) external view returns (uint256 timelock) {
+        return _getDynamicTimelock(chainId);
+    }
+
     /// @notice Computes the square root of a uint256 using the Babylonian method
     /// @param y The number to compute the square root of
     /// @return z The square root of y
@@ -1012,6 +1024,23 @@ contract CrossChainModule is ReentrancyGuard {
         } else {
             revert NoMessengerConfigured();
         }
+    }
+
+    function bridgeTokens(address token, uint256 amount, address recipient, uint16 dstChainId) external nonReentrant onlyPool whenNotPaused whenChainNotPaused(dstChainId) {
+        _bridgeTokens(token, amount, recipient, dstChainId);
+    }
+
+    function getNonce(uint16 chainId, uint8 messengerType) external view onlyAuthorized returns (uint64) {
+        return _getNonce(chainId, messengerType);
+    }
+
+    function validateCrossChainMessage(
+        uint16 srcChainId,
+        bytes memory srcAddress,
+        bytes memory payload,
+        bytes memory additionalParams
+    ) external nonReentrant onlyPool whenNotPaused whenChainNotPaused(srcChainId) {
+        _validateCrossChainMessage(srcChainId, srcAddress, payload, additionalParams);
     }
 
     /// @notice Estimates cross-chain message fees

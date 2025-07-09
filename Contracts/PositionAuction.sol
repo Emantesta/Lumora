@@ -1274,9 +1274,9 @@ contract PositionAuction is
     /// @param dstChainId Destination chain ID
     function _bridgeTokens(address token, uint256 amount, address recipient, uint16 dstChainId) internal {
         if (amount == 0) return;
-        IERC20(token).safeApprove(tokenBridge, amount);
+        IERC20(token).forceApprove(tokenBridge, amount);
         ITokenBridge(tokenBridge).burn(token, amount, recipient, dstChainId);
-        IERC20(token).safeApprove(tokenBridge, 0); // Reset approval
+        IERC20(token).forceApprove(tokenBridge, 0); // Reset approval
     }
 
     /// @notice Check if ERC20 token is valid and has sufficient liquidity

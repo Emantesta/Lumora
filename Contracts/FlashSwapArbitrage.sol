@@ -650,7 +650,7 @@ contract FlashSwapArbitrage is
         bytes memory params = abi.encode(user, collateralAsset, debtAsset, debtToCover, bonus, receiveAToken);
         
         // Use SafeERC20's safeApprove
-        SafeERC20.safeApprove(IERC20(debtAsset), LENDING_PROTOCOL, debtToCover);
+        SafeERC20.forceApprove(IERC20(debtAsset), LENDING_PROTOCOL, debtToCover);
 
         try IAavePool(LENDING_PROTOCOL).flashLoanSimple(
             address(this),
@@ -662,11 +662,11 @@ contract FlashSwapArbitrage is
             emit FlashLoanExecuted(debtAsset, debtToCover, 0);
         } catch {
             // Reset approval to 0 in case of failure
-            SafeERC20.safeApprove(IERC20(debtAsset), LENDING_PROTOCOL, 0);
+            SafeERC20.forceApprove(IERC20(debtAsset), LENDING_PROTOCOL, 0);
             revert FlashLoanFailed(debtAsset, debtToCover);
         }
         // Reset approval to 0 after execution
-        SafeERC20.safeApprove(IERC20(debtAsset), LENDING_PROTOCOL, 0);
+        SafeERC20.forceApprove(IERC20(debtAsset), LENDING_PROTOCOL, 0);
     }    
     /// @notice Initiates flash loan for liquidation (external entry point)
     function executeFlashLoanLiquidation(
@@ -696,7 +696,7 @@ contract FlashSwapArbitrage is
 
         IAavePool(LENDING_PROTOCOL).liquidationCall(collateralAsset, debtAsset, user, debtToCover, receiveAToken);
         uint256 totalRepay = amount + premium;
-        SafeERC20.safeApprove(IERC20(asset), LENDING_PROTOCOL, totalRepay);
+        SafeERC20.forceApprove(IERC20(asset), LENDING_PROTOCOL, totalRepay);
         emit LiquidationTriggered(user, collateralAsset, debtAsset, debtToCover, bonus);
         emit FlashLoanExecuted(asset, amount, premium);
 
@@ -713,9 +713,9 @@ contract FlashSwapArbitrage is
         if (reserves.gasReserve < MIN_GAS_RESERVE) revert InsufficientGasReserve(reserves.gasReserve, MIN_GAS_RESERVE);
         if (reserves.linkReserve < MIN_LINK_RESERVE) revert InsufficientLinkReserve(reserves.linkReserve, MIN_LINK_RESERVE);
 
-        SafeERC20.safeApprove(IERC20(fromAsset), LENDING_PROTOCOL, amount);
+        SafeERC20.forceApprove(IERC20(fromAsset), LENDING_PROTOCOL, amount);
         ILendingProtocol(LENDING_PROTOCOL).swapCollateral(user, fromAsset, toAsset, amount);
-        SafeERC20.safeApprove(IERC20(fromAsset), LENDING_PROTOCOL, 0);
+        SafeERC20.forceApprove(IERC20(fromAsset), LENDING_PROTOCOL, 0);
         emit CollateralSwapped(user, fromAsset, toAsset, amount);
     }
 
@@ -776,7 +776,7 @@ contract FlashSwapArbitrage is
         uint64 chainId
     ) internal {
         if (reserves.gasReserve < MIN_GAS_RESERVE) revert InsufficientGasReserve(reserves.gasReserve, MIN_GAS_RESERVE);
-        SafeERC20.safeApprove(IERC20(tokenIn), AMM_POOL, amountIn);
+        SafeERC20.forceApprove(IERC20(tokenIn), AMM_POOL, amountIn);
         if (chainId == 0) {
             uint256 amountOut = IAMMPool(AMM_POOL).swap(tokenIn, amountIn, 0, address(this));
             (address initiator, uint256 minProfit, , , , , ) = abi.decode(
@@ -793,7 +793,7 @@ contract FlashSwapArbitrage is
             reserves.gasReserve -= gasUsed;
             emit GasReserveUpdated(reserves.gasReserve);
         }
-        SafeERC20.safeApprove(IERC20(tokenIn), AMM_POOL, 0);
+        SafeERC20.forceApprove(IERC20(tokenIn), AMM_POOL, 0);
     }
 
     /// @notice Uniswap V3 swap callback
@@ -826,7 +826,7 @@ contract FlashSwapArbitrage is
         uint256 amountOut = _executeTrade(tokenOut, tokenIn, amountIn, chainId);
         if (amountOut < amountIn + minProfit) revert InsufficientRepayment(amountOut, amountIn + minProfit);
 
-        SafeERC20.safeApprove(IERC20(tokenIn), uniswapPool, amountIn);
+        SafeERC20.forceApprove(IERC20(tokenIn), uniswapPool, amountIn);
         uint256 profit = amountOut - amountIn;
         emit FlashSwapCompleted(initiator, amountIn, amountOut, profit, chainId);
     }
@@ -1111,9 +1111,9 @@ contract FlashSwapArbitrage is
         uint256 balance = IERC20(tokenIn).balanceOf(address(this));
         if (balance < amountIn) revert InsufficientBalance(tokenIn, balance, amountIn);
 
-        IERC20(tokenIn).safeApprove(externalExchange, amountIn);
+        IERC20(tokenIn).forceApprove(externalExchange, amountIn);
         amountOut = IExternalExchange(externalExchange).swapTokens(tokenIn, tokenOut, amountIn, chainId);
-        IERC20(tokenIn).safeApprove(externalExchange, 0);
+        IERC20(tokenIn).forceApprove(externalExchange, 0);
         if (amountOut == 0) revert TradeFailed(amountOut, 1);
     }
 
@@ -1269,7 +1269,7 @@ contract FlashSwapArbitrage is
             uint256 balance = IERC20(token).balanceOf(address(this));
             if (balance < amount) revert InsufficientBalance(token, balance, amount);
 
-            SafeERC20.safeApprove(IERC20(token), recipient, amount);
+            SafeERC20.forceApprove(IERC20(token), recipient, amount);
             emit ProfitWithdrawn(token, recipient, amount);
         }
 
@@ -1278,25 +1278,24 @@ contract FlashSwapArbitrage is
             if (recipient == address(0)) revert InvalidExchangeAddress(recipient);
             uint256 balance = IERC20(token).balanceOf(address(this));
             if (balance > 0) {
-                SafeERC20.safeApprove(IERC20(token), recipient, balance);
+                SafeERC20.forceApprove(IERC20(token), recipient, balance);
                 emit AssetsRecovered(token, balance, recipient);
             }
         }
 
         function revokeApproval(address token) external nonReentrant onlyRole(GOVERNOR_ROLE) {
             if (token == address(0)) revert InvalidOperation("Invalid token");
-            SafeERC20.safeApprove(IERC20(token), UNISWAP_V3_SWAP_ROUTER, 0);
-            SafeERC20.safeApprove(IERC20(token), SUSHI_SWAP_ROUTER, 0);
-            SafeERC20.safeApprove(IERC20(token), SUSHI_SWAP_PAIR, 0);
-            SafeERC20.safeApprove(IERC20(token), externalExchange, 0);
-            SafeERC20.safeApprove(IERC20(token), LENDING_PROTOCOL, 0);
-            IERC20(token).safeApprove(AMM_POOL, 0);
-            SafeERC20.safeApprove(IERC20(token), AMM_POOL, 0);
+            SafeERC20.forceApprove(IERC20(token), UNISWAP_V3_SWAP_ROUTER, 0);
+            SafeERC20.forceApprove(IERC20(token), SUSHI_SWAP_ROUTER, 0);
+            SafeERC20.forceApprove(IERC20(token), SUSHI_SWAP_PAIR, 0);
+            SafeERC20.forceApprove(IERC20(token), externalExchange, 0);
+            SafeERC20.forceApprove(IERC20(token), LENDING_PROTOCOL, 0);
+            SafeERC20.forceApprove(IERC20(token), AMM_POOL, 0);
             uint64[] memory chainIds = retryOracle.activeChainIds();
             for (uint256 i = 0; i < chainIds.length; i++) {
                 address crossChainPool = crossChainAMMPools[chainIds[i]];
                 if (crossChainPool != address(0)) {
-                    IERC20(token).safeApprove(crossChainPool, 0);
+                    SafeERC20.forceApprove(IERC20(token), crossChainPool, 0);
                 }
             }
             revert InvalidOperation("Approvals revoked");
@@ -1365,7 +1364,7 @@ contract FlashSwapArbitrage is
             bool useSushiSwap,
             bool useAMMPool,
             uint24 feeTier
-        ) external view returns (uint256 estimatedProfit) {
+        ) external returns (uint256 estimatedProfit) {
             if (amountIn == 0) revert InvalidBorrowedAmount(amountIn, 0);
             if (chainId != 0 && crossChainAMMPools[chainId] == address(0)) revert CrossChainNotConfigured(chainId);
             if (useSushiSwap && useAMMPool) revert InvalidOperation("Cannot use both");
